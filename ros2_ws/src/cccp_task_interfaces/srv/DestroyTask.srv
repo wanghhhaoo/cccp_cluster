@@ -1,0 +1,11 @@
+# <ns>/api/task/destroy：可以在任意节点上调用。
+# 把任务标记为 Cancelled，并由集群主节点通知所有执行节点停止。
+# 相比复用包 v0.1：响应新增 error_code。
+
+int64 task_id
+string reason
+---
+bool success
+string error_code                 # 已结束的任务返回 INVALID_STATE；不存在返回 NOT_FOUND
+string message
+string final_status

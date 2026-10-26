@@ -1,0 +1,56 @@
+# <ns>/api/task/create：可以在任意节点上提交任务（UE 的 HTTP 接口内部走同一逻辑）。
+# 网关把任务写入集群任务表，由集群主节点调度和下发；本服务等到下发完成或超时才返回。
+# 相比复用包 v0.1：新增幂等键、协同、来源、input_node 这几组字段，原有字段含义不变。
+
+string MODE_LOCAL="local"
+string MODE_REDUNDANT="redundant"
+string MODE_FUSION="fusion"
+
+string ORIGIN_MANUAL="manual"
+string ORIGIN_SCHEDULE="schedule"
+string ORIGIN_CHAIN="chain"
+string ORIGIN_EVENT="event"
+
+# 幂等键：同一个键只会生成一个任务，重复提交返回同一个 task_id。
+# 为空时由网关随机生成，相当于不做重试去重。各来源的键格式见开发规范 4.2。
+string idempotency_key
+
+string name                       # 为空时自动生成
+string task_type                  # PKCI | PKCT（以后改为 algorithmId）
+string input                      # 输入源描述，只作记录，如 airsim://uav_5/0
+string input_node                 # 输入数据所在的节点；填写后，网络评分以该节点为参照
+string request_node               # 指定单个节点；与 target_nodes 都为空时自动调度
+string[] target_nodes             # 指定多个节点，各自独立执行；非空时优先于 request_node
+
+# 协同，语义见《算法接入规范》第 4 节
+string mode                       # local | redundant | fusion；为空按 local 处理
+uint8 helper_count                # 辅助节点数，不含任务主节点；local 模式下必须为 0
+uint8 min_participants            # 最少参与数，含任务主节点；为 0 时取 1 + helper_count
+
+# 调度约束；为 0 时使用默认值
+bool use_gpu
+float32 cpu_compute_required
+float32 cpu_memory_required
+float32 gpu_memory_required
+float32 latency_sensitivity
+
+# 来源：只用于记录和防止无限链式触发，不影响执行
+string origin                     # manual | schedule | chain | event；为空按 manual 处理
+string origin_source              # 用户 ID / 定时规则 ID / 事件源
+int64 parent_task_id              # origin=chain 时为父任务 ID，否则为 0
+uint8 chain_depth                 # 父任务的深度 + 1；超过上限时返回 CHAIN_TOO_DEEP
+
+# 算法参数
+uint8 drone_id
+string level                      # 带宽等级；为空按 full 处理
+string image_topic                # 为空时使用执行节点的默认图像 topic
+string params_json                # 例如 PKCT 为 {"bbox":[x,y,w,h]}
+---
+bool success
+string error_code                 # 见 ErrorCodes.msg；成功时为空
+string message
+int64 task_id                     # 0 表示任务没有写入任务表
+bool duplicate                    # true 表示命中幂等键，返回的是已存在的任务
+string assigned_node              # 任务主节点
+string[] dispatched_nodes
+string[] candidate_nodes
