@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>cccp_task_executor</name>
+  <version>0.2.0</version>
+  <description>Board-side CCCP task executor and data-plane process: runs dispatched PKCI/PKCT tasks on an image stream.</description>
+  <maintainer email="comp@example.com">CCCP Team</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>cccp_cluster_interfaces</depend>
+  <depend>cccp_task_interfaces</depend>
+  <depend>collab_inference_interfaces</depend>
+  <exec_depend>cccp_node</exec_depend>
+  <exec_depend>collab_inference</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+  <!-- AirSim RPC client: pip install cosysairsim rpc-msgpack (see Dockerfile_build) -->
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

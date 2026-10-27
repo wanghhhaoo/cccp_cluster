@@ -1,0 +1,1 @@
+"""CCCP cluster node."""

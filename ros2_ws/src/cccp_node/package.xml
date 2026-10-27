@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>cccp_node</name>
+  <version>0.1.0</version>
+  <description>CCCP cluster node: replicated task table, leader control plane, gateway and resource monitor.</description>
+  <maintainer email="comp@example.com">CCCP Team</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>cccp_cluster_interfaces</depend>
+  <depend>cccp_task_interfaces</depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+  <!-- PySyncObj is not packaged for rosdep: pip install pysyncobj==0.3.17 (see deploy/Dockerfile) -->
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

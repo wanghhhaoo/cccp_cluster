@@ -1,0 +1,15 @@
+# Run PKCI inference for the local camera view.
+sensor_msgs/Image image
+uint8 drone_id
+uint32 frame_id
+string level
+---
+bool success
+string message
+int32 label
+string class_name
+float32 score
+float32 confidence
+float32 latency_ms
+float32[] log_probs
+uint8[] increment

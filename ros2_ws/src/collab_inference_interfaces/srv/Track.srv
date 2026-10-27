@@ -1,0 +1,16 @@
+# Advance a PKCT tracker by one frame and emit the local identity increment.
+string tracker_id
+sensor_msgs/Image frame
+uint8 drone_id
+uint32 frame_id
+string level
+---
+bool success
+string message
+float32 x
+float32 y
+float32 width
+float32 height
+float32 confidence
+float32 latency_ms
+uint8[] identity

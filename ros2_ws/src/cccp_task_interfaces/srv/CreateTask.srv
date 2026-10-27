@@ -22,7 +22,7 @@ string input_node                 # 输入数据所在的节点；填写后，�
 string request_node               # 指定单个节点；与 target_nodes 都为空时自动调度
 string[] target_nodes             # 指定多个节点，各自独立执行；非空时优先于 request_node
 
-# 协同，语义见《算法接入规范》第 4 节
+# 协同，语义见开发规范第 1 节
 string mode                       # local | redundant | fusion；为空按 local 处理
 uint8 helper_count                # 辅助节点数，不含任务主节点；local 模式下必须为 0
 uint8 min_participants            # 最少参与数，含任务主节点；为 0 时取 1 + helper_count

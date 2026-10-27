@@ -1,0 +1,13 @@
+# Fuse the local PKCI posterior with peer knowledge increments for one frame.
+uint32 frame_id
+float32[] own_log_probs
+collab_inference_interfaces/EncodedPayload[] peers
+---
+bool success
+string message
+int32 label
+string class_name
+float32 score
+uint32 views
+uint8[] used_drone_ids
+float32[] log_probs

@@ -1,0 +1,5 @@
+# Release a PKCT tracker and its collaborative election state.
+string tracker_id
+---
+bool success
+string message

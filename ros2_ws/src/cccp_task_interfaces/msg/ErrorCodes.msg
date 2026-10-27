@@ -1,7 +1,7 @@
 # 稳定错误码，只定义常量。各服务响应和消息里的 error_code 字段取这里的值，成功时为空字符串。
 # 每个错误码是否可以重试，见开发规范 7.2。
 #
-# 前 10 个与《CCCP 新增算法接入规范 v1.0》第 5 节一致：
+# 算法与执行层：
 
 string INVALID_INPUT="INVALID_INPUT"
 string NOT_READY="NOT_READY"

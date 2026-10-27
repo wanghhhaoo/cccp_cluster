@@ -1,0 +1,55 @@
+# Jetson / ARM64 node image. Build from the repository root on the target JetPack:
+#   docker build -f deploy/Dockerfile.arm64 \
+#     --build-arg TORCH_WHEEL_URL=... --build-arg TORCHVISION_WHEEL_URL=... \
+#     -t cccp-node:p1-$(git rev-parse --short HEAD)-arm64 .
+# The wheels must be NVIDIA builds matching the JetPack/L4T release; generic ARM
+# PyPI wheels are intentionally not used. Adapted from CCCP edge/Dockerfile_build_arm64.
+FROM ros:humble
+
+WORKDIR /ros2_ws
+COPY ros2_ws/src ./src
+COPY deploy/start_node.sh ./start_node.sh
+RUN chmod +x /ros2_ws/start_node.sh
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+		python3-colcon-common-extensions \
+		python3-pip \
+		python3-numpy \
+		python3-pil \
+		python3-yaml \
+		python3-msgpack \
+		python3-tornado \
+		python3-pytest \
+		ros-humble-cv-bridge \
+		ros-humble-rmw-cyclonedds-cpp \
+		libgl1 \
+		libglib2.0-0 \
+		libopenblas-dev \
+		ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir pysyncobj==0.3.17 \
+	&& pip3 install --no-cache-dir --no-deps cosysairsim==3.3.0 rpc-msgpack==0.6
+
+ENV ROS_DOMAIN_ID=10
+RUN bash -lc "source /opt/ros/humble/setup.bash && colcon build --merge-install \
+	--packages-up-to cccp_node cccp_task_executor collab_inference"
+
+ARG TORCH_WHEEL_URL=""
+ARG TORCHVISION_WHEEL_URL=""
+RUN if [ -n "$TORCH_WHEEL_URL" ] && [ -n "$TORCHVISION_WHEEL_URL" ]; then \
+		pip3 install --no-cache-dir "$TORCH_WHEEL_URL" "$TORCHVISION_WHEEL_URL"; \
+	else \
+		echo "NVIDIA torch wheels not installed; provide TORCH_WHEEL_URL and TORCHVISION_WHEEL_URL before deployment"; \
+	fi
+
+ENV CLUSTER_CONFIG=/etc/cccp/cluster.yaml
+ENV CCCP_DATA_DIR=/var/lib/cccp
+ENV UE_HTTP_PORT=18090
+ENV COLLAB_DEVICE=cuda:0
+ENV MAX_TRACKERS=4
+ENV IMAGE_TOPIC=camera/image
+VOLUME ["/var/lib/cccp"]
+
+CMD ["/ros2_ws/start_node.sh"]

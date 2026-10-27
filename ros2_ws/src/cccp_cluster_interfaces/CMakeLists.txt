@@ -9,6 +9,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/NodeStatus.msg"
   "msg/LinkQuality.msg"
   "msg/RunningTask.msg"
+  "msg/ExecutorStatus.msg"
   DEPENDENCIES builtin_interfaces
 )
 

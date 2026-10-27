@@ -1,0 +1,9 @@
+# Update collaborative PKCT election state with identities from one frame.
+string tracker_id
+uint32 frame_id
+collab_inference_interfaces/EncodedPayload[] identities
+---
+bool success
+string message
+int32 primary_drone_id
+uint8[] used_drone_ids

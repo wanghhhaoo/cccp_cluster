@@ -28,7 +28,7 @@ string cpu_model
 uint16 cpu_cores
 uint32 mem_total_mb
 string gpu_model                  # 无 GPU 时为空
-uint32 gpu_mem_total_mb
+uint32 gpu_mem_total_mb           # 独立显存总量；Jetson 等与系统共享内存的 GPU 填 0
 
 # ---- 动态资源；无法获取时填 -1 ----
 float32 cpu_usage                 # 0~100

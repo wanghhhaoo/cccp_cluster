@@ -1,0 +1,10 @@
+# Create or replace one stateful PKCT tracker session.
+string tracker_id
+sensor_msgs/Image first_frame
+float32 x
+float32 y
+float32 width
+float32 height
+---
+bool success
+string message

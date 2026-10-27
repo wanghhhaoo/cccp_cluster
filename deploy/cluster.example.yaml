@@ -1,0 +1,20 @@
+# 集群成员表（开发规范 3.1）。12 个节点使用同一份文件，挂载到 /etc/cccp/cluster.yaml。
+# Raft 必须事先知道全部投票成员才能计算多数派，所以这里不用 ROS 2 的自动发现。
+# 修改成员需要所有节点同时更新并重启。
+
+protocol_version: 1          # 必须等于 NodeStatus.PROTOCOL_VERSION，不一致时控制进程拒绝启动
+raft_port: 7480              # 每个成员可以用 port 单独覆盖
+
+members:
+  - {name: edge-01, ip: 10.0.0.1}
+  - {name: edge-02, ip: 10.0.0.2}
+  - {name: edge-03, ip: 10.0.0.3}
+  - {name: edge-04, ip: 10.0.0.4}
+  - {name: edge-05, ip: 10.0.0.5}
+  - {name: edge-06, ip: 10.0.0.6}
+  - {name: edge-07, ip: 10.0.0.7}
+  - {name: edge-08, ip: 10.0.0.8}
+  - {name: edge-09, ip: 10.0.0.9}
+  - {name: edge-10, ip: 10.0.0.10}
+  - {name: edge-11, ip: 10.0.0.11}
+  - {name: edge-12, ip: 10.0.0.12}
