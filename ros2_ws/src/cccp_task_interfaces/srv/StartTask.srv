@@ -1,6 +1,7 @@
 # <ns>/exec/task/start：集群主节点下发任务给执行节点，只有集群主节点可以调用。
-# 相比复用包 v0.1：新增 term、epoch、role、primary_node、helper_nodes、mode、min_participants，
+# 相比复用包 v0.1：新增 term、epoch、role、primary_node、helper_nodes、mode、min_participants、input，
 # 服务名由 <ns>/task/start 改为 <ns>/exec/task/start。
+# 10-28：新增 input（数据源地址，见开发规范 4.4）；请求里只带地址，不带数据。
 #
 # 执行节点的处理规则（开发规范 5.4）：
 #   term 小于本节点已知的最大值             -> 拒绝，STALE_TERM
@@ -20,9 +21,10 @@ string[] helper_nodes             # 辅助节点列表；只发给 primary
 string task_type
 string mode
 uint8 min_participants
+string input                      # 数据源地址：空、airsim://<vehicle>/<camera> 或 ros://<node>/<topic>
 uint8 drone_id
 string level
-string image_topic
+string image_topic                # 仅在 input 为空时使用：覆盖本节点默认的图像 topic
 string params_json
 ---
 bool success

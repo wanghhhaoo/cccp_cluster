@@ -5,44 +5,20 @@ so the board reads simulation images directly from the AirSim RPC server with
 no other ROS component in between. Frames are only requested while someone
 subscribes, so an idle board puts no load on the simulator.
 """
-import io
 import threading
 import time
 
-import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
+from .airsim_common import decode_response  # noqa: F401  (re-exported for tests and callers)
+
 try:
     import cosysairsim as airsim
 except ImportError:  # upstream AirSim client exposes the same API
     import airsim
-
-
-def decode_response(response, raw_encoding):
-    """AirSim ImageResponse -> (encoding, height, width, step, bytes).
-
-    Uncompressed Scene images arrive as raw 3-channel pixels (BGR on current
-    AirSim/Cosys releases, configurable via raw_encoding); 4-channel buffers
-    are treated as BGRA. Compressed responses are PNG and decoded to RGB.
-    """
-    width, height = int(response.width), int(response.height)
-    data = bytes(response.image_data_uint8)
-    if width <= 0 or height <= 0 or not data:
-        raise ValueError("empty image (check vehicle_name / camera_name): %s"
-                         % (getattr(response, "message", "") or "no data"))
-    if response.compress:
-        from PIL import Image as PILImage
-        rgb = np.asarray(PILImage.open(io.BytesIO(data)).convert("RGB"))
-        return "rgb8", rgb.shape[0], rgb.shape[1], rgb.shape[1] * 3, rgb.tobytes()
-    channels = len(data) // (width * height)
-    if channels == 3:
-        return raw_encoding, height, width, width * 3, data[:width * height * 3]
-    if channels == 4:
-        return "bgra8", height, width, width * 4, data[:width * height * 4]
-    raise ValueError("unexpected image buffer: %d bytes for %dx%d" % (len(data), width, height))
 
 
 class AirSimCamera(Node):

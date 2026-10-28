@@ -17,8 +17,9 @@ string idempotency_key
 
 string name                       # 为空时自动生成
 string task_type                  # PKCI | PKCT（以后改为 algorithmId）
-string input                      # 输入源描述，只作记录，如 airsim://uav_5/0
-string input_node                 # 输入数据所在的节点；填写后，网络评分以该节点为参照
+string input                      # 数据源地址（开发规范 4.4）：空 = 执行节点的默认相机；
+                                  # airsim://<vehicle>/<camera> = 任意节点都能取；ros://<node>/<topic> = 只在该节点上
+string input_node                 # 网络评分的参照节点；input 为 ros:// 时自动取其中的节点
 string request_node               # 指定单个节点；与 target_nodes 都为空时自动调度
 string[] target_nodes             # 指定多个节点，各自独立执行；非空时优先于 request_node
 

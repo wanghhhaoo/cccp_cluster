@@ -69,9 +69,18 @@ if [ "$ENABLE_CONTROL" = "true" ]; then
 fi
 
 if [ "$ENABLE_DATA_PLANE" = "true" ]; then
-	setsid ros2 run cccp_task_executor data_plane --ros-args --log-level "$LOG_LEVEL" "${NS_ARGS[@]}" \
+	# Unbounded torch CPU threads made inference ~5x slower on a 144-core host (docs/HANDOFF.md).
+	# airsim:// task inputs are fetched on demand when AIRSIM_HOST is set (CONVENTIONS 4.4).
+	# AIRSIM_FETCH_MODE=each: every participant queries AirSim; relay: only the task primary does.
+	case "$AIRSIM_FPS" in *.*) AIRSIM_FPS_PARAM="$AIRSIM_FPS" ;; *) AIRSIM_FPS_PARAM="${AIRSIM_FPS}.0" ;; esac
+	OMP_NUM_THREADS=${INFERENCE_THREADS:-4} setsid ros2 run cccp_task_executor data_plane --ros-args --log-level "$LOG_LEVEL" "${NS_ARGS[@]}" \
 		-p "node_name:=${NODE_NAME}" \
 		-p "image_topic:=${IMAGE_TOPIC}" \
+		-p "airsim_host:=${AIRSIM_HOST}" \
+		-p "airsim_port:=${AIRSIM_PORT}" \
+		-p "airsim_fps:=${AIRSIM_FPS_PARAM}" \
+		-p "airsim_raw_encoding:=${AIRSIM_RAW_ENCODING}" \
+		-p "airsim_fetch_mode:=${AIRSIM_FETCH_MODE:-each}" \
 		-p "device:=${COLLAB_DEVICE}" \
 		-p "max_trackers:=${MAX_TRACKERS}" &
 	pids+=("$!")

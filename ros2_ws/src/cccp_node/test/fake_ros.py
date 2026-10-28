@@ -25,6 +25,7 @@ INLINE = {
     "std_msgs/Header": "builtin_interfaces/Time stamp\nstring frame_id\n",
     "sensor_msgs/Image": ("std_msgs/Header header\nuint32 height\nuint32 width\nstring encoding\n"
                           "uint8 is_bigendian\nuint32 step\nuint8[] data\n"),
+    "sensor_msgs/CompressedImage": "std_msgs/Header header\nstring format\nuint8[] data\n",
 }
 INTS = {"byte", "char", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"}
 FLOATS = {"float32", "float64"}
@@ -149,7 +150,8 @@ def _build_interfaces():
     _module("std_msgs")
     _module("std_msgs.msg", Header=REGISTRY["std_msgs/Header"])
     _module("sensor_msgs")
-    _module("sensor_msgs.msg", Image=REGISTRY["sensor_msgs/Image"])
+    _module("sensor_msgs.msg", Image=REGISTRY["sensor_msgs/Image"],
+            CompressedImage=REGISTRY["sensor_msgs/CompressedImage"])
 
 
 # --------------------------------------------------------------------- bus
@@ -194,6 +196,10 @@ class _Entity:
 class Publisher(_Entity):
     def __init__(self, node, msg_type, topic):
         self.node, self.msg_type, self.topic = node, msg_type, topic
+
+    @property
+    def topic_name(self):
+        return self.topic
 
     def publish(self, msg):
         assert isinstance(msg, self.msg_type), "publishing %r on %s" % (type(msg), self.topic)
@@ -383,6 +389,9 @@ class Node:
 
     def destroy_subscription(self, subscription):
         subscription.alive = False
+
+    def destroy_publisher(self, publisher):
+        publisher.alive = False
 
     def create_service(self, srv_type, name, callback, **_):
         service = Service(self, srv_type, self.resolve_topic_name(name), callback)

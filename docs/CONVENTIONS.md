@@ -58,6 +58,8 @@
 | `<ns>/exec/status` | `ExecutorStatus` topic | 数据面进程 → 本节点控制进程 | 正在运行的任务、算法是否就绪 |
 | `<ns>/algorithms/pkci/*`、`pkct/*` | 复用包原有 srv | 执行节点 → 推理服务 | 不改 |
 | `<ns>/camera/image` | `sensor_msgs/Image` | 取图 → 执行节点 | 不改 |
+| `<ns>/input/airsim/<vehicle>/cam_<camera>` | `sensor_msgs/Image` | 按需取图 → 本节点执行器 | 有任务使用 `airsim://` 输入时才存在（4.4） |
+| `<ns>/<topic>/compressed` | `sensor_msgs/CompressedImage` | 数据所在节点 → 其他参与节点 | JPEG；只在有订阅者时才编码（4.4） |
 | `<ns>/task/result`、`result_image` | `TaskResult` / `Image` | 执行节点 → 汇总方、网关 | `TaskResult` 新增了字段 |
 | `http://<节点>:18090/api/ue/*` | HTTP/JSON | UE → 任意节点 | 沿用复用包的 `ue_api.py` |
 
@@ -108,6 +110,7 @@ Raft 必须事先知道完整的成员表，才能计算多数派，所以这里
 | `/cluster/task_report` | RELIABLE | KEEP_LAST(100) | VOLATILE | 状态变化不应丢失；即使丢了，也有对账兜底 |
 | `/cluster/task_status` | RELIABLE | KEEP_LAST(100) | VOLATILE | 事件流 |
 | `<ns>/camera/image` | sensor data 预设 | — | — | 沿用复用包 |
+| `.../input/airsim/...`、`.../compressed` | sensor data 预设 | — | — | 图像流丢一帧没关系，后面的帧会补上 |
 | `<ns>/task/result` | RELIABLE | KEEP_LAST(10) | VOLATILE | 沿用复用包 |
 
 QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义在 `cccp_node/names.py`。各处必须统一引用这两个模块，不允许在各自的代码里临时创建 QoS 或手写端点名。
@@ -142,6 +145,23 @@ QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义�
 - 消息里的 `stamp` 只能用于显示和记日志，**不得拿不同节点的时间戳做减法**。复用包 `monitor_node` 用接收时间减发送时间来算时延，就违反了这条规则，必须改为 `LinkQuality` 中的回显方式。
 - 所有节点仍然应该部署 chrony 做时间同步，这只是为了方便对照各节点的日志，正确性不依赖它。
 - 在 JSON 中，纳秒级时间戳必须写成十进制字符串。
+
+### 4.4 任务输入：数据源地址
+
+任务的输入用**数据源地址**（`CreateTask.input` / `StartTask.input`）表示，由平台按地址取数据。平台不关心数据是什么类型（图像、点云、特征），只关心它在哪里。代码在 `core/input_source.py`。
+
+| 地址 | 含义 | 位置属性 | 参与节点怎么拿到数据 |
+|---|---|---|---|
+| 空 | 执行节点自己的默认相机（**就是引入地址之前的行为**） | 绑定到本节点 | 订阅本节点的 `camera/image` |
+| `airsim://<vehicle>/<camera>` | AirSim 中的某个相机 | **共享**：任何节点都能直接取 | `each` 模式（默认）：每个参与节点各自通过 RPC 取图；`relay` 模式：只有任务主节点取图，辅助节点订阅它转发的压缩流 |
+| `ros://<node>/<topic>` | 某个节点上的 topic（真实传感器） | **绑定到该节点** | 该节点直接读本地 topic；其他节点订阅它的 `<topic>/compressed` |
+
+规则：
+- **请求里只放地址，不放大块数据。** 大块数据只通过 topic 跨节点传输：发布一次，可以有多个订阅者，并且压缩后再发。小数据（参数、bbox、协同载荷，几 KB 以内）可以直接放进请求。
+- **共享数据源**：任务迁移后输入不变，因为新节点按地址自己去取。`airsim://` 取图只在有任务使用时运行，没有任务使用就停止。
+- **绑定到节点的数据源**：调度器会给数据所在节点加分（`input_locality_bonus`），优先把任务主节点放在那里；如果数据所在节点离线，任务无法放置，会回到 Pending，超时后判定失败。
+- 压缩转发只有在其他节点订阅时才进行，否则不会解码，也不会编码。本节点需要对外提供的传感器 topic 由执行器参数 `relay_topics` 配置，默认是 `camera/image`；AirSim 取图的 topic 会自动提供转发。
+- 新增一种数据类型时，由算法声明自己需要的消息类型；平台的取数逻辑不用改。目前只实现了图像（`Image` 和 `CompressedImage`）。
 
 ---
 
@@ -266,6 +286,7 @@ MVP 阶段不做辅助节点的替换。辅助节点失效后，按 `min_partici
 
 - 控制进程的入口是 `ros2 run cccp_node control_node`；数据面进程的入口是 `ros2 run cccp_task_executor data_plane`，它用一个 `MultiThreadedExecutor` 同时运行执行器、PKCI、PKCT 三个节点；启动脚本是 `deploy/start_node.sh`。
 - 两个进程之间通过 `<ns>/exec/status` 传递信息：控制进程根据它填写 `NodeStatus` 里的 `running_tasks` 和 `inference_ready`。
+- 调用方式的选择：**同一进程内直接调用函数**（执行器 → PKCI/PKCT 引擎，`INFERENCE_BACKEND=local`，默认值）；**跨节点的低频调用用 ROS 2 Service**（`StartTask`/`StopTask`）；**跨节点的逐帧数据用 Topic**（`TaskResult` 和其中的协同载荷）。禁止跨节点逐帧传输图像。推理引擎仍然以 `<ns>/algorithms/*` 服务的形式对外提供，设置 `INFERENCE_BACKEND=ros` 可以让执行器改走服务调用。
 
 ### 6.2 业务逻辑与 ROS 解耦
 

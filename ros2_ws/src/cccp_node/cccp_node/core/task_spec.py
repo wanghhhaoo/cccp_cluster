@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from typing import Iterable
 
 from . import constants as c
+from .input_source import ROS, parse_input
 
 
 class SpecError(ValueError):
@@ -140,8 +141,20 @@ def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth
     if check is not None:
         check(params)
 
+    try:
+        source = parse_input(spec.input)
+    except ValueError as exc:
+        raise SpecError(c.INVALID_INPUT, str(exc)) from exc
+    input_node = spec.input_node.strip()
+    if source.kind == ROS:
+        if input_node and input_node != source.owner:
+            raise SpecError(c.INVALID_INPUT, "input_node %r contradicts input %r" % (input_node, spec.input))
+        input_node = source.owner     # the data lives there: network scores are measured from it
+
     return replace(
         spec,
+        input=source.uri,
+        input_node=input_node,
         task_type=task_type,
         name=spec.name.strip(),
         request_node=spec.request_node.strip(),

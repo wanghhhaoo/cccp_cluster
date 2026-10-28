@@ -1,7 +1,8 @@
 """Board-side task executor.
 
 Receives tasks from the cluster leader (<ns>/exec/task/start, <ns>/exec/task/stop),
-feeds frames from an image topic to the local PKCI/PKCT services, publishes
+feeds frames from an image topic to PKCI/PKCT through an inference backend
+(in-process calls or ROS services, see inference.py), publishes
 per-frame results and composited images, reports state changes on
 /cluster/task_report and publishes its running tasks on <ns>/exec/status.
 
@@ -20,7 +21,7 @@ from dataclasses import dataclass
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 
 from cccp_cluster_interfaces.msg import ExecutorStatus, RunningTask
 from cccp_task_interfaces.msg import TaskReport, TaskResult
@@ -30,9 +31,15 @@ from collab_inference_interfaces.srv import Classify, InitTracker, ResetTracker,
 from cccp_node import names
 from cccp_node.core import constants as c
 from cccp_node.core.execution_guard import NOOP, REJECT, RESTART, STOP, ExecutionGuard
+from cccp_node.core.input_source import FETCH_EACH, parse_input, plan_input
 from cccp_node.ros import qos
 
+from .airsim_common import AirSimClient
+from .airsim_feeds import AirSimFeeds
 from .annotate import annotate
+from .images import decompress
+from .inference import RosServiceBackend
+from .relay import ImageRelay
 
 TASK_TYPES = ("PKCI", "PKCT")
 
@@ -66,9 +73,12 @@ class ActiveTask:
     task_type: str
     drone_id: int
     level: str
-    image_topic: str
+    image_topic: str             # topic actually subscribed (see input_source.plan_input)
     params: dict
     tracker_id: str = ""
+    input: str = ""
+    compressed: bool = False
+    fetch: tuple = None          # (vehicle, camera) of the AirSim feed this task holds
     initialized: bool = False
     busy: bool = False
     frames: int = 0
@@ -77,7 +87,9 @@ class ActiveTask:
 
 
 class TaskExecutor(Node):
-    def __init__(self):
+    def __init__(self, backend=None, airsim_client_factory=None):
+        """backend: how to reach the algorithms (inference.py); default calls their ROS services.
+        airsim_client_factory: makes AirSim clients for airsim:// inputs; default uses airsim_host."""
         super().__init__("task_executor")
         self.declare_parameter("node_name", "node-1")
         self.declare_parameter("image_topic", "camera/image")
@@ -85,6 +97,13 @@ class TaskExecutor(Node):
         self.declare_parameter("max_consecutive_failures", 10)
         self.declare_parameter("service_wait_timeout", 2.0)
         self.declare_parameter("status_period", 1.0)
+        self.declare_parameter("airsim_host", "")             # empty: airsim:// inputs are not served here
+        self.declare_parameter("airsim_port", 41451)
+        self.declare_parameter("airsim_fps", 10.0)
+        self.declare_parameter("airsim_raw_encoding", "bgr8")
+        self.declare_parameter("airsim_fetch_mode", FETCH_EACH)   # each | relay (input_source.py)
+        self.declare_parameter("relay_topics", ["camera/image"])  # local sensors offered to other nodes
+        self.declare_parameter("jpeg_quality", 80)
 
         self._node_name = self.get_parameter("node_name").value
         self._default_topic = self.get_parameter("image_topic").value
@@ -99,12 +118,20 @@ class TaskExecutor(Node):
         self._tasks = {}
         self._subscriptions_by_topic = {}
 
-        # Relative names resolve inside this node's namespace, next to the
-        # algorithm services of the same data-plane process.
-        self._cli_classify = self.create_client(Classify, "algorithms/pkci/classify")
-        self._cli_init = self.create_client(InitTracker, "algorithms/pkct/init")
-        self._cli_track = self.create_client(Track, "algorithms/pkct/track")
-        self._cli_reset = self.create_client(ResetTracker, "algorithms/pkct/reset")
+        self._backend = backend if backend is not None else RosServiceBackend(self)
+        get = lambda name: self.get_parameter(name).value  # noqa: E731
+        self._airsim_mode = get("airsim_fetch_mode")
+        self._relay = ImageRelay(self, int(get("jpeg_quality")))
+        for topic in get("relay_topics"):
+            if topic:
+                self._relay.watch(topic)
+        if airsim_client_factory is None and get("airsim_host"):
+            host, port = get("airsim_host"), int(get("airsim_port"))
+            airsim_client_factory = lambda: AirSimClient(host, port)  # noqa: E731
+        self._feeds = None
+        if airsim_client_factory is not None:
+            self._feeds = AirSimFeeds(self, airsim_client_factory, float(get("airsim_fps")),
+                                      get("airsim_raw_encoding"), self._relay)
 
         self._results = self.create_publisher(TaskResult, names.TASK_RESULT_TOPIC, qos.TASK_RESULT)
         self._result_images = self.create_publisher(Image, names.TASK_RESULT_IMAGE_TOPIC, qos.TASK_RESULT_IMAGE)
@@ -118,12 +145,7 @@ class TaskExecutor(Node):
 
     # ------------------------------------------------------------------ status
     def _algorithms_ready(self):
-        ready = []
-        if self._cli_classify.service_is_ready():
-            ready.append("PKCI")
-        if self._cli_init.service_is_ready() and self._cli_track.service_is_ready():
-            ready.append("PKCT")
-        return ready
+        return self._backend.algorithms_ready()
 
     def _publish_status(self):
         self._status_seq += 1
@@ -167,30 +189,42 @@ class TaskExecutor(Node):
             if request.task_id <= 0 or request.epoch <= 0:
                 raise ValueError("task_id and epoch must be positive")
             params = parse_params(task_type, request.params_json)
-            needed = [self._cli_classify] if task_type == "PKCI" else [self._cli_init, self._cli_track]
-            for client in needed:
-                if not client.wait_for_service(timeout_sec=self._wait_timeout):
-                    response.success, response.error_code = False, c.NOT_READY
-                    response.message = "algorithm service %s is not available" % client.srv_name
-                    return response
+            unavailable = self._backend.wait_ready(task_type, self._wait_timeout)
+            if unavailable:
+                response.success, response.error_code, response.message = False, c.NOT_READY, unavailable
+                return response
+            role = request.role or c.ROLE_PRIMARY
+            plan = plan_input(parse_input(request.input), node_name=self._node_name,
+                              default_topic=self._default_topic, image_topic=request.image_topic.strip(),
+                              role=role, primary_node=request.primary_node, airsim_mode=self._airsim_mode)
+            if plan.fetch and self._feeds is None:
+                response.success, response.error_code = False, c.NOT_READY
+                response.message = "%s cannot read %s: airsim_host is not set" % (self._node_name, request.input)
+                return response
             if decision.action == RESTART:
                 self._remove(self._tasks[int(request.task_id)], c.REPORT_STOPPED, "replaced by a newer epoch")
             task = ActiveTask(
                 task_id=int(request.task_id),
                 epoch=int(request.epoch),
-                role=request.role or c.ROLE_PRIMARY,
+                role=role,
                 task_type=task_type,
                 drone_id=int(request.drone_id),
                 level=request.level or "full",
-                image_topic=request.image_topic.strip() or self._default_topic,
+                image_topic=plan.topic,
                 params=params,
                 tracker_id=tracker_id(int(request.task_id), int(request.epoch)),
+                input=request.input,
+                compressed=plan.compressed,
+                fetch=plan.fetch,
             )
+            if task.fetch:
+                self._feeds.acquire(*task.fetch)
             self._tasks[task.task_id] = task
             self._guard.started(task.task_id, task.epoch)
-            self._ensure_subscription(task.image_topic)
-            message = "%s started %s epoch %d as %s, input %s" % (
-                self._node_name, task_type, task.epoch, task.role, self.resolve_topic_name(task.image_topic))
+            self._ensure_subscription(task.image_topic, task.compressed)
+            message = "%s started %s epoch %d as %s, input %s via %s" % (
+                self._node_name, task_type, task.epoch, task.role, task.input or "local camera",
+                self.resolve_topic_name(task.image_topic))
             self._report(task, c.REPORT_RUNNING, message=message)
             response.success, response.error_code, response.message = True, "", message
             self.get_logger().info("task=%d epoch=%d term=%d %s" % (task.task_id, task.epoch, request.term, message))
@@ -213,10 +247,11 @@ class TaskExecutor(Node):
         return response
 
     # ------------------------------------------------------------------ frames
-    def _ensure_subscription(self, topic):
+    def _ensure_subscription(self, topic, compressed=False):
         if topic not in self._subscriptions_by_topic:
             self._subscriptions_by_topic[topic] = self.create_subscription(
-                Image, topic, lambda msg, t=topic: self._on_frame(t, msg), qos.CAMERA,
+                CompressedImage if compressed else Image, topic,
+                lambda msg, t=topic: self._on_frame(t, msg), qos.CAMERA,
             )
 
     def _release_subscription(self, topic):
@@ -227,6 +262,13 @@ class TaskExecutor(Node):
             self.destroy_subscription(subscription)
 
     def _on_frame(self, topic, msg):
+        if isinstance(msg, CompressedImage):    # frames streamed from another node
+            try:
+                msg = decompress(msg, Image)
+            except Exception as exc:
+                self.get_logger().warning("bad compressed frame on %s: %s" % (topic, exc),
+                                          throttle_duration_sec=5.0)
+                return
         for task in list(self._tasks.values()):
             if task.image_topic != topic or task.busy:
                 continue
@@ -243,7 +285,7 @@ class TaskExecutor(Node):
         request = Classify.Request(
             image=msg, drone_id=task.drone_id, frame_id=task.frames, level=task.level
         )
-        future = self._cli_classify.call_async(request)
+        future = self._backend.classify(request)
         future.add_done_callback(lambda f: self._on_classified(task, msg, f))
 
     def _run_init(self, task, msg):
@@ -251,7 +293,7 @@ class TaskExecutor(Node):
         request = InitTracker.Request(
             tracker_id=task.tracker_id, first_frame=msg, x=x, y=y, width=width, height=height
         )
-        future = self._cli_init.call_async(request)
+        future = self._backend.init_tracker(request)
         future.add_done_callback(lambda f: self._on_initialized(task, msg, f))
 
     def _run_track(self, task, msg):
@@ -260,7 +302,7 @@ class TaskExecutor(Node):
             tracker_id=task.tracker_id, frame=msg, drone_id=task.drone_id,
             frame_id=task.frames, level=task.level,
         )
-        future = self._cli_track.call_async(request)
+        future = self._backend.track(request)
         future.add_done_callback(lambda f: self._on_tracked(task, msg, f))
 
     # ------------------------------------------------------------------ results
@@ -367,8 +409,10 @@ class TaskExecutor(Node):
         self._tasks.pop(task.task_id, None)
         self._guard.stopped(task.task_id)
         self._release_subscription(task.image_topic)
-        if task.task_type == "PKCT" and self._cli_reset.service_is_ready():
-            self._cli_reset.call_async(ResetTracker.Request(tracker_id=task.tracker_id))
+        if task.fetch and self._feeds is not None:
+            self._feeds.release(*task.fetch)
+        if task.task_type == "PKCT":
+            self._backend.reset(ResetTracker.Request(tracker_id=task.tracker_id))
         self._report(task, state, error_code, message)
 
 

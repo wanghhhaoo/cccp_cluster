@@ -120,7 +120,8 @@ def fill_start_request(request: Any, start: StartRequest) -> Any:
     spec = start.spec
     return _set(request, term=start.term, task_id=start.task_id, epoch=start.epoch, role=start.role,
                 primary_node=start.primary_node, helper_nodes=list(start.helper_nodes), task_type=spec.task_type,
-                mode=spec.mode, min_participants=spec.min_participants, drone_id=spec.drone_id, level=spec.level,
+                mode=spec.mode, min_participants=spec.min_participants, input=spec.input,
+                drone_id=spec.drone_id, level=spec.level,
                 image_topic=spec.image_topic, params_json=spec.params_json)
 
 

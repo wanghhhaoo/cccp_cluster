@@ -25,6 +25,7 @@ from typing import Collection, Mapping
 
 from . import constants as c
 from .cluster_view import LinkView, NodeView
+from .input_source import ROS, parse_input
 from .task_spec import TaskSpec
 
 # Defaults the Java scheduler used when a node did not report a value.
@@ -53,6 +54,7 @@ class SchedulerConfig:
     per_task_penalty: float = 5.0
     max_tasks_per_node: int = 4
     min_battery: float = 0.2
+    input_locality_bonus: float = 15.0   # node-bound input: prefer the node holding the data
 
     def weights_for(self, task_type: str) -> tuple[float, float, float]:
         return self.weights.get(task_type, self.default_weights)
@@ -253,7 +255,14 @@ def schedule(
 
     target_nodes fixes the whole placement. request_node fixes only the
     primary; helpers, if the mode needs any, are still chosen by score.
+    A node-bound input (ros://<node>/...) needs its node online, and that
+    node gets input_locality_bonus: reading locally avoids streaming the data.
     """
+    source = parse_input(spec.input)
+    data_node = source.owner if source.kind == ROS else ""
+    if data_node and data_node not in nodes:
+        return ScheduleResult(None, (), {data_node: "offline"}, c.NO_FEASIBLE_NODE,
+                              "input %s is unavailable: %s is offline" % (spec.input, data_node))
     if spec.target_nodes:
         return _explicit(spec, spec.target_nodes, nodes, config)
     pinned = spec.request_node
@@ -281,6 +290,8 @@ def schedule(
         score = w_lrs * lrs + w_brs * brs + w_net * net - config.per_task_penalty * load
         if name == leader:
             score -= config.leader_self_penalty
+        if name == data_node:
+            score += config.input_locality_bonus
         candidates.append(ScoredNode(name, score, lrs, brs, net))
     candidates.sort(key=lambda s: (-s.score, s.name))
 

@@ -26,40 +26,48 @@ from cccp_node.core.naming import ros_namespace  # noqa: E402
 
 if INSTALLED:
     from cccp_task_interfaces.srv import CreateTask, DestroyTask  # noqa: E402
+    from cccp_task_interfaces.msg import TaskResult  # noqa: E402
     from collab_inference_interfaces.srv import Classify, InitTracker, ResetTracker, Track  # noqa: E402
     from sensor_msgs.msg import Image  # noqa: E402
 
     from cccp_node.ros.control_node import ControlNode  # noqa: E402
     from cccp_task_executor.executor_node import TaskExecutor  # noqa: E402
+    from cccp_task_executor.inference import LocalBackend  # noqa: E402
 
 NAMES = ("edge-01", "edge-02", "edge-03")
 
 
-class FakeAlgorithms(fake_ros.Node):
-    """PKCI/PKCT services answering instantly, standing in for collab_inference."""
-
-    def __init__(self):
-        super().__init__("fake_algorithms")
-        self.create_service(Classify, "algorithms/pkci/classify", self._classify)
-        self.create_service(InitTracker, "algorithms/pkct/init", lambda req, res: self._ok(res))
-        self.create_service(Track, "algorithms/pkct/track", self._track)
-        self.create_service(ResetTracker, "algorithms/pkct/reset", lambda req, res: self._ok(res))
+class FakeEngine:
+    """Answers like collab_inference's PkciEngine + PkctEngine, instantly and without models."""
 
     @staticmethod
-    def _ok(response):
+    def _ok(request, response):
         response.success = True
         return response
 
-    def _classify(self, request, response):
+    init_tracker = reset = _ok
+
+    def classify(self, request, response):
         response.success, response.label, response.class_name = True, 3, "car"
         response.score, response.confidence, response.latency_ms = 0.9, 0.9, 1.5
         response.log_probs, response.increment = [0.0] * 44, b"inc"
         return response
 
-    def _track(self, request, response):
+    def track(self, request, response):
         response.success, response.x, response.y, response.width, response.height = True, 1.0, 2.0, 3.0, 4.0
         response.confidence, response.identity = 0.8, b"id"
         return response
+
+
+class FakeAlgorithms(fake_ros.Node):
+    """The FakeEngine exposed as <ns>/algorithms/* services, like PkciServer/PkctServer."""
+
+    def __init__(self, engine):
+        super().__init__("fake_algorithms")
+        self.create_service(Classify, "algorithms/pkci/classify", engine.classify)
+        self.create_service(InitTracker, "algorithms/pkct/init", engine.init_tracker)
+        self.create_service(Track, "algorithms/pkct/track", engine.track)
+        self.create_service(ResetTracker, "algorithms/pkct/reset", engine.reset)
 
 
 def free_ports(n):
@@ -101,23 +109,68 @@ class FixedProbe:
         return Usage(cpu_usage=20.0, mem_usage=20.0)
 
 
-@pytest.fixture
-def cluster(tmp_path, monkeypatch):
+class Cluster(dict):
+    """name -> node parts, plus the fake AirSim server they share."""
+
+    def __init__(self, airsim):
+        super().__init__()
+        self.airsim = airsim
+
+
+class FakeAirSim:
+    """Stands in for the AirSim RPC server; counts frames fetched by each node."""
+
+    def __init__(self):
+        self.fetches = {}
+        self._lock = threading.Lock()
+
+    def client(self, node_name):
+        airsim = self
+
+        class Client:
+            def get(self, camera, vehicle):
+                with airsim._lock:
+                    key = (node_name, vehicle, camera)
+                    airsim.fetches[key] = airsim.fetches.get(key, 0) + 1
+                return NS(image_data_uint8=bytes(4 * 4 * 3), width=4, height=4, compress=False, message="")
+        return Client
+
+    def fetchers(self):
+        with self._lock:
+            return sorted({node for node, _, _ in self.fetches})
+
+
+@pytest.fixture(params=["ros_services", "local_calls"])
+def cluster(tmp_path, monkeypatch, request):
+    """Executors reach the algorithms through ROS services or in-process calls (data_plane default).
+
+    @pytest.mark.airsim_mode("relay") selects how airsim:// inputs are fetched (default "each").
+    """
+    marker = request.node.get_closest_marker("airsim_mode")
+    airsim_mode = marker.args[0] if marker else "each"
+    airsim = FakeAirSim()
     monkeypatch.setattr("cccp_node.ros.control_node.SystemProbe", FixedProbe)
     config = tmp_path / "cluster.yaml"
     members = [{"name": n, "ip": "127.0.0.1", "port": p} for n, p in zip(NAMES, free_ports(3))]
     config.write_text(yaml.safe_dump({"protocol_version": 1, "members": members}))
     fake_ros.BUS.reset()
-    nodes = {}
+    nodes = Cluster(airsim)
     for name in NAMES:
         fake_ros.BUS.namespace = ros_namespace(name)
         fake_ros.BUS.params = dict(
             node_name=name, cluster_config=str(config), data_dir="", status_period=0.2, offline_timeout=1.0,
             executor_timeout=1.0, dispatch_timeout=1.0, service_wait_timeout=0.5, ue_http_port=0,
             raft_heartbeat=0.05, raft_election_min=0.3, raft_election_max=0.6, raft_leader_fallback=1.0,
+            airsim_fetch_mode=airsim_mode, airsim_fps=20.0,
         )
-        nodes[name] = NS(name=name, control=ControlNode(), executor=TaskExecutor(), algorithms=FakeAlgorithms(),
-                         dead=False)
+        engine = FakeEngine()
+        if request.param == "local_calls":
+            backend = LocalBackend(engine, engine)
+            algorithms = fake_ros.Node("no_algorithm_services")
+        else:
+            backend, algorithms = None, FakeAlgorithms(engine)
+        executor = TaskExecutor(backend=backend, airsim_client_factory=airsim.client(name))
+        nodes[name] = NS(name=name, control=ControlNode(), executor=executor, algorithms=algorithms, dead=False)
     stop = threading.Event()
     timers = threading.Thread(target=fake_ros.BUS.run_timers, args=(stop,), daemon=True)
     timers.start()
@@ -228,6 +281,113 @@ def test_pinned_task_waits_when_its_node_dies_even_if_it_was_the_leader(cluster)
         gateway.control.consensus.get(reply.task_id)), timeout=20.0)
     assert record.status == c.PENDING and record.primary == "" and "offline" in record.last_event
     assert runners(cluster, reply.task_id) == []
+
+
+# ------------------------------------------------------------- input sources
+
+class Results:
+    """Collects (node, task_id, epoch) of every TaskResult published in the cluster."""
+
+    def __init__(self):
+        self._seen = set()
+        self._lock = threading.Lock()
+        self._node = fake_ros.Node("observer", namespace="/observer")
+        for name in NAMES:
+            self._node.create_subscription(TaskResult, "%s/task/result" % ros_namespace(name), self._on, None)
+
+    def _on(self, msg):
+        with self._lock:
+            self._seen.add((msg.node_name, msg.task_id, msg.epoch))
+
+    def nodes(self, task_id, epoch=None):
+        with self._lock:
+            return {n for n, t, e in self._seen if t == task_id and (epoch is None or e == epoch)}
+
+
+def create(node, **fields):
+    reply = node.control._on_create(CreateTask.Request(task_type="PKCI", **fields), CreateTask.Response())
+    assert reply.success, reply.message
+    return reply
+
+
+def feeds_of(cluster):
+    return {n.name: n.executor._feeds.active() for n in live(cluster)}
+
+
+def test_node_bound_input_runs_on_its_node_and_streams_to_helpers(cluster):
+    leader = wait_for(lambda: active_leader(cluster))
+    results = Results()
+    reply = create(leader, input="ros://edge-02/camera/image", mode="redundant", helper_count=1)
+    assert reply.assigned_node == "edge-02"                    # data locality wins
+    helper = next(n for n in reply.dispatched_nodes if n != "edge-02")
+    task = cluster[helper].executor._tasks[reply.task_id]
+    assert task.compressed and task.image_topic == "/edge_02/camera/image/compressed"
+    owner = cluster["edge-02"]
+    wait_for(lambda: (publish_frame(owner), {"edge-02", helper} <= results.nodes(reply.task_id))[1])
+    assert cluster.airsim.fetchers() == []
+
+
+def test_shared_input_each_participant_fetches_it(cluster):
+    leader = wait_for(lambda: active_leader(cluster))
+    results = Results()
+    reply = create(leader, input="airsim://uav_5/0", mode="redundant", helper_count=1)
+    wait_for(lambda: set(reply.dispatched_nodes) <= results.nodes(reply.task_id))
+    assert cluster.airsim.fetchers() == sorted(reply.dispatched_nodes)
+    assert leader.control._on_destroy(DestroyTask.Request(task_id=reply.task_id), DestroyTask.Response()).success
+    wait_for(lambda: all(not feeds for feeds in feeds_of(cluster).values()))   # feeds stop with the task
+
+
+@pytest.mark.airsim_mode("relay")
+def test_shared_input_relay_mode_fetches_once(cluster):
+    leader = wait_for(lambda: active_leader(cluster))
+    results = Results()
+    reply = create(leader, input="airsim://uav_5/0", mode="redundant", helper_count=1)
+    wait_for(lambda: set(reply.dispatched_nodes) <= results.nodes(reply.task_id))
+    assert cluster.airsim.fetchers() == [reply.assigned_node]
+
+
+def test_moved_task_keeps_its_shared_input(cluster):
+    leader = wait_for(lambda: active_leader(cluster))
+    results = Results()
+    reply = create(leader, input="airsim://uav_7/front")
+    primary = cluster[reply.assigned_node]
+    assert primary is not leader
+    wait_for(lambda: primary.name in results.nodes(reply.task_id, epoch=1))
+    kill(primary)
+    record = wait_for(lambda: (lambda r: r if r and r.epoch == 2 and r.status == c.RUNNING else None)(
+        leader.control.consensus.get(reply.task_id)), timeout=20.0)
+    wait_for(lambda: record.primary in results.nodes(reply.task_id, epoch=2))
+    assert ("uav_7", "front") in feeds_of(cluster)[record.primary]   # same camera on the new node
+
+
+def test_node_bound_input_waits_while_its_node_is_down(cluster):
+    leader = wait_for(lambda: active_leader(cluster))
+    owner = next(n for n in live(cluster) if n is not leader)
+    kill(owner)
+    reply = create(leader, input="ros://%s/camera/image" % owner.name)
+    assert reply.assigned_node == "" and "pending" in reply.message
+    time.sleep(2.0)
+    record = leader.control.consensus.get(reply.task_id)
+    assert record.status == c.PENDING and runners(cluster, reply.task_id) == []
+
+
+def test_image_conversions_keep_colour_order():
+    import numpy as np
+    from sensor_msgs.msg import CompressedImage
+    from cccp_task_executor.images import compress, decompress, to_rgb
+    red_bgr = Image(height=1, width=2, step=6, encoding="bgr8", data=[0, 0, 255] * 2)
+    assert to_rgb(red_bgr)[0, 0].tolist() == [255, 0, 0]
+    red_bgra = Image(height=1, width=1, step=4, encoding="bgra8", data=[0, 0, 255, 9])
+    assert to_rgb(red_bgra)[0, 0].tolist() == [255, 0, 0]
+    gray = Image(height=1, width=1, step=1, encoding="mono8", data=[7])
+    assert to_rgb(gray)[0, 0].tolist() == [7, 7, 7]
+    frame = Image(height=8, width=8, step=24, encoding="rgb8", data=[200, 30, 30] * 64)
+    frame.header.frame_id = "cam"
+    small = compress(frame, CompressedImage)
+    assert small.format == "jpeg" and len(small.data) < 8 * 8 * 3 * 4
+    back = decompress(small, Image)
+    assert (back.encoding, back.width, back.header.frame_id) == ("rgb8", 8, "cam")
+    assert np.abs(to_rgb(back).astype(int) - [200, 30, 30]).max() < 20      # lossy but same colour
 
 
 def test_fake_messages_are_strict():
