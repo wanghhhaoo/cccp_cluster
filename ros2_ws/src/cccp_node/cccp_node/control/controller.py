@@ -2,10 +2,12 @@
 
 Runs on every node. Requests addressed to this node are answered whatever its
 role (NOT_LEADER when it does not lead, NO_LEADER while it warms up); the rest
-happens only while the election says this node leads. Each time it becomes
-leader for a new term it starts from an empty task table and waits warmup_s,
-so the cluster view holds every live node's heartbeat and TaskList; the first
-reconciliation then adopts every running task (CONVENTIONS 5.3).
+happens only while the election says this node leads. Each time it is elected
+it starts from an empty task table and waits warmup_s, so the cluster view
+holds every live node's heartbeat and TaskList; the first reconciliation then
+adopts every running task (CONVENTIONS 5.3). A leader that only raises its
+term past a lone claim was never out of office: it keeps its table and just
+commands under the new term.
 
 Nothing here waits for another node. Commands go out through a CommandSink and
 their outcome comes back later as ExecEvents (on_event). Requests come in
@@ -33,8 +35,8 @@ from ..core.cluster_view import ClusterView
 from ..core.election import Leadership
 from ..core.generation import Generation
 from ..core.reconciler import (
-    AdoptTask, ConfirmRunning, Dispatch, FailTask, LeaderMemory, ReconcileConfig, Reschedule, ScheduleTask,
-    StopOrphan, reconcile,
+    AdoptTask, CancelTask, ConfirmRunning, Dispatch, FailTask, LeaderMemory, ReconcileConfig, Reschedule,
+    ScheduleTask, StopOrphan, reconcile,
 )
 from ..core.scheduler import SchedulerConfig, schedule
 from ..core.task_table import (
@@ -110,6 +112,7 @@ class LeaderController:
         self._requests: queue.Queue[Request] = queue.Queue()
         self._last_event_seq: dict[tuple[str, int], int] = {}
         self._ready_term = 0
+        self._claimed_term = 0               # Leadership.claimed_term of the current leadership
         self._ready_at = 0.0
         self._last_reconcile = float("-inf")
         self._command_id = 0
@@ -173,14 +176,19 @@ class LeaderController:
             if self._ready_term:
                 log.info("no longer leader (term %d), now following %s term %d",
                          self._ready_term, state.leader or "nobody", state.term)
-                self._ready_term = 0
+                self._ready_term = self._claimed_term = 0
                 self._flush_waiting(c.NOT_LEADER, "%s is no longer the cluster leader" % self.node_name)
             return False
         if self._ready_term == state.term:
             return True
+        if self._ready_term and state.claimed_term and state.claimed_term == self._claimed_term:
+            log.info("still leader, term %d -> %d (raised past a higher claim); keeping the task table",
+                     self._ready_term, state.term)
+            self._ready_term, self._command_id = state.term, 0
+            return True
         self._flush_waiting(c.NO_LEADER, "the leader changed; retry with the same idempotency key")
         self._store.reset()          # rebuilt from executor reports after the warm-up
-        self._ready_term, self._ready_at = state.term, self._clock()
+        self._ready_term, self._claimed_term, self._ready_at = state.term, state.claimed_term, self._clock()
         self._command_id = 0
         self._memory = LeaderMemory()
         self._failures.clear()
@@ -406,6 +414,9 @@ class LeaderController:
                 if result.ok:
                     log.info("task=%s gen=%s adopted from %s (primary %s)%s", action.task_id, action.generation,
                              action.reported_by, action.primary, " as cancelled" if action.cancelled else "")
+            elif isinstance(action, CancelTask):
+                log.warning("task=%s cancelled: %s", action.task_id, action.reason)
+                self._submit(Cancel(action.task_id, action.reason, self._wall_ms()))
             elif isinstance(action, ScheduleTask):
                 self._place(record, online, now)     # usually done already by step(); Assign is fenced
             elif isinstance(action, Reschedule):

@@ -54,6 +54,9 @@ class Leadership:
     leader: str        # "" while unknown
     term: int
     is_self: bool
+    claimed_term: int = 0   # while is_self: the term this node claimed with. It stays the same while the
+                            # node keeps leading and only raises its term past a lone claim, so a change
+                            # of term with the same claimed_term is not a new election (DESIGN 5.3)
 
 
 class Election:
@@ -64,11 +67,13 @@ class Election:
         self._started = now
         self._term = 0
         self._leader = ""
+        self._claimed_term = 0
         self._claim_seen = None          # local time a foreign claim was last heard
 
     @property
     def state(self) -> Leadership:
-        return Leadership(self._leader, self._term, self._leader == self.node_name)
+        is_self = self._leader == self.node_name
+        return Leadership(self._leader, self._term, is_self, self._claimed_term if is_self else 0)
 
     def update(self, peers: Mapping[str, NodeView], now: float, me: NodeView | None = None) -> Leadership:
         """peers: online nodes other than this one (latest NodeStatus of each).
@@ -103,7 +108,7 @@ class Election:
         timeout = self._config.leader_timeout_s if self._claim_seen is not None else self._config.startup_grace_s
         if now - waited_since >= timeout:
             if self._first_candidate([me, *compatible.values()]) is me:
-                self._term = highest + 1
+                self._term = self._claimed_term = highest + 1
                 self._leader = self.node_name
             else:
                 self._leader = ""                             # the first candidate will claim

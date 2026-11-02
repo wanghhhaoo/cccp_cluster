@@ -13,8 +13,10 @@ adopted rather than stopped. That is how a new leader rebuilds its table, and
 how tasks placed by a second leader during a split are merged back. Among
 several copies of one task the newest generation wins; within it the copy on
 its primary; then the smallest node name. Losing copies are stopped in later
-rounds. A tombstone for the task on any node means it was destroyed: it is
-adopted as Cancelled, and its remaining copies are stopped.
+rounds. A tombstone for the task on any node means some leader destroyed it:
+it is adopted as Cancelled, or cancelled if the table still has it running
+(another leader destroyed it while both led), and its remaining copies are
+stopped.
 
 reconcile() is a pure function of the table, the nodes' reports, the leader's
 local memory of when it saw and did things, and the current monotonic time.
@@ -100,6 +102,15 @@ class AdoptTask:
 
 
 @dataclass(frozen=True)
+class CancelTask:
+    """The table has the task alive, but a node holds a tombstone for it: another leader
+    destroyed it (DESIGN 4.5). Cancelled tasks do not come back."""
+
+    task_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class StopOrphan:
     """kind is one of constants.STOP_*; reason is for people."""
 
@@ -118,7 +129,7 @@ class FailTask:
     message: str
 
 
-Action = Union[ScheduleTask, Reschedule, Dispatch, ConfirmRunning, AdoptTask, StopOrphan, FailTask]
+Action = Union[ScheduleTask, Reschedule, Dispatch, ConfirmRunning, AdoptTask, CancelTask, StopOrphan, FailTask]
 
 
 @dataclass
@@ -221,9 +232,15 @@ def reconcile(
     and of retained offline ones (a node whose TaskList lags its heartbeat is left out).
     Pending tasks come first, in the table's order (pending_tasks: by priority)."""
     memory.observe_nodes(online, now, config)
-    adoptions, rejected = _adoptions(records, task_lists)
+    buried = {t: name for name in sorted(task_lists, reverse=True) for t in task_lists[name].tombstones}
+    adoptions, rejected = _adoptions(records, task_lists, buried)
     actions: list[Action] = list(adoptions.values())
-    pending = [r for r in records.values() if r.status == c.PENDING and r.task_id not in adoptions]
+    cancelled = {task_id for task_id, record in records.items()
+                 if task_id in buried and not record.terminal and task_id not in adoptions}
+    actions.extend(CancelTask(task_id, "destroyed elsewhere: tombstone on %s" % buried[task_id])
+                   for task_id in sorted(cancelled))
+    pending = [r for r in records.values()
+               if r.status == c.PENDING and r.task_id not in adoptions and r.task_id not in cancelled]
     for record in sorted(pending, key=lambda r: -r.spec.priority):
         since = memory.since(record, now)
         if now - since >= config.pending_timeout_s:
@@ -233,19 +250,17 @@ def reconcile(
             actions.append(ScheduleTask(record.task_id, record.generation))
     for task_id in sorted(records):
         record = records[task_id]
-        if record.terminal or record.status == c.PENDING or task_id in adoptions:
+        if record.terminal or record.status == c.PENDING or task_id in adoptions or task_id in cancelled:
             continue
         actions.extend(_check_placement(record, online, memory, now, config))
     actions.extend(_orphans(records, online, memory, now, config, adoptions, rejected))
     return actions
 
 
-def _adoptions(records, task_lists) -> tuple[dict, dict]:
+def _adoptions(records, task_lists, buried) -> tuple[dict, dict]:
     """Row 1-2. Copies newer than the table: {task_id: AdoptTask}, {task_id: (stop kind, reason)}."""
     copies: dict[str, list[tuple[str, TaskStateView]]] = {}
-    buried: set[str] = set()
     for name in sorted(task_lists):
-        buried.update(task_lists[name].tombstones)
         for state in task_lists[name].tasks:
             record = records.get(state.task_id)
             if record is None or (not record.terminal and state.generation > record.generation):

@@ -500,3 +500,75 @@ def test_destroy_is_confirmed_by_heartbeats_when_stopped_events_are_lost():
         node.events.clear()                           # the Stopped events are lost
     world.run(controller, 0.5, dt=0.1)
     assert replies[-1].request_id == 2 and replies[-1].success
+
+
+# --------------------------------------------------- raising the term in office
+
+def test_raising_the_term_keeps_the_table_waiting_requests_and_readiness():
+    """DESIGN 5.3: the leader saw a lone claim with term 7 (whose node may have reached some
+    executors) and raised its term to 8. It never left office: nothing is rebuilt."""
+    clock, world, store, controller, replies = leader()
+    warm(world, controller)
+    running = created(world, controller, replies)
+    for node in world.nodes.values():
+        node.view["inference_ready"] = False
+    world.publish()
+    controller.on_request(create(2, key="queued"))
+    world.run(controller, 1.0)
+    queued = next(t for t in store.records() if t != running)
+    for node in world.nodes.values():
+        node.guard.on_start(7, "other", (1, 7))      # the lone claimer's term reached the executors
+    controller._election.raise_term(8)
+    clock.advance(0.1)
+    controller.step()
+    assert controller.active and controller.term == 8
+    assert store.get(running).status == c.RUNNING and store.get(queued).status == c.PENDING
+    for node in world.nodes.values():
+        node.view["inference_ready"] = True
+    world.run(controller, 1.0, dt=0.1)
+    assert store.get(queued).status == c.RUNNING and store.get(queued).generation == (1, 8)
+    assert replies[-1].request_id == 2 and replies[-1].success   # the waiting create was answered
+    assert world.network.commands[-1].term == 8
+
+
+def test_a_new_election_still_starts_from_an_empty_table():
+    clock, world, store, controller, replies = leader()
+    warm(world, controller)
+    created(world, controller, replies)
+    controller._election.set("n2", 2)                 # followed n2 for a while...
+    world.run(controller, 1.0)
+    controller._election.set("n1", 3)                 # ...then won an election again
+    clock.advance(0.1)
+    controller.step()
+    assert not controller.active and store.records() == {}
+
+
+def test_a_task_the_other_leader_destroyed_is_not_revived_by_a_leader_that_kept_its_table():
+    clock, world, store, a, replies = leader()
+    warm(world, a)
+    task_id = created(world, a, replies)
+    primary = store.get(task_id).primary
+    b_store, b_replies = TaskStore(), Replies()
+    b = LeaderController("n3", b_store, FakeElection("n3", 2, me="n3"), world.cluster, world.network, CONFIG,
+                         clock=clock, reply=b_replies)
+    world.run(b, 7.0)                                 # a split: n3 leads too, adopts the task...
+    b.on_request(request(p.DESTROY, 9, target="n3", task_id=task_id))
+    world.run(b, 1.0)                                 # ...and destroys it; the primary leaves a tombstone
+    assert b_replies[-1].success and running_copies(world, task_id) == []
+    a._election.raise_term(3)                         # the split heals; n1 keeps leading, term 3
+    world.run(a, 10.0)
+    assert store.get(task_id).status == c.CANCELLED and running_copies(world, task_id) == []
+    assert not any(cmd.op == p.START and cmd.task_id == task_id and cmd.term == 3 for cmd in world.network.commands)
+    assert primary in world.nodes and task_id in world.nodes[primary].guard.tombstones()
+
+
+def test_a_new_election_between_two_steps_is_not_taken_for_a_raised_term():
+    """The controller may never see the node follow someone: it steps down and wins again
+    between two of its steps. claimed_term tells this apart from a raise in office."""
+    clock, world, store, controller, replies = leader()
+    warm(world, controller)
+    created(world, controller, replies)
+    controller._election.set("n1", 4)                 # claimed anew at term 4
+    clock.advance(0.1)
+    controller.step()
+    assert not controller.active and store.records() == {}

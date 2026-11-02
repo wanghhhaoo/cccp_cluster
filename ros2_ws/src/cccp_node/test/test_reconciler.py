@@ -2,7 +2,7 @@ from cccp_node.core import constants as c
 from cccp_node.core.cluster_view import NodeView, TaskListView, TaskStateView
 from cccp_node.core.generation import Generation
 from cccp_node.core.reconciler import (
-    AdoptTask, ConfirmRunning, Dispatch, FailTask, LeaderMemory, ReconcileConfig, Reschedule, ScheduleTask,
+    AdoptTask, CancelTask, ConfirmRunning, Dispatch, FailTask, LeaderMemory, ReconcileConfig, Reschedule, ScheduleTask,
     StopOrphan, reconcile,
 )
 from cccp_node.core.task_spec import TaskSpec
@@ -374,3 +374,18 @@ def test_protection_held_too_long_does_not_restart_while_the_drops_are_recent():
     assert reschedules(w.step(5.0, config)) == []
     assert reschedules(w.step(9.0, config)) == ids[3:]            # gave up after 4 s
     assert reschedules(w.step(10.0, config)) == ids[3:]           # the drops are still recent: stays off
+
+
+def test_a_task_destroyed_by_another_leader_is_cancelled_here_too():
+    """While two leaders coexisted the other one destroyed the task: its primary stopped and left
+    a tombstone. This leader, which kept its table, must not move the task elsewhere."""
+    w = World()
+    w.online = {"n1", "n2"}
+    task_id = w.submit()
+    w.table.apply(Assign(task_id, g(0), T, "n1"))
+    w.table.apply(ReportStatus("n1", task_id, g(1), c.REPORT_RUNNING))
+    w.tombstones["n1"] = [task_id]                    # stopped and buried; nothing runs it now
+    assert w.step(10.0) == [CancelTask(task_id, "destroyed elsewhere: tombstone on n1")]
+    w.table.apply(Cancel(task_id))
+    w.runs("n2", task_id, 1, role=c.ROLE_HELPER)      # a helper still running it is stopped
+    assert stops(w.step(11.0)) == [("n2", task_id, c.STOP_CANCEL)]

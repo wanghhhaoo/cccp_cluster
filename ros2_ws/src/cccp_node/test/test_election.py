@@ -144,3 +144,16 @@ def test_equal_claims_prefer_the_smaller_id():
     state = other.update(peers(candidate("z", 1, term=1, is_leader=True, leader_name="z")), 7.0,
                          me=candidate("a", 2))
     assert state.leader == "z" and not state.is_self
+
+
+def test_claimed_term_tells_a_raised_term_from_a_new_election():
+    n1 = Election("n1", CONFIG, 0.0)
+    state = n1.update(peers(peer("n2"), peer("n3")), 6.0)
+    assert (state.term, state.claimed_term) == (1, 1)
+    followers = (peer("n2", 1, follows="n1"), peer("n3", 1, follows="n1"))
+    state = n1.update(peers(*followers, peer("n0", 7, leader=True)), 7.0)   # a lone claim rejoins
+    assert (state.term, state.claimed_term, state.is_self) == (8, 1, True)   # same leadership, higher term
+    state = n1.update(peers(peer("n2", 9, leader=True, follows="n2"), peer("n3", 9, follows="n2")), 8.0)
+    assert not state.is_self and state.claimed_term == 0                     # stepped down
+    state = n1.update({}, 20.0)                                              # alone: claims again
+    assert state.is_self and state.claimed_term == state.term == 10

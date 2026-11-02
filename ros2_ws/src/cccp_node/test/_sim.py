@@ -33,7 +33,12 @@ class FakeElection:
         self.set(leader, term)
 
     def set(self, leader, term):
-        self.state = Leadership(leader, term, leader == self.me)
+        """A new election result: claimed at this term if this node won."""
+        self.state = Leadership(leader, term, leader == self.me, term if leader == self.me else 0)
+
+    def raise_term(self, term):
+        """The leader keeps leading and raises its term past a lone claim (DESIGN 5.3)."""
+        self.state = Leadership(self.state.leader, term, self.state.is_self, self.state.claimed_term)
 
 
 class SimNode:
