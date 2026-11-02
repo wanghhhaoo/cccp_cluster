@@ -66,9 +66,17 @@ def test_chain_rules():
 @pytest.mark.parametrize("field, value", [
     ("cpu_memory_required", -1.0), ("gpu_memory_required", float("nan")),
     ("latency_sensitivity", 1.5), ("params_json", "{bad"), ("params_json", "[1, 2]"),
+    ("priority", 256), ("priority", -1), ("priority", True), ("preemption_policy", 1.5),
 ])
 def test_bad_values_are_rejected(field, value):
     assert rejected(**{field: value}) == c.INVALID_INPUT
+
+
+def test_priority_is_passed_through_and_defaults_to_normal():
+    assert (norm().priority, norm().preemption_policy) == (0, 0)
+    spec = norm(priority=200, preemption_policy=0)
+    assert spec.priority == 200 and TaskSpec.from_json(spec.to_json()) == spec
+    assert TaskSpec.from_dict({"task_type": "PKCI"}).priority == 0     # a spec_json without the fields
 
 
 def test_spec_round_trips_through_dict():

@@ -5,33 +5,41 @@ from cccp_node.core.execution_guard import NOOP, REJECT, RESTART, START, STOP, E
 
 def test_start_rules():
     guard = ExecutionGuard()
-    assert guard.on_start(1, 7, 1).action == START
-    guard.started(7, 1)
-    duplicate = guard.on_start(1, 7, 1)
+    assert guard.on_start(1, "t", (1, 1)).action == START
+    guard.started("t", (1, 1))
+    duplicate = guard.on_start(1, "t", (1, 1))
     assert duplicate.action == NOOP and duplicate.success          # resend after leader change
-    assert guard.on_start(2, 7, 2).action == RESTART
-    guard.started(7, 2)
-    stale = guard.on_start(2, 7, 1)
+    assert guard.on_start(2, "t", (2, 1)).action == RESTART
+    guard.started("t", (2, 1))
+    stale = guard.on_start(2, "t", (1, 2))
     assert stale.action == REJECT and stale.error_code == c.STALE_EPOCH
+
+
+def test_same_epoch_from_a_later_term_is_a_newer_session():
+    guard = ExecutionGuard()
+    guard.started("t", (2, 4))
+    assert guard.on_start(5, "t", (2, 5)).action == RESTART
+    guard.started("t", (2, 5))
+    assert guard.on_start(5, "t", (2, 4)).error_code == c.STALE_EPOCH
 
 
 def test_old_leader_is_fenced_by_term():
     guard = ExecutionGuard()
-    guard.on_start(5, 1, 1)
-    rejected = guard.on_start(4, 2, 1)
+    guard.on_start(5, "a", (1, 5))
+    rejected = guard.on_start(4, "b", (1, 4))
     assert rejected.error_code == c.STALE_TERM and not rejected.success
-    assert guard.on_stop(4, 1, 1).error_code == c.STALE_TERM
+    assert guard.on_stop(4, "a", (1, 5)).error_code == c.STALE_TERM
     assert guard.max_term == 5
 
 
 def test_stop_rules():
     guard = ExecutionGuard()
-    assert guard.on_stop(1, 7, 1).action == NOOP                   # not running: idempotent success
-    guard.started(7, 3)
-    assert guard.on_stop(1, 7, 2).action == NOOP                   # older epoch than the running one
-    assert guard.on_stop(1, 7, 3).action == STOP
-    assert guard.on_stop(1, 7, 0).action == STOP                   # 0 = any epoch
-    guard.stopped(7)
+    assert guard.on_stop(1, "t", (1, 1)).action == NOOP            # not running: idempotent success
+    guard.started("t", (3, 1))
+    assert guard.on_stop(1, "t", (2, 1)).action == NOOP            # older than the running one
+    assert guard.on_stop(1, "t", (3, 1)).action == STOP
+    assert guard.on_stop(1, "t", (0, 0)).action == STOP            # (0, 0) = any generation
+    guard.stopped("t")
     assert guard.running() == {}
 
 

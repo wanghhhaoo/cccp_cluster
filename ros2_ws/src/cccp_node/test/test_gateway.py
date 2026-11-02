@@ -60,8 +60,8 @@ def test_running_task_is_a_success():
     def start_immediately(events):
         for event in events:
             if event.status == c.PENDING:
-                store.apply(Assign(event.task_id, 0, "n2"))
-                store.apply(ReportStatus("n2", event.task_id, 1, c.REPORT_RUNNING))
+                store.apply(Assign(event.task_id, (0, 0), 1, "n2"))
+                store.apply(ReportStatus("n2", event.task_id, (1, 1), c.REPORT_RUNNING))
 
     store.add_event_listener(start_immediately)
     gateway, _ = leader_gateway(store)

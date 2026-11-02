@@ -9,6 +9,8 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 
+from .generation import Generation
+
 
 @dataclass(frozen=True)
 class LinkView:
@@ -34,6 +36,11 @@ class TaskStateView:
     idempotency_key: str = ""
     name: str = ""
     spec_json: str = ""
+    assign_term: int = 0
+
+    @property
+    def generation(self) -> Generation:
+        return Generation(self.epoch, self.assign_term)
 
 
 @dataclass(frozen=True)
@@ -66,8 +73,8 @@ class NodeView:
                 return link
         return None
 
-    def runs(self, task_id: str, epoch: int) -> bool:
-        return any(t.task_id == task_id and t.epoch == epoch for t in self.running_tasks)
+    def runs(self, task_id: str, generation: Generation) -> bool:
+        return any(t.task_id == task_id and t.generation == generation for t in self.running_tasks)
 
 
 class ClusterView:

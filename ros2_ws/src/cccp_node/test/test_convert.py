@@ -6,6 +6,7 @@ from cccp_node.control.controller import StartRequest
 from cccp_node.control.gateway import CreateReply, DestroyReply, QueryReply
 from cccp_node.core import constants as c
 from cccp_node.core.cluster_view import NodeView, TaskStateView
+from cccp_node.core.generation import Generation
 from cccp_node.core.link_estimator import LinkReport
 from cccp_node.core.naming import ros_namespace
 from cccp_node.core.task_spec import TaskSpec
@@ -21,7 +22,7 @@ def blank():
 
 
 def test_node_status_round_trip_keeps_full_task_state():
-    task = TaskStateView("t-4", 2, c.ROLE_PRIMARY, "edge-01", ("edge-02",), "k4", "demo", SPEC.to_json())
+    task = TaskStateView("t-4", 2, c.ROLE_PRIMARY, "edge-01", ("edge-02",), "k4", "demo", SPEC.to_json(), 3)
     view = NodeView("edge-01", incarnation=5, seq=9, leader_name="edge-02", term=3, inference_ready=True,
                     algorithms_ready=("PKCI",), cpu_cores=8, cpu_usage=12.5, running_tasks=(task,))
     links = [LinkReport("edge-02", 12.0, 1.5, 0.1, echo_seq=77, echo_delay_ms=300)]
@@ -34,8 +35,10 @@ def test_node_status_round_trip_keeps_full_task_state():
 
 
 def test_start_request_carries_the_whole_spec():
-    start = convert.fill_start_request(blank(), StartRequest(7, "t-1", 2, c.ROLE_HELPER, "a", ("b",), "k", "n", SPEC))
+    start = convert.fill_start_request(blank(), StartRequest(7, "t-1", Generation(2, 6), c.ROLE_HELPER, "a", ("b",),
+                                                             "k", "n", SPEC))
     assert (start.term, start.task_id, start.helper_nodes, start.idempotency_key) == (7, "t-1", ["b"], "k")
+    assert (start.epoch, start.assign_term) == (2, 6)
     assert TaskSpec.from_json(start.spec_json) == SPEC
 
 
@@ -66,10 +69,10 @@ def test_query_and_destroy_round_trip_for_forwarding():
 def test_status_report_and_result_conversion():
     status = convert.fill_task_status(blank(), StatusEvent(4, "t-1", "n", "PKCI", c.RUNNING, 2, "a", "m"), 7, "now")
     assert (status.seq, status.term, status.epoch, status.task_id) == (4, 7, 2, "t-1")
-    report = convert.report_from_msg(NS(node_name="a", task_id="t-1", epoch=2, state=c.REPORT_RUNNING,
+    report = convert.report_from_msg(NS(node_name="a", task_id="t-1", epoch=2, assign_term=5, state=c.REPORT_RUNNING,
                                         error_code="", message="", incarnation=9, seq=3))
-    assert (report.task_id, report.epoch, report.seq) == ("t-1", 2, 3)
-    result = NS(task_id="t-1", epoch=2, node_name="a", task_type="PKCT", drone_id=0, frame_id=5, success=True,
+    assert (report.task_id, report.generation, report.seq) == ("t-1", (2, 5), 3)
+    result = NS(task_id="t-1", epoch=2, assign_term=5, node_name="a", task_type="PKCT", drone_id=0, frame_id=5, success=True,
                 valid=True, message="ok", latency_ms=12.3456, source_stamp=NS(sec=1, nanosec=500000000),
                 payload=b"xyz", x=1.0, y=2.0, width=3.0, height=4.0, confidence=0.5)
     data = convert.result_to_dict(result)

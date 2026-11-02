@@ -7,8 +7,9 @@ from cccp_task_executor.annotate import annotate
 from cccp_task_executor.executor_node import parse_params, tracker_id
 
 
-def test_tracker_sessions_are_isolated_per_epoch():
-    assert tracker_id(7, 1) == "task-7-1" and tracker_id(7, 2) != tracker_id(7, 1)
+def test_tracker_sessions_are_isolated_per_generation():
+    assert tracker_id(7, (1, 4)) == "task-7-1-4"
+    assert len({tracker_id(7, g) for g in ((1, 4), (2, 4), (2, 5))}) == 3
 
 
 def test_parse_params_normalizes_pkct_bbox():

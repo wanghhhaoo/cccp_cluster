@@ -255,12 +255,13 @@ def test_unpinned_task_moves_when_its_primary_dies(cluster):
                                        CreateTask.Response())
     assert reply.success, reply.message
     primary = cluster[reply.assigned_node]
-    assert primary.executor._tasks[reply.task_id].tracker_id == "task-%s-1" % reply.task_id
+    assert primary.executor._tasks[reply.task_id].tracker_id.startswith("task-%s-1-" % reply.task_id)
     kill(primary)
     record = wait_for(record_where(cluster, reply.task_id, lambda r: r.epoch == 2 and r.status == c.RUNNING),
                       timeout=20.0)
     assert record.primary != primary.name and runners(cluster, reply.task_id) == [record.primary]
-    assert cluster[record.primary].executor._tasks[reply.task_id].tracker_id == "task-%s-2" % reply.task_id
+    assert cluster[record.primary].executor._tasks[reply.task_id].tracker_id == "task-%s-%d-%d" % (
+        reply.task_id, *record.generation)
 
 
 def test_task_running_on_the_leader_is_lost_with_it_and_can_be_resubmitted(cluster):

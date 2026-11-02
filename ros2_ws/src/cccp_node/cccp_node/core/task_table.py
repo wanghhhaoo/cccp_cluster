@@ -1,10 +1,14 @@
 """The cluster leader's task table: what should exist and who should run it (CONVENTIONS 5.2).
 
 The table lives only in the current leader's memory. What executors actually
-run is reported in NodeStatus.tasks; after an election the new leader starts
+run is reported in every node's TaskList; after an election the new leader starts
 with an empty table and rebuilds it from those reports (Adopt). Tasks that had
 not reached any executor when the old leader died are lost: the caller sees
 its request fail and retries with the same idempotency key (CONVENTIONS 5.3).
+
+Each record carries its execution generation (epoch, assign_term). Commands
+that change it (Assign, Requeue) or act on it (MarkFailed) name the generation
+they expect, so two decisions made from the same view cannot both succeed.
 
 All changes go through apply(command) and the records are immutable, so
 readers can keep them without being able to change the table. Every status
@@ -17,6 +21,7 @@ from dataclasses import dataclass, replace
 from typing import Union
 
 from . import constants as c
+from .generation import Generation
 from .task_spec import TaskSpec
 
 _RANK = {c.PENDING: 0, c.SCHEDULED: 1, c.RUNNING: 2, c.FINISHED: 3, c.FAILED: 3, c.CANCELLED: 3}
@@ -31,6 +36,7 @@ class TaskRecord:
     name: str
     status: str = c.PENDING
     epoch: int = 0
+    assign_term: int = 0
     primary: str = ""
     helpers: tuple[str, ...] = ()
     error_code: str = ""
@@ -48,9 +54,13 @@ class TaskRecord:
         return ((self.primary,) if self.primary else ()) + self.helpers
 
     @property
-    def order(self) -> tuple[int, int]:
-        """(epoch, status rank). Only ever increases (CONVENTIONS 5.5)."""
-        return self.epoch, _RANK[self.status]
+    def generation(self) -> Generation:
+        return Generation(self.epoch, self.assign_term)
+
+    @property
+    def order(self) -> tuple[int, int, int]:
+        """(epoch, assign_term, status rank). Only ever increases (CONVENTIONS 5.5)."""
+        return self.epoch, self.assign_term, _RANK[self.status]
 
 
 @dataclass(frozen=True)
@@ -92,30 +102,34 @@ class Submit:
 @dataclass(frozen=True)
 class Adopt:
     """Leader: take over a task that an executor reports running but this table does not
-    know, or knows at an older epoch (after an election, or a task another leader placed
-    while two leaders coexisted)."""
+    know, or knows at an older generation (after an election, or a task another leader
+    placed while two leaders coexisted). The generation is kept as reported: adopting
+    is claiming, not reassigning, and a new assign_term would restart the session.
+    cancelled: some node holds a tombstone for the task, so it was destroyed and must
+    not come back to life (DESIGN 4.5)."""
 
     OP = "adopt"
     task_id: str
     idempotency_key: str
     name: str
     spec: TaskSpec
-    epoch: int
+    generation: Generation
     primary: str
     helpers: tuple[str, ...] = ()
     reported_by: str = ""
+    cancelled: bool = False
     now_ms: int = 0
 
 
 @dataclass(frozen=True)
 class Assign:
-    """Leader: (re)schedule. Applies only while the task is still at expected_epoch;
-    the epoch then advances by one, so two decisions made from the same view
-    cannot both succeed."""
+    """Leader of term: (re)schedule. Applies only while the task is still at the
+    expected generation, which then moves to (epoch + 1, term)."""
 
     OP = "assign"
     task_id: str
-    expected_epoch: int
+    expected: Generation
+    term: int
     primary: str
     helpers: tuple[str, ...] = ()
     now_ms: int = 0
@@ -123,23 +137,25 @@ class Assign:
 
 @dataclass(frozen=True)
 class Requeue:
-    """Leader: put a task back to Pending (its primary is gone and no node fits yet)."""
+    """Leader of term: put a task back to Pending (its primary is gone and no node fits
+    yet, or a participant turned the start down). Also moves to (epoch + 1, term)."""
 
     OP = "requeue"
     task_id: str
-    expected_epoch: int
+    expected: Generation
+    term: int
     reason: str = ""
     now_ms: int = 0
 
 
 @dataclass(frozen=True)
 class ReportStatus:
-    """Leader, relaying a TaskReport from an executing node."""
+    """Leader, relaying an ExecEvent from an executing node."""
 
     OP = "report_status"
     node: str
     task_id: str
-    epoch: int
+    generation: Generation
     state: str
     error_code: str = ""
     message: str = ""
@@ -152,7 +168,7 @@ class MarkFailed:
 
     OP = "mark_failed"
     task_id: str
-    expected_epoch: int
+    expected: Generation
     error_code: str
     message: str = ""
     now_ms: int = 0
@@ -211,6 +227,13 @@ class TaskTable:
     def active_tasks(self) -> list[TaskRecord]:
         return [r for r in self._tasks.values() if not r.terminal]
 
+    def pending_tasks(self) -> list[TaskRecord]:
+        """Pending records in the order to schedule them: higher priority first, then
+        submission order (DESIGN 8.1). Insertion order stands in for submission time,
+        since the wall clocks in the records must not be compared."""
+        pending = [r for r in self._tasks.values() if r.status == c.PENDING]
+        return sorted(pending, key=lambda r: -r.spec.priority)     # stable: keeps insertion order
+
     # ----------------------------------------------------------------- writes
     def apply(self, command: Command) -> ApplyResult:
         return getattr(self, "_apply_" + command.OP)(command)
@@ -238,22 +261,28 @@ class TaskTable:
 
     def _apply_adopt(self, cmd: Adopt) -> ApplyResult:
         known = self._tasks.get(cmd.task_id)
-        if known is not None and (known.terminal or cmd.epoch <= known.epoch):
+        if known is not None and (known.terminal or cmd.generation <= known.generation):
             return ApplyResult(True, message="no change", task_id=cmd.task_id)
         key = known.idempotency_key if known is not None else cmd.idempotency_key   # fixed at creation
         owner = self._by_key.get(key)
         if owner is not None and owner != cmd.task_id:
             return _error(c.INVALID_STATE, "idempotency key already used by task %s" % owner, cmd.task_id)
-        message = "adopted epoch %d on %s (reported by %s)" % (cmd.epoch, cmd.primary, cmd.reported_by or "?")
+        generation = Generation(*cmd.generation)
+        message = "adopted %s on %s (reported by %s)" % (generation, cmd.primary, cmd.reported_by or "?")
+        if cmd.cancelled:
+            message += ", destroyed before"
         record = TaskRecord(
             task_id=cmd.task_id,
             idempotency_key=key,
             spec=cmd.spec,
             name=cmd.name or "%s-%s" % (cmd.spec.task_type.lower(), cmd.task_id[:8]),
-            status=c.RUNNING,
-            epoch=cmd.epoch,
+            status=c.CANCELLED if cmd.cancelled else c.RUNNING,
+            epoch=generation.epoch,
+            assign_term=generation.assign_term,
             primary=cmd.primary,
             helpers=tuple(cmd.helpers),
+            error_code=c.CANCELLED_ERROR if cmd.cancelled else "",
+            error_message="destroyed before the leader changed" if cmd.cancelled else "",
             last_event=message,
             submitted_ms=known.submitted_ms if known else cmd.now_ms,
             updated_ms=cmd.now_ms,
@@ -262,7 +291,7 @@ class TaskTable:
         return ApplyResult(True, message=message, task_id=cmd.task_id, events=(self._emit(record),))
 
     def _apply_assign(self, cmd: Assign) -> ApplyResult:
-        record, error = self._changeable(cmd.task_id, cmd.expected_epoch)
+        record, error = self._changeable(cmd.task_id, cmd.expected)
         if error:
             return error
         helpers = cmd.helpers
@@ -274,15 +303,17 @@ class TaskTable:
         message = "scheduled to %s" % cmd.primary
         if helpers:
             message += " with helpers %s" % ", ".join(helpers)
-        return self._commit(record, message, cmd.now_ms, status=c.SCHEDULED, epoch=record.epoch + 1,
+        epoch, assign_term = record.generation.next(cmd.term)
+        return self._commit(record, message, cmd.now_ms, status=c.SCHEDULED, epoch=epoch, assign_term=assign_term,
                             primary=cmd.primary, helpers=helpers, error_code="", error_message="")
 
     def _apply_requeue(self, cmd: Requeue) -> ApplyResult:
-        record, error = self._changeable(cmd.task_id, cmd.expected_epoch)
+        record, error = self._changeable(cmd.task_id, cmd.expected)
         if error:
             return error
+        epoch, assign_term = record.generation.next(cmd.term)
         return self._commit(record, cmd.reason or "requeued", cmd.now_ms, status=c.PENDING,
-                            epoch=record.epoch + 1, primary="", helpers=())
+                            epoch=epoch, assign_term=assign_term, primary="", helpers=())
 
     def _apply_report_status(self, cmd: ReportStatus) -> ApplyResult:
         record = self._tasks.get(cmd.task_id)
@@ -291,12 +322,12 @@ class TaskTable:
         target = _REPORTED.get(cmd.state)
         if target is None and cmd.state != c.REPORT_STOPPED:
             return _error(c.INVALID_INPUT, "unknown report state %r" % cmd.state, cmd.task_id)
-        if cmd.epoch < record.epoch:
-            return _error(c.STALE_EPOCH, "report for epoch %d, task %s is at epoch %d"
-                          % (cmd.epoch, cmd.task_id, record.epoch), cmd.task_id)
-        if cmd.epoch > record.epoch:
-            return _error(c.INVALID_STATE, "report for future epoch %d of task %s"
-                          % (cmd.epoch, cmd.task_id), cmd.task_id)
+        if cmd.generation < record.generation:
+            return _error(c.STALE_EPOCH, "report for %s, task %s is at %s"
+                          % (Generation(*cmd.generation), cmd.task_id, record.generation), cmd.task_id)
+        if cmd.generation > record.generation:
+            return _error(c.INVALID_STATE, "report for future generation %s of task %s"
+                          % (Generation(*cmd.generation), cmd.task_id), cmd.task_id)
         # Only the task primary drives the task state; helper reports, Stopped
         # acknowledgements and late reports for finished tasks change nothing.
         if record.terminal or target is None or cmd.node != record.primary:
@@ -308,7 +339,7 @@ class TaskTable:
         return self._commit(record, message, cmd.now_ms, **changes)
 
     def _apply_mark_failed(self, cmd: MarkFailed) -> ApplyResult:
-        record, error = self._changeable(cmd.task_id, cmd.expected_epoch)
+        record, error = self._changeable(cmd.task_id, cmd.expected)
         if error:
             return error
         if not cmd.error_code:
@@ -339,16 +370,16 @@ class TaskTable:
         self._tasks[record.task_id] = record
         self._by_key[record.idempotency_key] = record.task_id
 
-    def _changeable(self, task_id: str, expected_epoch: int | None = None):
+    def _changeable(self, task_id: str, expected: Generation | None = None):
         """(record, None) if the task can still change, else (None, error result)."""
         record = self._tasks.get(task_id)
         if record is None:
             return None, _error(c.NOT_FOUND, "task %s does not exist" % task_id, task_id)
         if record.terminal:
             return None, _error(c.INVALID_STATE, "task %s is already %s" % (task_id, record.status), task_id)
-        if expected_epoch is not None and expected_epoch != record.epoch:
-            return None, _error(c.STALE_EPOCH, "task %s is at epoch %d, not %d"
-                                % (task_id, record.epoch, expected_epoch), task_id)
+        if expected is not None and tuple(expected) != record.generation:
+            return None, _error(c.STALE_EPOCH, "task %s is at %s, not %s"
+                                % (task_id, record.generation, Generation(*expected)), task_id)
         return record, None
 
     def _commit(self, record: TaskRecord, message: str, now_ms: int, **changes) -> ApplyResult:

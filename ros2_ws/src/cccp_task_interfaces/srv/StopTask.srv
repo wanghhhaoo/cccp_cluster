@@ -4,7 +4,8 @@
 
 uint64 term
 string task_id
-uint32 epoch                      # 0 表示停止该任务的所有代次
+uint32 epoch                      # epoch 和 assign_term 都为 0 表示停止该任务的所有代次
+uint32 assign_term
 string reason
 ---
 bool success

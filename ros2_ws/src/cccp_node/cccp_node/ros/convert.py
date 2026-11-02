@@ -52,11 +52,12 @@ def node_view_from_msg(msg: Any) -> NodeView:
 
 def task_state_from_msg(msg: Any) -> TaskStateView:
     return TaskStateView(msg.task_id, msg.epoch, msg.role, msg.primary_node, tuple(msg.helper_nodes),
-                         msg.idempotency_key, msg.name, msg.spec_json)
+                         msg.idempotency_key, msg.name, msg.spec_json, msg.assign_term)
 
 
 def fill_task_state(msg: Any, state: TaskStateView) -> Any:
-    return _set(msg, task_id=state.task_id, epoch=state.epoch, role=state.role, primary_node=state.primary,
+    return _set(msg, task_id=state.task_id, epoch=state.epoch, assign_term=state.assign_term, role=state.role,
+                primary_node=state.primary,
                 helper_nodes=list(state.helpers), idempotency_key=state.idempotency_key, name=state.name,
                 spec_json=state.spec_json)
 
@@ -159,11 +160,12 @@ def fill_task_status(msg: Any, event: StatusEvent, term: int, stamp: Any) -> Any
 
 def report_from_msg(msg: Any) -> TaskReportView:
     return TaskReportView(msg.node_name, msg.task_id, msg.epoch, msg.state, msg.error_code, msg.message,
-                          msg.incarnation, msg.seq)
+                          msg.incarnation, msg.seq, msg.assign_term)
 
 
 def fill_start_request(request: Any, start: StartRequest) -> Any:
-    return _set(request, term=start.term, task_id=start.task_id, epoch=start.epoch, role=start.role,
+    return _set(request, term=start.term, task_id=start.task_id, epoch=start.generation.epoch,
+                assign_term=start.generation.assign_term, role=start.role,
                 primary_node=start.primary_node, helper_nodes=list(start.helper_nodes),
                 idempotency_key=start.idempotency_key, name=start.name, spec_json=start.spec.to_json())
 
@@ -171,7 +173,7 @@ def fill_start_request(request: Any, start: StartRequest) -> Any:
 def result_to_dict(msg: Any) -> dict:
     """TaskResult -> JSON-friendly dict for UE (payload summarised, not copied). From CCCP ue_api."""
     data = {
-        "task_id": msg.task_id, "epoch": msg.epoch, "node": msg.node_name, "task_type": msg.task_type,
+        "task_id": msg.task_id, "epoch": msg.epoch, "assign_term": msg.assign_term, "node": msg.node_name, "task_type": msg.task_type,
         "drone_id": msg.drone_id, "frame_id": msg.frame_id, "success": msg.success, "valid": msg.valid,
         "message": msg.message, "latency_ms": round(float(msg.latency_ms), 3),
         "source_stamp": msg.source_stamp.sec + msg.source_stamp.nanosec * 1e-9,

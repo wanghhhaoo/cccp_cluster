@@ -44,6 +44,8 @@ class TaskSpec:
     level: str = ""
     image_topic: str = ""
     params_json: str = ""
+    priority: int = 0            # uint8, larger is more important: 0 normal, 100 important, 200 urgent
+    preemption_policy: int = 0   # uint8, 0 = never preempt others; other values reserved
 
     @property
     def participants(self) -> int:
@@ -136,6 +138,10 @@ def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth
         value = getattr(spec, name)
         if not math.isfinite(value) or value < 0:
             raise SpecError(c.INVALID_INPUT, "%s must be a non-negative number" % name)
+    for name in ("priority", "preemption_policy"):
+        value = getattr(spec, name)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255:
+            raise SpecError(c.INVALID_INPUT, "%s must be an integer within [0, 255]" % name)
     if not 0.0 <= spec.latency_sensitivity <= 1.0:
         raise SpecError(c.INVALID_INPUT, "latency_sensitivity must be within [0, 1]")
     if spec.params_json.strip():

@@ -23,6 +23,7 @@ from typing import Callable, Mapping, Protocol
 from ..core import constants as c
 from ..core.cluster_view import ClusterView
 from ..core.election import Leadership
+from ..core.generation import Generation
 from ..core.reconciler import (
     AdoptTask, ConfirmRunning, Dispatch, FailTask, LeaderMemory, ReconcileConfig, Reschedule, ScheduleTask,
     StopOrphan, reconcile,
@@ -42,7 +43,7 @@ PERMANENT_START_ERRORS = frozenset({c.INVALID_INPUT, c.UNSUPPORTED_VERSION})
 class StartRequest:
     term: int
     task_id: str
-    epoch: int
+    generation: Generation
     role: str
     primary_node: str
     helper_nodes: tuple[str, ...]
@@ -66,7 +67,7 @@ class LeadershipSource(Protocol):
 class Dispatcher(Protocol):
     def start(self, node: str, request: StartRequest) -> DispatchResult: ...
 
-    def stop(self, node: str, term: int, task_id: str, epoch: int, reason: str) -> DispatchResult: ...
+    def stop(self, node: str, term: int, task_id: str, generation: Generation, reason: str) -> DispatchResult: ...
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,11 @@ class TaskReportView:
     message: str = ""
     incarnation: int = 0
     seq: int = 0
+    assign_term: int = 0
+
+    @property
+    def generation(self) -> Generation:
+        return Generation(self.epoch, self.assign_term)
 
 
 @dataclass(frozen=True)
@@ -191,11 +197,11 @@ class LeaderController:
                 continue
             self._last_report_seq[key] = report.seq
             if apply and not self._requeue_stalled(report):
-                result = self._submit(ReportStatus(report.node_name, report.task_id, report.epoch, report.state,
-                                                   report.error_code, report.message, self._wall_ms()))
+                result = self._submit(ReportStatus(report.node_name, report.task_id, report.generation,
+                                                   report.state, report.error_code, report.message, self._wall_ms()))
                 if not result.ok and result.error_code != c.STALE_EPOCH:
-                    log.warning("task=%s epoch=%d node=%s report %s not applied: %s", report.task_id,
-                                report.epoch, report.node_name, report.state, result.message)
+                    log.warning("task=%s gen=%s node=%s report %s not applied: %s", report.task_id,
+                                report.generation, report.node_name, report.state, result.message)
 
     def _requeue_stalled(self, report: TaskReportView) -> bool:
         """The primary got no input frames for a while (NOT_READY, CONVENTIONS 5.5): the input may
@@ -204,14 +210,14 @@ class LeaderController:
         if report.state != c.REPORT_FAILED or report.error_code != c.NOT_READY:
             return False
         record = self._store.get(report.task_id)
-        if (record is None or record.terminal or record.epoch != report.epoch
+        if (record is None or record.terminal or record.generation != report.generation
                 or record.primary != report.node_name or record.spec.request_node):
             return False
         self._stalls[record.task_id] += 1
         if self._stalls[record.task_id] >= self._config.max_input_stalls:
             return False
         self._failures.setdefault(record.task_id, {})[report.node_name] = self._clock()
-        self._submit(Requeue(record.task_id, record.epoch, "%s (%d/%d)" % (
+        self._submit(Requeue(record.task_id, record.generation, self._ready_term, "%s (%d/%d)" % (
             report.message or "no input on %s" % report.node_name, self._stalls[record.task_id],
             self._config.max_input_stalls), self._wall_ms()))
         return True
@@ -226,26 +232,26 @@ class LeaderController:
             record = records.get(getattr(action, "task_id", ""))
             if isinstance(action, AdoptTask):
                 result = self._submit(Adopt(action.task_id, action.idempotency_key, action.name, action.spec,
-                                            action.epoch, action.primary, action.helpers, action.reported_by,
-                                            self._wall_ms()))
+                                            action.generation, action.primary, action.helpers, action.reported_by,
+                                            now_ms=self._wall_ms()))
                 if result.ok:
-                    log.info("task=%s epoch=%d adopted from %s (primary %s)", action.task_id, action.epoch,
+                    log.info("task=%s gen=%s adopted from %s (primary %s)", action.task_id, action.generation,
                              action.reported_by, action.primary)
             elif isinstance(action, ScheduleTask):
                 self._place(record, online, now)
             elif isinstance(action, Reschedule):
-                log.info("task=%s epoch=%d reschedule: %s", action.task_id, action.expected_epoch, action.reason)
+                log.info("task=%s gen=%s reschedule: %s", action.task_id, action.expected, action.reason)
                 self._place(record, online, now, reason=action.reason)
             elif isinstance(action, Dispatch):
                 self._start(record, action.node, now)
             elif isinstance(action, ConfirmRunning):
-                self._submit(ReportStatus(action.node, action.task_id, action.epoch, c.REPORT_RUNNING,
+                self._submit(ReportStatus(action.node, action.task_id, action.generation, c.REPORT_RUNNING,
                                           message="running on %s (seen in NodeStatus)" % action.node,
                                           now_ms=self._wall_ms()))
             elif isinstance(action, StopOrphan):
                 self._stop(action, now)
             elif isinstance(action, FailTask):
-                self._submit(MarkFailed(action.task_id, action.expected_epoch, action.error_code,
+                self._submit(MarkFailed(action.task_id, action.expected, action.error_code,
                                         action.message, self._wall_ms()))
         self._prune(records, now)
 
@@ -261,48 +267,49 @@ class LeaderController:
         )
         if not result.ok:
             if reason:   # the current placement is unusable: go back to Pending and keep trying
-                self._submit(Requeue(record.task_id, record.epoch, "%s; %s" % (reason, result.message),
-                                     self._wall_ms()))
+                self._submit(Requeue(record.task_id, record.generation, self._ready_term,
+                                     "%s; %s" % (reason, result.message), self._wall_ms()))
             else:
                 log.debug("task=%s still pending: %s", record.task_id, result.message)
             return
         placement = result.placement
-        assigned = self._submit(Assign(record.task_id, record.epoch, placement.primary, placement.helpers,
-                                       self._wall_ms()))
+        assigned = self._submit(Assign(record.task_id, record.generation, self._ready_term, placement.primary,
+                                       placement.helpers, self._wall_ms()))
         if not assigned.ok:
             return
         updated = self._store.get(record.task_id)
-        log.info("task=%s epoch=%d term=%d scheduled primary=%s helpers=%s", updated.task_id, updated.epoch,
-                 self._ready_term, updated.primary, ",".join(updated.helpers) or "-")
+        log.info("task=%s gen=%s scheduled primary=%s helpers=%s", updated.task_id, updated.generation,
+                 updated.primary, ",".join(updated.helpers) or "-")
         for node in updated.nodes:      # commit first, then dispatch (CONVENTIONS 5.3)
             if not self._start(updated, node, now):
                 break
 
     def _start(self, record: TaskRecord, node: str, now: float) -> bool:
         role = c.ROLE_PRIMARY if node == record.primary else c.ROLE_HELPER
-        self._memory.note_dispatch(record.task_id, record.epoch, node, now)
-        request = StartRequest(self._ready_term, record.task_id, record.epoch, role, record.primary,
+        self._memory.note_dispatch(record.task_id, record.generation, node, now)
+        request = StartRequest(self._ready_term, record.task_id, record.generation, role, record.primary,
                                record.helpers, record.idempotency_key, record.name, record.spec)
         result = self._dispatcher.start(node, request)
         if result.success:
             return True
-        log.warning("task=%s epoch=%d node=%s start failed: %s %s", record.task_id, record.epoch, node,
+        log.warning("task=%s gen=%s node=%s start failed: %s %s", record.task_id, record.generation, node,
                     result.error_code, result.message)
         if result.error_code == c.STALE_TERM:
             return False                # a newer leader exists; it will take over
         self._failures.setdefault(record.task_id, {})[node] = now
         message = "start on %s failed: %s" % (node, result.message or result.error_code)
         if result.error_code in PERMANENT_START_ERRORS:
-            self._submit(MarkFailed(record.task_id, record.epoch, c.DISPATCH_FAILED, message, self._wall_ms()))
+            self._submit(MarkFailed(record.task_id, record.generation, c.DISPATCH_FAILED, message, self._wall_ms()))
         else:
-            self._submit(Requeue(record.task_id, record.epoch, message, self._wall_ms()))
+            self._submit(Requeue(record.task_id, record.generation, self._ready_term, message, self._wall_ms()))
         return False
 
     def _stop(self, action: StopOrphan, now: float) -> None:
-        self._memory.note_stop(action.node, action.task_id, action.epoch, now)
-        result = self._dispatcher.stop(action.node, self._ready_term, action.task_id, action.epoch, action.reason)
+        self._memory.note_stop(action.node, action.task_id, action.generation, now)
+        result = self._dispatcher.stop(action.node, self._ready_term, action.task_id, action.generation,
+                                       action.reason)
         if not result.success:
-            log.warning("task=%s epoch=%d node=%s stop failed: %s", action.task_id, action.epoch,
+            log.warning("task=%s gen=%s node=%s stop failed: %s", action.task_id, action.generation,
                         action.node, result.message)
 
     def _prune(self, records: Mapping[str, TaskRecord], now: float) -> None:

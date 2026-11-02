@@ -10,7 +10,8 @@ string STATE_STOPPED="Stopped"
 
 string node_name
 string task_id
-uint32 epoch                      # 主节点会丢弃 epoch 小于任务当前 epoch 的报告
+uint32 epoch                      # 主节点会丢弃执行代次 (epoch, assign_term) 小于任务当前代次的报告
+uint32 assign_term
 string state
 string error_code                 # 见 ErrorCodes.msg；成功时为空
 string message

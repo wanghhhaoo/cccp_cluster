@@ -7,8 +7,9 @@ per-frame results and composited images, reports state changes on
 /cluster/task_report and publishes its running tasks on <ns>/exec/status.
 
 Every command passes the ExecutionGuard first (CONVENTIONS 5.4): commands from
-an older term are rejected, a repeated start of the same epoch is a no-op, and
-a newer epoch replaces the running session.
+an older term are rejected, a repeated start of the same generation
+(epoch, assign_term) is a no-op, and a newer generation replaces the running
+session.
 
 Frames that arrive while a task's previous frame is still being processed are
 skipped, so each task always works on the latest frame and PKCT receives its
@@ -34,6 +35,7 @@ from collab_inference_interfaces.srv import Classify, InitTracker, ResetTracker,
 from cccp_node import names
 from cccp_node.core import constants as c
 from cccp_node.core.execution_guard import NOOP, REJECT, RESTART, STOP, ExecutionGuard
+from cccp_node.core.generation import Generation
 from cccp_node.core.input_source import FETCH_EACH, parse_input, plan_input
 from cccp_node.core.task_spec import TaskSpec
 from cccp_node.ros import qos
@@ -64,9 +66,9 @@ def parse_params(task_type, params_json):
     return params
 
 
-def tracker_id(task_id, epoch):
-    """PKCT sessions are isolated per task and epoch (CONVENTIONS 4.1)."""
-    return "task-%s-%d" % (task_id, epoch)
+def tracker_id(task_id, generation):
+    """PKCT sessions are isolated per task and generation (CONVENTIONS 4.1)."""
+    return "task-%s-%d-%d" % (task_id, *generation)
 
 
 @dataclass
@@ -94,6 +96,11 @@ class ActiveTask:
     failures: int = 0
     reported_first_result: bool = False
     last_input: float = 0.0      # time.monotonic() of the start or of the last frame received
+    assign_term: int = 0         # with epoch, the generation of this session
+
+    @property
+    def generation(self):
+        return Generation(self.epoch, self.assign_term)
 
 
 class TaskExecutor(Node):
@@ -169,7 +176,8 @@ class TaskExecutor(Node):
         msg.seq = self._status_seq
         msg.algorithms_ready = self._algorithms_ready()
         msg.inference_ready = bool(msg.algorithms_ready)
-        msg.tasks = [TaskState(task_id=t.task_id, epoch=t.epoch, role=t.role, primary_node=t.primary,
+        msg.tasks = [TaskState(task_id=t.task_id, epoch=t.epoch, assign_term=t.assign_term, role=t.role,
+                               primary_node=t.primary,
                                helper_nodes=list(t.helpers), idempotency_key=t.idempotency_key, name=t.name,
                                spec_json=t.spec_json)
                      for t in sorted(self._tasks.values(), key=lambda t: t.task_id)]
@@ -182,6 +190,7 @@ class TaskExecutor(Node):
         msg.node_name = self._node_name
         msg.task_id = task.task_id
         msg.epoch = task.epoch
+        msg.assign_term = task.assign_term
         msg.state = state
         msg.error_code = error_code
         msg.message = message
@@ -192,7 +201,8 @@ class TaskExecutor(Node):
 
     # ------------------------------------------------------------------ services
     def _on_start(self, request, response):
-        decision = self._guard.on_start(int(request.term), request.task_id, int(request.epoch))
+        generation = Generation(int(request.epoch), int(request.assign_term))
+        decision = self._guard.on_start(int(request.term), request.task_id, generation)
         response.success = decision.success
         response.error_code = decision.error_code
         response.message = decision.message
@@ -219,17 +229,18 @@ class TaskExecutor(Node):
                 response.message = "%s cannot read %s: airsim_host is not set" % (self._node_name, spec.input)
                 return response
             if decision.action == RESTART:
-                self._remove(self._tasks[request.task_id], c.REPORT_STOPPED, "replaced by a newer epoch")
+                self._remove(self._tasks[request.task_id], c.REPORT_STOPPED, "replaced by %s" % (generation,))
             task = ActiveTask(
                 task_id=request.task_id,
-                epoch=int(request.epoch),
+                epoch=generation.epoch,
+                assign_term=generation.assign_term,
                 role=role,
                 task_type=task_type,
                 drone_id=int(spec.drone_id),
                 level=spec.level or "full",
                 image_topic=plan.topic,
                 params=params,
-                tracker_id=tracker_id(request.task_id, int(request.epoch)),
+                tracker_id=tracker_id(request.task_id, generation),
                 primary=request.primary_node,
                 helpers=tuple(request.helper_nodes),
                 idempotency_key=request.idempotency_key,
@@ -243,29 +254,30 @@ class TaskExecutor(Node):
             if task.fetch:
                 self._feeds.acquire(*task.fetch)
             self._tasks[task.task_id] = task
-            self._guard.started(task.task_id, task.epoch)
+            self._guard.started(task.task_id, task.generation)
             self._ensure_subscription(task.image_topic, task.compressed)
-            message = "%s started %s epoch %d as %s, input %s via %s" % (
-                self._node_name, task_type, task.epoch, task.role, task.input or "local camera",
+            message = "%s started %s %s as %s, input %s via %s" % (
+                self._node_name, task_type, task.generation, task.role, task.input or "local camera",
                 self.resolve_topic_name(task.image_topic))
             self._report(task, c.REPORT_RUNNING, message=message)
             response.success, response.error_code, response.message = True, "", message
-            self.get_logger().info("task=%s epoch=%d term=%d %s" % (task.task_id, task.epoch, request.term, message))
+            self.get_logger().info("task=%s gen=%s term=%d %s" % (task.task_id, task.generation, request.term, message))
         except Exception as exc:
             response.success, response.error_code, response.message = False, c.INVALID_INPUT, str(exc)
             self.get_logger().error("task=%s start failed: %s" % (request.task_id, exc))
         return response
 
     def _on_stop(self, request, response):
-        decision = self._guard.on_stop(int(request.term), request.task_id, int(request.epoch))
+        decision = self._guard.on_stop(int(request.term), request.task_id,
+                                       Generation(int(request.epoch), int(request.assign_term)))
         response.success, response.error_code, response.message = decision.success, decision.error_code, \
             decision.message
         if decision.action == STOP:
             task = self._tasks.get(request.task_id)
             if task is not None:
                 self._remove(task, c.REPORT_STOPPED, request.reason or "stopped by leader")
-                response.message = "task %s epoch %d stopped on %s" % (task.task_id, task.epoch, self._node_name)
-                self.get_logger().info("task=%s epoch=%d %s (%s)" % (task.task_id, task.epoch,
+                response.message = "task %s %s stopped on %s" % (task.task_id, task.generation, self._node_name)
+                self.get_logger().info("task=%s gen=%s %s (%s)" % (task.task_id, task.generation,
                                                                      response.message, request.reason))
         return response
 
@@ -340,7 +352,7 @@ class TaskExecutor(Node):
                 continue
             reason = "no input frames for %.0f s from %s (%s)" % (
                 idle, task.input or "local camera", self.resolve_topic_name(task.image_topic))
-            self.get_logger().error("task=%s epoch=%d failed: %s" % (task.task_id, task.epoch, reason))
+            self.get_logger().error("task=%s gen=%s failed: %s" % (task.task_id, task.generation, reason))
             self._remove(task, c.REPORT_FAILED, reason, c.NOT_READY)
 
     # ------------------------------------------------------------------ results
@@ -348,6 +360,7 @@ class TaskExecutor(Node):
         result = TaskResult()
         result.task_id = task.task_id
         result.epoch = task.epoch
+        result.assign_term = task.assign_term
         result.node_name = self._node_name
         result.task_type = task.task_type
         result.drone_id = task.drone_id
@@ -428,20 +441,20 @@ class TaskExecutor(Node):
                 self.get_logger().warning("result image for task %s failed: %s" % (task.task_id, exc))
         if summary and not task.reported_first_result:
             task.reported_first_result = True
-            self.get_logger().info("task=%s epoch=%d first result: %s" % (task.task_id, task.epoch, summary))
+            self.get_logger().info("task=%s gen=%s first result: %s" % (task.task_id, task.generation, summary))
 
     def _failure(self, task, reason):
         task.failures += 1
         self.get_logger().warning(
-            "task=%s epoch=%d frame failed (%d/%d): %s"
-            % (task.task_id, task.epoch, task.failures, self._max_failures, reason)
+            "task=%s gen=%s frame failed (%d/%d): %s"
+            % (task.task_id, task.generation, task.failures, self._max_failures, reason)
         )
         if not task.initialized and task.task_type == "PKCT":
             reason = "tracker init failed: " + reason
         elif task.failures < self._max_failures:
             return
         self._remove(task, c.REPORT_FAILED, reason, c.INFERENCE_ERROR)
-        self.get_logger().error("task=%s epoch=%d failed: %s" % (task.task_id, task.epoch, reason))
+        self.get_logger().error("task=%s gen=%s failed: %s" % (task.task_id, task.generation, reason))
 
     def _remove(self, task, state, message, error_code=""):
         self._tasks.pop(task.task_id, None)

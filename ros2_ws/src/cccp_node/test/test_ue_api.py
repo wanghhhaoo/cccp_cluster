@@ -62,8 +62,8 @@ def start_on(server, node):
     def start(events):
         for event in events:
             if event.status == c.PENDING:
-                server.store.apply(Assign(event.task_id, 0, node))
-                server.store.apply(ReportStatus(node, event.task_id, 1, c.REPORT_RUNNING))
+                server.store.apply(Assign(event.task_id, (0, 0), 1, node))
+                server.store.apply(ReportStatus(node, event.task_id, (1, 1), c.REPORT_RUNNING))
     server.store.add_event_listener(start)
 
 
@@ -117,8 +117,8 @@ def test_failed_task_returns_502(server):
     def fail_on_submit(events):
         for event in events:
             if event.status == c.PENDING:
-                server.store.apply(Assign(event.task_id, 0, "n1"))
-                server.store.apply(ReportStatus("n1", event.task_id, 1, c.REPORT_FAILED, c.INFERENCE_ERROR,
+                server.store.apply(Assign(event.task_id, (0, 0), 1, "n1"))
+                server.store.apply(ReportStatus("n1", event.task_id, (1, 1), c.REPORT_FAILED, c.INFERENCE_ERROR,
                                                 "model crashed"))
     server.store.add_event_listener(fail_on_submit)
     status, body = call_json("POST", server.base + "/tasks", {"task_type": "PKCI", "idempotency_key": "ue:3"})

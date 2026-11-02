@@ -7,6 +7,7 @@ string ROLE_HELPER="helper"
 
 string task_id                    # UUID
 uint32 epoch
+uint32 assign_term                # 执行代次 (epoch, assign_term) 的后一半：做这次调度的集群主节点的任期
 string role                       # primary（任务主节点）| helper（辅助节点）
 string primary_node
 string[] helper_nodes             # 任务主节点上的这一项才完整；辅助节点上可能为空

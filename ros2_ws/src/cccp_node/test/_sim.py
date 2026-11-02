@@ -2,7 +2,7 @@
 
 Each SimNode stands in for one node's executor (with the real ExecutionGuard)
 and its NodeStatus publisher. SimDispatcher routes StartTask/StopTask to the
-target SimNode, so term and epoch fencing behave as on real executors.
+target SimNode, so term and generation fencing behave as on real executors.
 """
 from cccp_node.control.controller import DispatchResult, TaskReportView
 from cccp_node.core import constants as c
@@ -50,15 +50,16 @@ class SimNode:
     def status(self):
         self.seq += 1
         running = tuple(
-            TaskStateView(t, e, self.starts[t].role, self.starts[t].primary_node, self.starts[t].helper_nodes,
-                          self.starts[t].idempotency_key, self.starts[t].name, self.starts[t].spec.to_json())
-            for t, e in sorted(self.guard.running().items()))
+            TaskStateView(t, g.epoch, self.starts[t].role, self.starts[t].primary_node, self.starts[t].helper_nodes,
+                          self.starts[t].idempotency_key, self.starts[t].name, self.starts[t].spec.to_json(),
+                          g.assign_term)
+            for t, g in sorted(self.guard.running().items()))
         return NodeView(self.name, incarnation=1, seq=self.seq, running_tasks=running, **self.view)
 
-    def report(self, task_id, epoch, state, error_code=""):
+    def report(self, task_id, generation, state, error_code=""):
         self.report_seq += 1
-        self.reports.append(TaskReportView(self.name, task_id, epoch, state, error_code,
-                                           incarnation=1, seq=self.report_seq))
+        self.reports.append(TaskReportView(self.name, task_id, generation[0], state, error_code,
+                                           incarnation=1, seq=self.report_seq, assign_term=generation[1]))
 
 
 class SimDispatcher:
@@ -68,29 +69,29 @@ class SimDispatcher:
         self.stops = []
 
     def start(self, node, request):
-        self.starts.append((node, request.task_id, request.epoch, request.term, request.role))
+        self.starts.append((node, request.task_id, request.generation, request.term, request.role))
         sim = self.nodes.get(node)
         if sim is None or not sim.alive:
             return DispatchResult(False, c.TIMEOUT, "%s unreachable" % node)
         if sim.fail_start:
             return DispatchResult(False, sim.fail_start, "simulated failure")
-        decision = sim.guard.on_start(request.term, request.task_id, request.epoch)
+        decision = sim.guard.on_start(request.term, request.task_id, request.generation)
         if decision.action == REJECT:
             return DispatchResult(False, decision.error_code, decision.message)
         if decision.action in (START, RESTART):
-            sim.guard.started(request.task_id, request.epoch)
+            sim.guard.started(request.task_id, request.generation)
             sim.starts[request.task_id] = request
             if request.role == c.ROLE_PRIMARY:
-                sim.report(request.task_id, request.epoch, c.REPORT_RUNNING)
+                sim.report(request.task_id, request.generation, c.REPORT_RUNNING)
         assert decision.action in (START, RESTART, NOOP)
         return DispatchResult(True, message=decision.action)
 
-    def stop(self, node, term, task_id, epoch, reason):
-        self.stops.append((node, task_id, epoch, reason))
+    def stop(self, node, term, task_id, generation, reason):
+        self.stops.append((node, task_id, generation, reason))
         sim = self.nodes.get(node)
         if sim is None or not sim.alive:
             return DispatchResult(False, c.TIMEOUT, "%s unreachable" % node)
-        decision = sim.guard.on_stop(term, task_id, epoch)
+        decision = sim.guard.on_stop(term, task_id, generation)
         if decision.action == STOP:
             sim.guard.stopped(task_id)
         return DispatchResult(decision.success, decision.error_code, decision.message)

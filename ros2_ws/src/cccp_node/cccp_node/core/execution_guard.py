@@ -1,4 +1,4 @@
-"""Executor-side term and epoch checks for StartTask / StopTask (CONVENTIONS 5.4).
+"""Executor-side term and generation checks for StartTask / StopTask (CONVENTIONS 5.4).
 
 The executor asks the guard before acting on a command from the cluster
 leader and tells it what it actually started or stopped. Commands from a
@@ -10,9 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import constants as c
+from .generation import NONE, Generation
 
 START = "start"        # start a new session
-RESTART = "restart"    # stop the running session, then start the newer epoch
+RESTART = "restart"    # stop the running session, then start the newer generation
 STOP = "stop"
 NOOP = "noop"          # already in the requested state: reply success
 REJECT = "reject"
@@ -32,9 +33,9 @@ class Decision:
 class ExecutionGuard:
     def __init__(self) -> None:
         self.max_term = 0
-        self._running: dict[int, int] = {}   # task_id -> epoch
+        self._running: dict[str, Generation] = {}
 
-    def running(self) -> dict[int, int]:
+    def running(self) -> dict[str, Generation]:
         return dict(self._running)
 
     def _fence(self, term: int) -> Decision | None:
@@ -43,31 +44,33 @@ class ExecutionGuard:
         self.max_term = term
         return None
 
-    def on_start(self, term: int, task_id: str, epoch: int) -> Decision:
+    def on_start(self, term: int, task_id: str, generation: Generation) -> Decision:
         rejected = self._fence(term)
         if rejected:
             return rejected
+        generation = Generation(*generation)
         current = self._running.get(task_id)
         if current is None:
             return Decision(START)
-        if epoch == current:
-            return Decision(NOOP, message="task %s epoch %d already running" % (task_id, epoch))
-        if epoch > current:
-            return Decision(RESTART, message="replacing epoch %d with %d" % (current, epoch))
-        return Decision(REJECT, c.STALE_EPOCH, "task %s is running epoch %d, not %d" % (task_id, current, epoch))
+        if generation == current:
+            return Decision(NOOP, message="task %s %s already running" % (task_id, generation))
+        if generation > current:
+            return Decision(RESTART, message="replacing %s with %s" % (current, generation))
+        return Decision(REJECT, c.STALE_EPOCH, "task %s is running %s, not %s" % (task_id, current, generation))
 
-    def on_stop(self, term: int, task_id: str, epoch: int) -> Decision:
-        """epoch 0 stops any epoch; stopping an epoch older than the running one is a no-op."""
+    def on_stop(self, term: int, task_id: str, generation: Generation) -> Decision:
+        """(0, 0) stops any generation; stopping one older than the running one is a no-op."""
         rejected = self._fence(term)
         if rejected:
             return rejected
+        generation = Generation(*generation)
         current = self._running.get(task_id)
-        if current is None or (epoch and epoch < current):
-            return Decision(NOOP, message="task %s epoch %d is not running" % (task_id, epoch))
+        if current is None or (generation != NONE and generation < current):
+            return Decision(NOOP, message="task %s %s is not running" % (task_id, generation))
         return Decision(STOP)
 
-    def started(self, task_id: str, epoch: int) -> None:
-        self._running[task_id] = epoch
+    def started(self, task_id: str, generation: Generation) -> None:
+        self._running[task_id] = Generation(*generation)
 
     def stopped(self, task_id: str) -> None:
         self._running.pop(task_id, None)

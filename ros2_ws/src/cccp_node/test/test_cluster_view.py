@@ -21,8 +21,8 @@ def test_old_or_reordered_messages_are_ignored():
 
 
 def test_node_view_helpers():
-    node = NodeView("a", running_tasks=(TaskStateView("t7", 2, "primary"),),
+    node = NodeView("a", running_tasks=(TaskStateView("t7", 2, "primary", assign_term=3),),
                     links=(LinkView("b", rtt_ms=12.0),))
-    assert node.runs("t7", 2) and not node.runs("t7", 1)
+    assert node.runs("t7", (2, 3)) and not node.runs("t7", (2, 2)) and not node.runs("t7", (1, 3))
     assert node.link_to("b").measured and node.link_to("c") is None
     assert not LinkView("x").measured

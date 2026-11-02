@@ -4,7 +4,8 @@
 # 两者含义不同：低置信度或“未检测到目标”可以是有效结果，不算失败。
 
 string task_id
-uint32 epoch                      # 汇总方丢弃旧代次的结果
+uint32 epoch                      # 汇总方丢弃旧执行代次 (epoch, assign_term) 的结果
+uint32 assign_term
 string node_name                  # 产生这条结果的节点
 string task_type                  # PKCI | PKCT
 uint8 drone_id

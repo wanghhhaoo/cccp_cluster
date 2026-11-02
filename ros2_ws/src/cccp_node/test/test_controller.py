@@ -58,7 +58,7 @@ def test_schedules_starts_and_records_running():
     world.run(controller, 1.5)
     record = store.get(task_id)
     assert (record.status, record.primary, record.epoch) == (c.RUNNING, "n2", 1)
-    assert world.dispatcher.starts == [("n2", task_id, 1, 1, c.ROLE_PRIMARY)]
+    assert world.dispatcher.starts == [("n2", task_id, (1, 1), 1, c.ROLE_PRIMARY)]
 
 
 def test_collaborative_task_starts_primary_and_helpers():
@@ -82,7 +82,7 @@ def test_primary_failure_moves_task_and_old_copy_is_stopped():
     assert record.status == c.RUNNING and record.epoch == 2 and record.primary != first
     world.nodes[first].alive = True                  # comes back still running epoch 1
     world.run(controller, 2.0)
-    assert (first, task_id, 1, "epoch 1 superseded by 2") in world.dispatcher.stops
+    assert (first, task_id, (1, 1), "(1,1) superseded by (2,1)") in world.dispatcher.stops
     assert running_copies(world, task_id) == [record.primary]
 
 
@@ -124,7 +124,7 @@ def stall(world, store, task_id):
     """The task's primary got no input frames: it reports NOT_READY and drops the task."""
     record = store.get(task_id)
     sim = world.nodes[record.primary]
-    sim.report(task_id, record.epoch, c.REPORT_FAILED, c.NOT_READY)
+    sim.report(task_id, record.generation, c.REPORT_FAILED, c.NOT_READY)
     sim.guard.stopped(task_id)
     return record.primary
 
@@ -213,7 +213,7 @@ def test_two_leaders_accepting_the_same_request_converge_to_one_copy():
 def test_deposed_leader_is_fenced_by_executors():
     clock, world, store, election, controller = setup()
     for node in world.nodes.values():
-        node.guard.on_start(5, "other", 1)           # executors already saw term 5
+        node.guard.on_start(5, "other", (1, 5))      # executors already saw term 5
     warm(world, controller)                          # this controller only has term 1
     task_id = submit(store)
     world.run(controller, 3.0)
@@ -228,7 +228,7 @@ def test_cancelled_and_failed_tasks_end_on_their_nodes():
     world.run(controller, 1.5)
     store.apply(Cancel(cancelled, "user"))
     sim = world.nodes[store.get(failed).primary]
-    sim.report(failed, 1, c.REPORT_FAILED, c.INFERENCE_ERROR)
+    sim.report(failed, store.get(failed).generation, c.REPORT_FAILED, c.INFERENCE_ERROR)
     sim.guard.stopped(failed)
     world.run(controller, 2.0)
     assert running_copies(world, cancelled) == [] and store.get(failed).status == c.FAILED

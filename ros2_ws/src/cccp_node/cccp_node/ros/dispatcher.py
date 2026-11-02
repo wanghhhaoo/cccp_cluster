@@ -8,6 +8,7 @@ from cccp_task_interfaces.srv import StartTask, StopTask
 from .. import names
 from ..control.controller import DispatchResult, StartRequest
 from ..core import constants as c
+from ..core.generation import Generation
 from . import convert
 
 
@@ -64,9 +65,10 @@ class RosDispatcher(ServiceCaller):
             return DispatchResult(False, c.TIMEOUT, str(exc))
         return DispatchResult(reply.success, reply.error_code, reply.message)
 
-    def stop(self, node: str, term: int, task_id: str, epoch: int, reason: str) -> DispatchResult:
+    def stop(self, node: str, term: int, task_id: str, generation: Generation, reason: str) -> DispatchResult:
         client = self.client(StopTask, node, names.EXEC_STOP_SERVICE)
-        request = StopTask.Request(term=term, task_id=task_id, epoch=epoch, reason=reason)
+        request = StopTask.Request(term=term, task_id=task_id, epoch=generation.epoch,
+                                   assign_term=generation.assign_term, reason=reason)
         try:
             reply = self.call(client, request)
         except Exception as exc:
