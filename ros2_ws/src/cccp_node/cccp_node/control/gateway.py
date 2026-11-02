@@ -124,27 +124,11 @@ class Gateway:
             waiting[1] = reply
         waiting[0].set()
 
-    # ---------------------------------- protocol 2 only (leader/task/* services)
-    # The leader serves forwarded calls by handing them to its own controller, which
-    # answers NOT_LEADER / NO_LEADER itself when it cannot handle them. Removed once
-    # requests travel as messages (protocol 3).
-    def serve_create(self, spec: TaskSpec, idempotency_key: str) -> CreateReply:
-        return _create_reply(self._call(p.CREATE, here=True, idempotency_key=idempotency_key, spec=spec))
-
-    def serve_destroy(self, task_id: str, reason: str = "") -> DestroyReply:
-        return _destroy_reply(self._call(p.DESTROY, here=True, task_id=task_id, reason=reason))
-
-    def serve_query(self, task_id: str) -> QueryReply:
-        return _query_reply(self._call(p.QUERY, here=True, task_id=task_id))
-
     # ------------------------------------------------------------- internals
-    def _call(self, op: str, here: bool = False, **fields) -> Reply:
-        if here:
-            leader = self.node_name
-        else:
-            leader, problem = self._route()
-            if problem:
-                return self._failure(c.NO_LEADER, problem)
+    def _call(self, op: str, **fields) -> Reply:
+        leader, problem = self._route()
+        if problem:
+            return self._failure(c.NO_LEADER, problem)
         with self._lock:
             self._request_id += 1
             request = Request(self.node_name, self.incarnation, self._request_id, leader, self._term(), op, **fields)

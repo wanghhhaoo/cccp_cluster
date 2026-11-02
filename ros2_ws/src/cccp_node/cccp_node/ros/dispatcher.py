@@ -1,68 +1,39 @@
-"""Leader -> executor commands over protocol 2's StartTask / StopTask services.
+"""Leader -> executor commands on /cluster/command (DESIGN 2.5).
 
-Stands in for the Command / ExecEvent topics of protocol 3 (DESIGN 2.5) until the
-interfaces change: each command becomes one asynchronous service call per target,
-and each response comes back as an ExecEvent. Nothing blocks; a lost call simply
-produces no event, and reconciliation resends from heartbeats as it would for a
-lost Command.
+Only the leader publishes commands, so the control node attaches a publisher when
+this node is elected and detaches it when it steps down. A command sent while
+none is attached is lost, like any lost command: reconciliation resends it.
 """
 from __future__ import annotations
 
 import threading
 
-from cccp_task_interfaces.srv import StartTask, StopTask
+from cccp_cluster_interfaces.msg import Command
 
-from .. import names
-from ..control import protocol as p
-from ..control.protocol import ExecCommand, ExecEvent
+from ..control.protocol import ExecCommand
 from . import convert
 
 
-class ServiceClients:
-    """Per-node service clients, created once and reused."""
+class RosCommandSink:
+    """Implements control.controller.CommandSink. send() runs on the controller thread."""
 
-    def __init__(self, node, callback_group):
-        self._node = node
-        self._group = callback_group
-        self._clients = {}
+    def __init__(self, directory: convert.Directory):
+        self._directory = directory
+        self._publisher = None
         self._lock = threading.Lock()
 
-    def get(self, srv_type, node_name: str, relative: str):
-        key = (relative, node_name)
+    def attach(self, publisher) -> None:
         with self._lock:
-            client = self._clients.get(key)
-            if client is None:
-                client = self._node.create_client(srv_type, names.on_node(node_name, relative),
-                                                  callback_group=self._group)
-                self._clients[key] = client
-            return client
+            self._publisher = publisher
 
-
-class RosCommandSink:
-    """Implements control.controller.CommandSink; on_event receives the executors' answers."""
-
-    def __init__(self, node, callback_group, on_event):
-        self._clients = ServiceClients(node, callback_group)
-        self._on_event = on_event
+    def detach(self):
+        """Returns the publisher, for the node to destroy."""
+        with self._lock:
+            publisher, self._publisher = self._publisher, None
+            return publisher
 
     def send(self, command: ExecCommand) -> None:
-        for target in command.targets:
-            if command.op == p.START:
-                client = self._clients.get(StartTask, target, names.EXEC_START_SERVICE)
-                request = convert.fill_start_request(StartTask.Request(), command, target)
-                done = p.RUNNING
-            else:
-                client = self._clients.get(StopTask, target, names.EXEC_STOP_SERVICE)
-                request = convert.fill_stop_request(StopTask.Request(), command)
-                done = p.STOPPED
-            if not client.service_is_ready():
-                continue             # as if the command were lost: reconciliation resends
-            future = client.call_async(request)
-            future.add_done_callback(lambda f, node=target, kind=done: self._answered(command, node, kind, f))
-
-    def _answered(self, command: ExecCommand, node: str, kind: str, future) -> None:
-        response = future.result()
-        if response is None:
-            return
-        self._on_event(ExecEvent(node, 0, 0, command.term, command.request_id, command.task_id, command.generation,
-                                 kind if response.success else p.REJECTED, response.error_code, response.message))
+        msg = convert.fill_command(Command(), command, self._directory)
+        with self._lock:
+            if self._publisher is not None:
+                self._publisher.publish(msg)

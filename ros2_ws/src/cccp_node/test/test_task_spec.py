@@ -66,7 +66,7 @@ def test_chain_rules():
 @pytest.mark.parametrize("field, value", [
     ("cpu_memory_required", -1.0), ("gpu_memory_required", float("nan")),
     ("latency_sensitivity", 1.5), ("params_json", "{bad"), ("params_json", "[1, 2]"),
-    ("priority", 256), ("priority", -1), ("priority", True), ("preemption_policy", 1.5),
+    ("priority", 256), ("priority", -1), ("priority", True), ("preemption_policy", 1.5), ("name", "x" * 65),
 ])
 def test_bad_values_are_rejected(field, value):
     assert rejected(**{field: value}) == c.INVALID_INPUT

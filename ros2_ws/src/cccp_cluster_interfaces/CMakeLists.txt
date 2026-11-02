@@ -6,10 +6,18 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/NodeStatus.msg"
+  "msg/TaskBrief.msg"
   "msg/LinkQuality.msg"
+  "msg/NodeLoad.msg"
   "msg/TaskState.msg"
+  "msg/Tombstone.msg"
+  "msg/NodeStatus.msg"
+  "msg/TaskList.msg"
   "msg/ExecutorStatus.msg"
+  "msg/Command.msg"
+  "msg/ExecEvent.msg"
+  "msg/Request.msg"
+  "msg/Reply.msg"
   DEPENDENCIES builtin_interfaces
 )
 

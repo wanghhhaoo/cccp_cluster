@@ -1,7 +1,8 @@
 """ROS 2 .msg/.srv syntax check (rosidl_adapter rules) for machines without ROS.
 
 Usage: python3 tools/check_interfaces.py ros2_ws/src
-Checks every *_interfaces package: field and constant names, types, srv separators, CMakeLists lists.
+Checks every *_interfaces package: field and constant names, types (including bounded strings
+`string<=N` and fixed or bounded arrays `T[N]`, `T[<=N]`), srv separators, CMakeLists lists.
 """
 import re
 import sys
@@ -21,14 +22,21 @@ def check_section(lines, pkg, local_msgs, where, errors):
         if not line or line.startswith("#"):
             continue
         is_const = re.match(r"^\S+\s+[A-Za-z0-9_]+\s*=", line)
-        if not is_const and "#" in line:
+        is_string_const = is_const and line.split()[0].startswith(("string", "wstring"))
+        if not is_string_const and "#" in line:      # a string constant's value may contain '#'
             line = line[:line.index("#")].strip()
         m = re.match(r"^(\S+)\s+([A-Za-z0-9_]+)\s*(=.*)?(\s+.*)?$", line)
         if not m:
             errors.append(f"{where}:{no}: cannot parse: {raw!r}")
             continue
         typ, name, const_val = m.group(1), m.group(2), m.group(3)
+        array = re.search(r"\[(<=)?(\d*)\]$", typ)
+        if typ.endswith("]") and (not array or (array.group(1) and not array.group(2))):
+            errors.append(f"{where}:{no}: bad array type {typ}")
         base = re.sub(r"\[.*\]$", "", typ)
+        bounded = re.fullmatch(r"(w?string)<=(\d+)", base)
+        if bounded:
+            base = bounded.group(1)
         if base not in PRIMITIVES and base not in EXTERNAL:
             ref = base.split("/")[-1] if base.startswith(pkg + "/") or "/" not in base else None
             if ref is None or ref not in local_msgs:
@@ -37,7 +45,7 @@ def check_section(lines, pkg, local_msgs, where, errors):
             if not CONST.match(name):
                 errors.append(f"{where}:{no}: bad constant name {name}")
             if base not in PRIMITIVES or typ != base:
-                errors.append(f"{where}:{no}: constant must be a primitive scalar: {typ}")
+                errors.append(f"{where}:{no}: constant must be a primitive unbounded scalar: {typ}")
             value = const_val[1:].strip()
             if base == "string":
                 if not re.fullmatch(r'"[^"#]*"', value):

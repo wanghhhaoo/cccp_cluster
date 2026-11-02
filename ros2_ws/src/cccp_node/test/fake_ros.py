@@ -2,10 +2,13 @@
 
 Message classes are generated from the .msg/.srv files in this workspace and,
 like rosidl, reject unknown fields and wrongly typed values (a float field
-does not accept an int). An in-process bus connects publishers to
+does not accept an int), arrays of the wrong length (T[N], T[<=N]) and strings
+over their bound (string<=N). An in-process bus connects publishers to
 subscriptions and clients to services by fully resolved name, so several
 nodes can run in one test process. Not a simulation of DDS: delivery is
-synchronous and lossless, and QoS is ignored.
+synchronous and lossless. The one QoS setting it honours is TRANSIENT_LOCAL:
+a late subscription gets a publisher's last messages, but only when both ends
+declare it, as with DDS.
 
 install() is a no-op when the real rclpy is importable.
 """
@@ -34,6 +37,13 @@ REGISTRY = {}     # "pkg/Name" -> class
 
 # ---------------------------------------------------------------- messages
 
+class Field:
+    """base type; array: None, or (maximum or exact length or None, exact?); bound: string length limit."""
+
+    def __init__(self, base, array=None, bound=None):
+        self.base, self.array, self.bound = base, array, bound
+
+
 def _parse(text, pkg):
     fields, constants = {}, {}
     for raw in text.splitlines():
@@ -46,15 +56,22 @@ def _parse(text, pkg):
             constants[name] = value.strip().strip('"') if typ == "string" else int(value.split("#")[0])
             continue
         typ, name = line.split("#")[0].split()[:2]
-        array_field = typ.endswith("[]")
-        base = typ[:-2] if array_field else typ
+        shape = re.match(r"^(.+?)(?:\[(<=)?(\d*)\])?$", typ)
+        base, bounded, size = shape.group(1), shape.group(2), shape.group(3)
+        array = None
+        if typ.endswith("]"):
+            array = (int(size), not bounded) if size else (None, False)
+        bound = None
+        if base.startswith("string<="):
+            base, bound = "string", int(base[len("string<="):])
         if base not in INTS | FLOATS | {"bool", "string"} and "/" not in base:
             base = "%s/%s" % (pkg, base)
-        fields[name] = (base, array_field)
+        fields[name] = Field(base, array, bound)
     return fields, constants
 
 
-def _scalar_ok(base, value):
+def _scalar_ok(field, value):
+    base = field.base
     if base in INTS:
         return isinstance(value, int) and (not base.startswith("u") or value >= 0)
     if base in FLOATS:
@@ -62,13 +79,15 @@ def _scalar_ok(base, value):
     if base == "bool":
         return isinstance(value, bool)
     if base == "string":
-        return isinstance(value, str)
+        return isinstance(value, str) and (field.bound is None or len(value) <= field.bound)
     return isinstance(value, REGISTRY[base])
 
 
-def _default(base, array_field):
-    if array_field:
-        return []
+def _default(field):
+    if field.array:
+        size, exact = field.array
+        return [_default(Field(field.base, bound=field.bound))] * size if exact else []
+    base = field.base
     if base in INTS:
         return 0
     if base in FLOATS:
@@ -85,23 +104,28 @@ def _make(full_name, text):
     fields, constants = _parse(text, pkg)
 
     def __init__(self, **values):
-        for field, (base, array_field) in fields.items():
-            object.__setattr__(self, field, _default(base, array_field))
+        for name_, field in fields.items():
+            object.__setattr__(self, name_, _default(field))
         for key, value in values.items():
             setattr(self, key, value)
 
     def __setattr__(self, key, value):
         if key not in fields:
             raise AttributeError("%s has no field %r" % (full_name, key))
-        base, array_field = fields[key]
-        if array_field:
-            if base == "uint8" and isinstance(value, (bytes, bytearray)):
+        field = fields[key]
+        if field.array:
+            if field.base == "uint8" and isinstance(value, (bytes, bytearray)):
                 value = list(value)
-            if not isinstance(value, (list, tuple, array.array)) or not all(_scalar_ok(base, v) for v in value):
-                raise AssertionError("%s.%s must be a sequence of %s" % (full_name, key, base))
+            if not isinstance(value, (list, tuple, array.array)) or not all(_scalar_ok(field, v) for v in value):
+                raise AssertionError("%s.%s must be a sequence of %s" % (full_name, key, field.base))
+            size, exact = field.array
+            if size is not None and (len(value) != size if exact else len(value) > size):
+                raise AssertionError("%s.%s takes %s %d items, got %d" % (
+                    full_name, key, "exactly" if exact else "at most", size, len(value)))
             value = list(value)
-        elif not _scalar_ok(base, value):
-            raise AssertionError("%s.%s must be of type %s, got %r" % (full_name, key, base, value))
+        elif not _scalar_ok(field, value):
+            raise AssertionError("%s.%s must be of type %s%s, got %r" % (
+                full_name, key, field.base, "<=%d" % field.bound if field.bound else "", value))
         object.__setattr__(self, key, value)
 
     def __repr__(self):
@@ -131,7 +155,7 @@ def _build_interfaces():
         pending = dict(msgs)
         while pending:     # create nested types first
             for stem, text in list(pending.items()):
-                deps = re.findall(r"^(\w+)(?:\[\])?\s", text, re.M)
+                deps = re.findall(r"^(\w+)(?:\[[^\]]*\])?\s", text, re.M)
                 if all(d in INTS | FLOATS | {"bool", "string"} or d not in pending or d == stem for d in deps):
                     _make("%s/%s" % (pkg, stem), text)
                     del pending[stem]
@@ -160,6 +184,7 @@ class Bus:
     def __init__(self):
         self.lock = threading.RLock()
         self.subscriptions = {}    # topic -> [Subscription]
+        self.publishers = {}       # topic -> [Publisher]
         self.services = {}         # name -> Service
         self.timers = []
         self.namespace = "/"
@@ -168,6 +193,7 @@ class Bus:
     def reset(self):
         with self.lock:
             self.subscriptions.clear()
+            self.publishers.clear()
             self.services.clear()
             self.timers.clear()
 
@@ -193,9 +219,15 @@ class _Entity:
     alive = True
 
 
+def _transient_local(qos):
+    return getattr(qos, "durability", None) == "TRANSIENT_LOCAL"
+
+
 class Publisher(_Entity):
-    def __init__(self, node, msg_type, topic):
+    def __init__(self, node, msg_type, topic, qos=None):
         self.node, self.msg_type, self.topic = node, msg_type, topic
+        self.keep = getattr(qos, "depth", 1) if _transient_local(qos) else 0
+        self.history = []
 
     @property
     def topic_name(self):
@@ -206,6 +238,8 @@ class Publisher(_Entity):
         if not (self.alive and self.node.alive):
             return
         with BUS.lock:
+            if self.keep:
+                self.history = (self.history + [msg])[-self.keep:]
             subscribers = [s for s in BUS.subscriptions.get(self.topic, []) if s.alive and s.node.alive]
         for subscription in subscribers:
             subscription.callback(msg)
@@ -379,12 +413,23 @@ class Node:
 
     # entities
     def create_publisher(self, msg_type, topic, qos, **_):
-        return Publisher(self, msg_type, self.resolve_topic_name(topic))
+        publisher = Publisher(self, msg_type, self.resolve_topic_name(topic), qos)
+        with BUS.lock:
+            BUS.publishers.setdefault(publisher.topic, []).append(publisher)
+        return publisher
 
     def create_subscription(self, msg_type, topic, callback, qos, **_):
         subscription = Subscription(self, msg_type, self.resolve_topic_name(topic), callback)
         with BUS.lock:
             BUS.subscriptions.setdefault(subscription.topic, []).append(subscription)
+            replay = [m for p in BUS.publishers.get(subscription.topic, []) if p.alive and p.node.alive
+                      for m in p.history] if _transient_local(qos) else []
+        if replay:          # delivered later, as by an executor, not inside create_subscription
+            def deliver():
+                for msg in replay:
+                    if subscription.alive and self.alive:
+                        callback(msg)
+            threading.Timer(0.01, deliver).start()
         return subscription
 
     def destroy_subscription(self, subscription):

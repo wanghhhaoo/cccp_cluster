@@ -10,6 +10,9 @@ from . import constants as c
 from .input_source import ROS, parse_input
 
 
+MAX_NAME_LENGTH = 64     # TaskState.name and friends are string<=64 on the wire
+
+
 class SpecError(ValueError):
     """A submitted spec was rejected; error_code is an ErrorCodes value."""
 
@@ -138,6 +141,8 @@ def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth
         value = getattr(spec, name)
         if not math.isfinite(value) or value < 0:
             raise SpecError(c.INVALID_INPUT, "%s must be a non-negative number" % name)
+    if len(spec.name.strip()) > MAX_NAME_LENGTH:
+        raise SpecError(c.INVALID_INPUT, "name is longer than %d characters" % MAX_NAME_LENGTH)
     for name in ("priority", "preemption_policy"):
         value = getattr(spec, name)
         if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255:

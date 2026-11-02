@@ -46,7 +46,7 @@ UNMEASURED_LINK = LinkView("", rtt_ms=30.0, jitter_ms=5.0, loss_rate=0.005)
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    protocol_version: int = 2
+    protocol_version: int = c.PROTOCOL_VERSION
     weights: Mapping[str, tuple[float, float, float]] = field(default_factory=dict)  # task_type -> (lrs, brs, net)
     default_weights: tuple[float, float, float] = (0.3, 0.3, 0.4)   # Java "INFERENCE" weights
     default_latency_sensitivity: float = 0.5
@@ -102,6 +102,12 @@ def _mem_gb(node: NodeView) -> float:
     return (node.mem_total_mb or DEFAULT_MEM_TOTAL_MB) / 1024.0
 
 
+def _has_gpu(node: NodeView) -> bool:
+    """A node with a GPU always measures its load (gpu_usage >= 0), Jetson included; a discrete one
+    also reports its memory. Heartbeats carry no model names since protocol 3."""
+    return node.gpu_mem_total_mb > 0 or node.gpu_usage >= 0
+
+
 def _discrete_gpu(node: NodeView) -> bool:
     """Discrete GPUs report their own memory; Jetson-style GPUs share system memory."""
     return node.gpu_mem_total_mb > 0
@@ -136,7 +142,7 @@ def resource_reason(spec: TaskSpec, node: NodeView, assigned: int, config: Sched
         return "busy"
     if 0 <= node.battery < config.min_battery:
         return "battery_low"
-    if spec.use_gpu and not node.gpu_model:
+    if spec.use_gpu and not _has_gpu(node):
         return "gpu_unavailable"
     cores = _cores(node)
     free_cores = round(cores * (1.0 - _ratio(node.cpu_usage, DEFAULT_CPU_RATIO)))

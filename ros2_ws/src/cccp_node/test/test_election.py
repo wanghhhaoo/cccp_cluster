@@ -1,10 +1,11 @@
+from cccp_node.core import constants as c
 from cccp_node.core.cluster_view import NodeView
 from cccp_node.core.election import Election, ElectionConfig
 
 CONFIG = ElectionConfig(leader_timeout_s=1.0, startup_grace_s=5.0)
 
 
-def peer(name, term=0, leader=False, protocol=2, follows=""):
+def peer(name, term=0, leader=False, protocol=c.PROTOCOL_VERSION, follows=""):
     return NodeView(name, protocol_version=protocol, term=term, is_leader=leader,
                     leader_name=name if leader else follows)
 
@@ -95,7 +96,7 @@ def test_incompatible_claims_are_ignored():
 
 def candidate(name, node_id, visible=11, ready=True, battery=-1.0, follows="", **kw):
     kw.setdefault("leader_name", follows)
-    return NodeView(name, protocol_version=2, node_id=node_id, visible_peers=visible, inference_ready=ready,
+    return NodeView(name, node_id=node_id, visible_peers=visible, inference_ready=ready,
                     battery=battery, **kw)
 
 

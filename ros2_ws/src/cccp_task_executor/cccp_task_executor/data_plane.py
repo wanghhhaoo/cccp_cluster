@@ -1,7 +1,7 @@
 """Data-plane process (CONVENTIONS 6.1): task executor plus the PKCI and PKCT services.
 
 Running them in one process cuts DDS participants per board; inference stays
-out of the control process so it cannot starve Raft heartbeats.
+out of the control process so it cannot starve the heartbeats (DESIGN 2.4).
 
 The executor calls the algorithm engines of this process directly
 (INFERENCE_BACKEND=local, the default), so frames are not serialized per call.

@@ -13,3 +13,13 @@ def ros_namespace(node_name: str) -> str:
     if not token or token[0].isdigit():
         token = "n" + token
     return "/" + token
+
+
+def default_node_id(node_name: str) -> int:
+    """The node id a deployment gets unless NODE_ID says otherwise: the number the name ends with
+    ('edge-07' -> 7, DESIGN 3.8). Raises ValueError when there is none in 1..254."""
+    match = re.search(r"(\d+)$", node_name.strip())
+    node_id = int(match.group(1)) if match else 0
+    if not 1 <= node_id <= 254:
+        raise ValueError("cannot derive a node id (1..254) from %r; set node_id" % node_name)
+    return node_id

@@ -180,6 +180,9 @@ def test_body_parsing():
         spec_from_body([])
     with pytest.raises(ValueError):
         spec_from_body({"target_nodes": "a"})
+    assert spec_from_body({"task_type": "PKCI", "priority": 200})[0].priority == 200
+    with pytest.raises(ValueError):
+        spec_from_body({"task_type": "PKCI", "priority": 256})
 
 
 def test_event_log_bounds():

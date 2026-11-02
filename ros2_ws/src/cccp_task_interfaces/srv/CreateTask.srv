@@ -46,6 +46,10 @@ uint8 drone_id
 string level                      # 带宽等级；为空按 full 处理
 string image_topic                # 为空时使用执行节点的默认图像 topic
 string params_json                # 例如 PKCT 为 {"bbox":[x,y,w,h]}
+
+# 预留（设计 0.3 第 3.3 节）：当前只透传，只影响待调度队列的顺序，不影响过滤、评分，也不抢占
+uint8 priority                    # 越大越重要：0 普通（默认），100 重要，200 紧急
+uint8 preemption_policy           # 0 = 不抢占别人（默认），其他取值预留
 ---
 bool success
 string error_code                 # 见 ErrorCodes.msg；成功时为空

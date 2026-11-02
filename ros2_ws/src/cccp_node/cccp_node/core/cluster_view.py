@@ -16,6 +16,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, replace
 
+from . import constants as c
 from .generation import Generation
 
 
@@ -57,7 +58,7 @@ class NodeView:
     sent every few beats: slow=False means this beat did not carry it."""
 
     name: str
-    protocol_version: int = 2
+    protocol_version: int = c.PROTOCOL_VERSION
     incarnation: int = 0
     seq: int = 0
     leader_name: str = ""
@@ -70,10 +71,8 @@ class NodeView:
     executor_alive: bool = True      # False: the local executor went quiet; running_tasks are the last known
     tasks_version: int = 0           # matches TaskListView.tasks_version
     slow: bool = True
-    cpu_model: str = ""
     cpu_cores: int = 0
     mem_total_mb: int = 0
-    gpu_model: str = ""
     gpu_mem_total_mb: int = 0
     cpu_usage: float = -1.0
     mem_usage: float = -1.0
@@ -98,8 +97,8 @@ class NodeView:
 
 
 # The slow part of a heartbeat: carried over from the previous beat when absent.
-SLOW_FIELDS = ("cpu_model", "cpu_cores", "mem_total_mb", "gpu_model", "gpu_mem_total_mb", "cpu_usage", "mem_usage",
-               "gpu_usage", "gpu_mem_usage", "battery", "links")
+SLOW_FIELDS = ("cpu_cores", "mem_total_mb", "gpu_mem_total_mb", "cpu_usage", "mem_usage", "gpu_usage",
+               "gpu_mem_usage", "battery", "links")
 
 
 @dataclass(frozen=True)
@@ -130,6 +129,7 @@ class ClusterView:
         self._task_lists: dict[str, TaskListView] = {}
         self._listed_at: dict[str, float] = {}
         self._names: dict[int, str] = {}
+        self._ids: dict[str, int] = {}
 
     def update(self, view: NodeView, now: float) -> bool:
         """Record a heartbeat received at local monotonic time now.
@@ -150,7 +150,7 @@ class ClusterView:
             self._views[view.name] = view
             self._seen_at[view.name] = now
             if view.node_id:
-                self._names[view.node_id] = view.name
+                self._register(view.name, view.node_id)
             return True
 
     def update_task_list(self, task_list: TaskListView, now: float) -> bool:
@@ -168,7 +168,7 @@ class ClusterView:
             self._task_lists[task_list.name] = task_list
             self._listed_at[task_list.name] = now
             if task_list.node_id:
-                self._names[task_list.node_id] = task_list.name
+                self._register(task_list.name, task_list.node_id)
             return True
 
     def task_list(self, name: str) -> TaskListView | None:
@@ -185,9 +185,24 @@ class ClusterView:
                 return None
             return listed
 
+    def register(self, name: str, node_id: int) -> None:
+        """Note a node's id (this node's own, from its configuration)."""
+        with self._lock:
+            self._register(name, node_id)
+
+    def _register(self, name: str, node_id: int) -> None:
+        self._names[node_id] = name
+        self._ids[name] = node_id
+
     def name_of(self, node_id: int) -> str | None:
+        """Messages name nodes by id; TaskLists say which name each id has."""
         with self._lock:
             return self._names.get(node_id)
+
+    def id_of(self, name: str) -> int:
+        """0 ("none") for a node whose id is not known yet."""
+        with self._lock:
+            return self._ids.get(name, 0)
 
     def visible_peers(self, me: str, now: float) -> int:
         with self._lock:

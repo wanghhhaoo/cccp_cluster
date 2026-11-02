@@ -8,13 +8,10 @@ find_package(builtin_interfaces REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ErrorCodes.msg"
   "msg/TaskStatus.msg"
-  "msg/TaskReport.msg"
   "msg/TaskResult.msg"
   "srv/CreateTask.srv"
   "srv/DestroyTask.srv"
   "srv/QueryTask.srv"
-  "srv/StartTask.srv"
-  "srv/StopTask.srv"
   DEPENDENCIES builtin_interfaces
 )
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Starts the three processes of one cluster node (CONVENTIONS 6.1):
-#   control     cccp_node control_node: leader election, leader control plane, gateway, NodeStatus
+#   control     cccp_node control_node: heartbeat, TaskList, election, leader control plane, gateway
 #   data plane  cccp_task_executor data_plane: task executor + PKCI + PKCT services
 #   camera      cccp_task_executor airsim_camera: only when AIRSIM_HOST is set
 # Adapted from CCCP start_edge_agent.sh.
@@ -16,6 +16,11 @@ fi
 
 # Nodes find each other through DDS discovery: no member list, only a unique NODE_NAME per node.
 NODE_NAME=${NODE_NAME:?NODE_NAME must be set (unique per node)}
+# 1-byte id that names this node in control-plane messages (1..254, unique). 0 or unset: the number
+# NODE_NAME ends with (edge-07 -> 7). Protocol 3 (DESIGN 3.8).
+NODE_ID=${NODE_ID:-0}
+# How long a gateway waits for the leader's reply (the leader waits up to 10 s for a task to start).
+REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-15.0}
 UE_HTTP_PORT=${UE_HTTP_PORT:-18090}
 LOG_LEVEL=${LOG_LEVEL:-INFO}
 export RCUTILS_LOGGING_MIN_SEVERITY=$LOG_LEVEL
@@ -44,7 +49,7 @@ case "$ns_token" in
 esac
 NS_ARGS=(-r "__ns:=/${ns_token}")
 
-echo "[start_node] NODE_NAME=$NODE_NAME ns=/${ns_token}"
+echo "[start_node] NODE_NAME=$NODE_NAME NODE_ID=$NODE_ID ns=/${ns_token}"
 echo "[start_node] ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-N/A} RMW=$RMW_IMPLEMENTATION UE_HTTP_PORT=$UE_HTTP_PORT DEVICE=$COLLAB_DEVICE"
 
 if [ "$ENABLE_DATA_PLANE" = "true" ] && { [ "$ENABLE_PKCI" = "true" ] || [ "$ENABLE_PKCT" = "true" ]; }; then
@@ -59,6 +64,8 @@ pids=()
 if [ "$ENABLE_CONTROL" = "true" ]; then
 	setsid ros2 run cccp_node control_node --ros-args --log-level "$LOG_LEVEL" "${NS_ARGS[@]}" \
 		-p "node_name:=${NODE_NAME}" \
+		-p "node_id:=${NODE_ID}" \
+		-p "request_timeout:=${REQUEST_TIMEOUT}" \
 		-p "ue_http_port:=${UE_HTTP_PORT}" &
 	pids+=("$!")
 fi
@@ -70,6 +77,8 @@ if [ "$ENABLE_DATA_PLANE" = "true" ]; then
 	case "$AIRSIM_FPS" in *.*) AIRSIM_FPS_PARAM="$AIRSIM_FPS" ;; *) AIRSIM_FPS_PARAM="${AIRSIM_FPS}.0" ;; esac
 	OMP_NUM_THREADS=${INFERENCE_THREADS:-4} setsid ros2 run cccp_task_executor data_plane --ros-args --log-level "$LOG_LEVEL" "${NS_ARGS[@]}" \
 		-p "node_name:=${NODE_NAME}" \
+		-p "node_id:=${NODE_ID}" \
+		-p "max_tasks_per_node:=${MAX_TRACKERS}" \
 		-p "image_topic:=${IMAGE_TOPIC}" \
 		-p "airsim_host:=${AIRSIM_HOST}" \
 		-p "airsim_port:=${AIRSIM_PORT}" \

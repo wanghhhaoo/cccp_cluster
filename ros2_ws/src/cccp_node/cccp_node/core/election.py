@@ -34,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
+from . import constants as c
 from .cluster_view import NodeView
 
 
@@ -43,8 +44,8 @@ class ElectionConfig:
     # 5 s), which already acts as its lease; this only adds a little hysteresis.
     leader_timeout_s: float = 1.0
     startup_grace_s: float = 5.0      # listen this long after start before claiming
-    protocol_version: int = 2
-    leader_min_battery: float = 0.0   # candidates below this battery % are not eligible; 0 disables
+    protocol_version: int = c.PROTOCOL_VERSION
+    leader_min_battery: float = 0.0   # candidates below this battery (0..1) are not eligible; 0 disables
                                       # (value to be decided, DESIGN 10.5)
 
 

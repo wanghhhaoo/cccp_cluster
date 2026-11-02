@@ -1,10 +1,10 @@
 """Three control nodes and three executors wired through fake_ros.
 
-Exercises the ROS layer (control_node, election, forwarder, dispatcher,
-convert, executor_node) end to end on machines without ROS: creating a task
+Exercises the ROS layer (control_node, election, Command/ExecEvent and
+Request/Reply topics, convert, executor_node) end to end on machines without ROS: creating a task
 through another node's CreateTask handler (forwarded to the leader),
 per-frame results reaching that node's UE backend, the leader dying while the
-task runs (the new leader rebuilds its table from NodeStatus), and executors
+task runs (the new leader rebuilds its table from the TaskLists), and executors
 dying. Skipped when the real rclpy is installed.
 """
 import sys
@@ -147,8 +147,8 @@ def cluster(monkeypatch, request):
     for name in NAMES:
         fake_ros.BUS.namespace = ros_namespace(name)
         fake_ros.BUS.params = dict(
-            node_name=name, status_period=0.2, offline_timeout=1.0, executor_timeout=1.0, dispatch_timeout=1.0,
-            create_wait=3.0, service_wait_timeout=0.5, ue_http_port=0,
+            node_name=name, status_period=0.2, offline_timeout=1.0, executor_timeout=1.0, executor_stall_grace=6.0,
+            create_wait=3.0, destroy_wait=3.0, service_wait_timeout=0.5, ue_http_port=0,
             airsim_fetch_mode=airsim_mode, airsim_fps=20.0, input_timeout=input_timeout,
         )
         engine = FakeEngine()
@@ -283,6 +283,32 @@ def test_task_running_on_the_leader_is_restarted_elsewhere_after_it_dies(cluster
     assert record.primary != leader.name and runners(cluster, reply.task_id) == [record.primary]
 
 
+def test_only_the_leader_holds_the_leader_endpoints(cluster):
+    leader = wait_for(lambda: active_leader(cluster))
+    assert all((n.control._leader_endpoints is not None) == (n is leader) for n in live(cluster))
+    publisher, events, requests = leader.control._leader_endpoints
+    leader.control._follow_role(False)                       # stepping down
+    assert leader.control._leader_endpoints is None
+    assert not (publisher.alive or events.alive or requests.alive)
+
+
+def test_silent_executor_keeps_its_tasks_for_the_grace_period_then_they_move(cluster):
+    """DESIGN 6.4: an executor that goes quiet is not one that lost its tasks. Its node keeps
+    reporting them (executor_alive=false); only after executor_stall_grace (6 s here) do they move."""
+    leader = wait_for(lambda: active_leader(cluster))
+    gateway = next(n for n in live(cluster) if n is not leader)
+    reply = create(gateway)
+    stalled = cluster[reply.assigned_node]
+    stalled.executor.destroy_node()                          # no more ExecutorStatus, nor anything else
+    time.sleep(4.5)                                          # quiet for 1 s, then 3.5 s into the grace
+    record = table_of(cluster).get(reply.task_id)
+    assert (record.primary, record.epoch) == (stalled.name, 1)
+    assert not leader.control.cluster.get(stalled.name).executor_alive
+    moved = wait_for(record_where(cluster, reply.task_id, lambda r: r.epoch >= 2 and r.status == c.RUNNING),
+                     timeout=15.0)
+    assert moved.primary != stalled.name
+
+
 # ------------------------------------------------------------- input sources
 
 class Results:
@@ -409,11 +435,31 @@ def test_image_conversions_keep_colour_order():
 
 
 def test_fake_messages_are_strict():
-    from cccp_cluster_interfaces.msg import NodeStatus
+    from cccp_cluster_interfaces.msg import NodeStatus, TaskBrief, TaskList
+    from cccp_task_interfaces.msg import TaskResult
     msg = NodeStatus()
     with pytest.raises(AttributeError):
         msg.no_such_field = 1
     with pytest.raises(AssertionError):
-        msg.cpu_usage = 1                               # float field: int rejected, like rosidl
-    msg.cpu_usage = 1.0
-    assert NodeStatus.PROTOCOL_VERSION == 2
+        TaskResult().latency_ms = 1                     # float field: int rejected, like rosidl
+    with pytest.raises(AssertionError):
+        msg.tasks = [TaskBrief()] * 9                   # bounded array: TaskBrief[<=8]
+    with pytest.raises(AssertionError):
+        TaskBrief().task_id = [0] * 15                  # fixed array: uint8[16]
+    with pytest.raises(AssertionError):
+        TaskList().node_name = "x" * 33                 # bounded string: string<=32
+    assert NodeStatus.PROTOCOL_VERSION == c.PROTOCOL_VERSION
+
+
+def test_task_list_reaches_late_subscribers_only_if_both_ends_are_transient_local():
+    from cccp_cluster_interfaces.msg import TaskList
+    from cccp_node.ros import qos
+    fake_ros.BUS.reset()
+    publisher = fake_ros.Node("pub").create_publisher(TaskList, "/cluster/task_list", qos.TASK_LIST_PUB)
+    publisher.publish(TaskList(node_name="edge-01"))
+    late, volatile = [], []
+    node = fake_ros.Node("sub")
+    node.create_subscription(TaskList, "/cluster/task_list", late.append, qos.TASK_LIST_SUB)
+    node.create_subscription(TaskList, "/cluster/task_list", volatile.append, qos.COMMAND)
+    wait_for(lambda: late)
+    assert [m.node_name for m in late] == ["edge-01"] and volatile == []

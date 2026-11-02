@@ -1,45 +1,34 @@
-# /cluster/node_status：每个节点按 1 Hz 发布，所有节点都订阅。
-# 一条消息同时承担：资源上报、存活心跳、选主（leader_name/term/is_leader）、
-# 链路测量（丢包看 seq 缺口，RTT 看 links 里的回显）、任务上报（tasks）。
-# QoS：BEST_EFFORT + KEEP_LAST(1) + VOLATILE，见开发规范 3.3。
+# /cluster/node_status：心跳。每个节点按 1 Hz 发布，所有节点都订阅（设计 0.3 第 3.2 节、附录 C.2）。
+# 每条都自包含：收到任意一条，就知道这个节点此刻在不在、认谁当集群主节点、在跑哪些任务（摘要）。
+# 必须装进一个链路层帧（约 1.4 KB）：BEST_EFFORT 下一条消息拆成 n 帧，丢失率就从 p 变成 1-(1-p)^n。
+# 完整的任务信息在 TaskList 里，只在变化时可靠发布。
+# QoS：BEST_EFFORT + KEEP_LAST(1) + VOLATILE。
 
-# 接口协议版本。cccp_* 接口包有不兼容修改时 +1。
-# 2：task_id 改为 UUID 字符串；running_tasks 改为 tasks（TaskState）；选主不再使用 Raft。
-# 集群主节点不向 protocol_version 与自己不同的节点派发任务。
-uint16 PROTOCOL_VERSION=2
-uint16 protocol_version
+# 接口协议版本。cccp_* 接口包有不兼容修改时 +1；12 个节点必须一起升级。
+# 3：心跳拆成 NodeStatus + TaskList；节点编号代替名字；跨节点的 Service 改为 topic；执行代次 (epoch, assign_term)。
+uint8 PROTOCOL_VERSION=3
+uint8 protocol_version
 
 # ---- 身份与序号 ----
-string node_name                  # 部署配置中的 NODE_NAME，命名空间由它推导
-uint64 incarnation                # 本进程启动时的 Unix 毫秒；变化说明节点重启过
-uint64 seq                        # 每次发布 +1，从 1 开始；incarnation 变化后重新计数
-builtin_interfaces/Time stamp     # 发送方本地时间，只用于显示，不得与其他节点的时间相减
+uint8 node_id                     # 部署时配置的节点编号，1~254；名字见 TaskList.node_name
+uint64 incarnation                # 控制进程启动时的 Unix 毫秒；变化说明节点重启过
+uint32 seq                        # 每次发布 +1，从 1 开始；incarnation 变化后重新计数
 
-# ---- 选主（开发规范 5.1）：每个节点都广播自己认可的集群主节点 ----
-string leader_name                # 本节点认可的集群主节点；未知时为空
-uint64 term                       # 本节点已知的最大任期
+# ---- 选主（每条都带）：每个节点都广播自己认可的集群主节点 ----
+uint8 leader_id                   # 0 表示还没有跟随任何集群主节点
+uint32 term                       # 本节点已知的最大任期
 bool is_leader                    # true 即本节点声明自己是集群主节点；同时也是它的续约
+uint8 visible_peers               # 本节点判定在线的对端数，用于选主候选排序
 
-# ---- 就绪状态 ----
-bool inference_ready              # 推理服务整体可用
-string[] algorithms_ready         # 已就绪的算法 ID，如 ["PKCI", "PKCT"]
+# ---- 就绪（每条都带）----
+bool executor_alive               # false：本机执行器超过 executor_timeout 没有出声；tasks 是最后一次已知的值
+bool inference_ready
+uint8 algorithms_ready            # 位掩码：bit0 = PKCI，bit1 = PKCT
 
-# ---- 静态硬件（很少变化，每条都带，省去单独的查询接口）----
-string cpu_model
-uint16 cpu_cores
-uint32 mem_total_mb
-string gpu_model                  # 无 GPU 时为空
-uint32 gpu_mem_total_mb           # 独立显存总量；Jetson 等与系统共享内存的 GPU 填 0
+# ---- 任务摘要（每条都带）----
+TaskBrief[<=8] tasks
+uint32 tasks_version              # 与 TaskList.tasks_version 对应；比缓存的 TaskList 新说明新版本还在路上
 
-# ---- 动态资源；无法获取时填 -1 ----
-float32 cpu_usage                 # 0~100
-float32 mem_usage                 # 0~100
-float32 gpu_usage                 # 0~100
-float32 gpu_mem_usage             # 0~100
-float32 battery                   # 0~1；非无人机节点填 -1
-
-# ---- 任务 ----
-TaskState[] tasks                 # 本节点当前正在执行的全部任务；集群主节点据此对账，换主后据此重建任务表
-
-# ---- 链路：本节点对每个已知邻居的测量 ----
-LinkQuality[] links
+# ---- 慢变部分：每 slow_fields_every 条附带一次，其余时候为空数组 ----
+NodeLoad[<=1] load
+LinkQuality[<=15] links

@@ -109,15 +109,6 @@ def test_replies_for_other_gateways_or_an_earlier_incarnation_are_ignored():
     assert gateway(transport=transport).query("t1").error_code == c.TIMEOUT
 
 
-def test_forwarded_calls_go_to_the_local_controller_whatever_the_election_says():
-    local, transport = Leader(lambda r: answer(r, error_code=c.NOT_LEADER)), Leader()
-    gw = gateway("n3", leader="n1", local=local, transport=transport)
-    assert gw.serve_create(TaskSpec(task_type="PKCI"), "k").error_code == c.NOT_LEADER
-    assert gw.serve_destroy("t1").error_code == c.NOT_LEADER
-    assert gw.serve_query("t1").error_code == c.NOT_LEADER
-    assert [r.target_leader for r in local.requests] == ["n3"] * 3 and transport.requests == []
-
-
 def test_end_to_end_create_and_destroy_through_the_controller():
     world = SimWorld(["n1", "n2"], clock=time.monotonic, offline_timeout_s=1.0)
     config = ControllerConfig(warmup_s=0.2, reconcile_period_s=0.02, reconcile=ReconcileConfig(dispatch_retry_s=0.2))

@@ -28,9 +28,9 @@ CREATE_FIELDS = {
     "target_nodes": list, "mode": str, "helper_count": int, "min_participants": int,
     "use_gpu": bool, "cpu_compute_required": float, "cpu_memory_required": float,
     "gpu_memory_required": float, "latency_sensitivity": float, "drone_id": int, "level": str,
-    "image_topic": str,
+    "image_topic": str, "priority": int, "preemption_policy": int,
 }
-UINT8_FIELDS = ("drone_id", "helper_count", "min_participants")
+UINT8_FIELDS = ("drone_id", "helper_count", "min_participants", "priority", "preemption_policy")
 # "Try again shortly" (no leader yet, election, leader busy or slow): 503 so UE retries instead of giving up.
 RETRYABLE = frozenset((c.NO_LEADER, c.NOT_LEADER, c.BUSY, c.NOT_READY, c.TIMEOUT))
 

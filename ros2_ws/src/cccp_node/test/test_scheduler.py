@@ -51,8 +51,8 @@ def test_network_penalties_match_java_formulas():
 
 def test_gpu_scores_use_reported_gpu_memory():
     spec = task(use_gpu=True, gpu_memory_required=2.0)
-    idle = node(gpu_model="RTX", gpu_mem_total_mb=8192, gpu_mem_usage=0.0)
-    full = node(gpu_model="RTX", gpu_mem_total_mb=8192, gpu_mem_usage=75.0)
+    idle = node(gpu_mem_total_mb=8192, gpu_mem_usage=0.0)
+    full = node(gpu_mem_total_mb=8192, gpu_mem_usage=75.0)
     assert least_resource_score(spec, idle) > least_resource_score(spec, full)
 
 
@@ -75,9 +75,9 @@ def test_hard_filters(override, reason):
     (task(cpu_compute_required=5.0), {}, 0, "cpu_insufficient"),
     (task(cpu_memory_required=4.5), {}, 0, "mem_insufficient"),
     (task(use_gpu=True, gpu_memory_required=3.0),
-     dict(gpu_model="RTX", gpu_mem_total_mb=4096, gpu_mem_usage=50.0), 0, "gpu_mem_insufficient"),
+     dict(gpu_mem_total_mb=4096, gpu_mem_usage=50.0), 0, "gpu_mem_insufficient"),
     # Jetson: no separate GPU memory, so GPU memory comes out of system memory
-    (task(use_gpu=True, cpu_memory_required=2.0, gpu_memory_required=2.5), dict(gpu_model="Orin"), 0,
+    (task(use_gpu=True, cpu_memory_required=2.0, gpu_memory_required=2.5), dict(gpu_usage=10.0), 0,
      "mem_insufficient"),
 ])
 def test_resource_filters(spec, override, assigned, reason):

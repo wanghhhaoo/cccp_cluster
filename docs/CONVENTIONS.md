@@ -46,25 +46,37 @@
 
 - ROS 2 包名必须以 `cccp_` 开头，例如 `cccp_cluster_interfaces`、`cccp_task_interfaces`。从复用包原样带过来的 `collab_inference*` 保持原名。
 - 节点名 `NODE_NAME` 由部署配置决定，**在集群内必须唯一**。不需要配置成员名单：节点之间通过 DDS 自动发现。
+- 节点编号 `NODE_ID`（1～254，**在集群内必须唯一**）在控制面消息里代替节点名，省带宽。不配置时取 `NODE_NAME` 末尾的数字（`edge-07` → 7），没有就启动失败。每个节点的 `TaskList` 带着自己的名字，其他节点据此把编号对应回名字；还没收到某节点的 `TaskList` 时，暂时忽略它的心跳。
 - 命名空间 `<ns>` 由 `NODE_NAME` 推导，规则沿用复用包的 `naming.py`：非 `[A-Za-z0-9_]` 字符替换为 `_`，连续的 `_` 合并为一个，空串或以数字开头时在前面加 `n`。例如 `edge-01` 推导为 `/edge_01`。
 
 ### 2.2 通信端点
 
+控制面（设计 0.3 第 2.5 节）：节点之间只有下面 6 个 topic，**没有跨节点的 Service**。
+
+| 名称 | 消息 | 方向 | 说明 |
+|---|---|---|---|
+| `/cluster/node_status` | `NodeStatus` | 所有节点 → 所有节点，1 Hz | 心跳：存活、选主声明、就绪、任务摘要；每 5 条附带资源和链路。必须装进一个链路层帧 |
+| `/cluster/task_list` | `TaskList` | 所有节点 → 所有节点，变化时 | 本节点全部任务的完整信息和墓碑；新集群主节点据此接收任务 |
+| `/cluster/command` | `Command` | 集群主节点 → 执行器 | 启动、停止；带目标节点，执行器只处理发给自己的 |
+| `/cluster/exec_event` | `ExecEvent` | 执行器 → 集群主节点 | 执行状态变化，也是命令的回执 |
+| `/cluster/request` | `Request` | 网关 → 集群主节点 | 创建、销毁、查询；带 `target_leader`，只有它处理 |
+| `/cluster/reply` | `Reply` | 集群主节点 → 网关 | 按 (请求方, incarnation, request_id) 对应请求 |
+
+`Command`、`Reply` 的发布端和 `ExecEvent`、`Request` 的订阅端只有集群主节点在当选时创建、卸任时销毁。
+
+本机和接入层：
+
 | 名称 | 类型 | 方向 | 说明 |
 |---|---|---|---|
-| `/cluster/node_status` | `NodeStatus` topic | 所有节点 → 所有节点 | 资源、心跳、选主声明、链路、正在运行的任务 |
-| `/cluster/task_report` | `TaskReport` topic | 执行节点 → 集群主节点 | 执行状态变化 |
-| `/cluster/task_status` | `TaskStatus` topic | 集群主节点 → 所有节点 | 任务表变化，供网关生成事件流 |
-| `<ns>/api/task/create\|destroy\|query` | `CreateTask` 等 srv | 任何调用方 → 本节点网关 | 对外入口；不是集群主节点时转发给它 |
-| `<ns>/leader/task/create\|destroy\|query` | 同上 | 其他节点的网关 → 集群主节点 | 只由集群主节点处理，**不再转发**，避免请求在节点之间来回转发 |
-| `<ns>/exec/task/start\|stop` | `StartTask`/`StopTask` srv | 集群主节点 → 执行节点 | 内部接口，其他程序不得调用 |
-| `<ns>/exec/status` | `ExecutorStatus` topic | 数据面进程 → 本节点控制进程 | 正在运行的任务、算法是否就绪 |
+| `<ns>/exec/status` | `ExecutorStatus` topic | 数据面进程 → 本节点控制进程 | 正在运行的任务、墓碑、算法是否就绪 |
+| `/cluster/task_status` | `TaskStatus` topic | 集群主节点 → 所有节点 | 接入层：任务表变化，供网关生成事件流 |
+| `<ns>/api/task/create\|destroy\|query` | `CreateTask` 等 srv | 本机调用方 → 本节点网关 | 对外入口；网关把它做成 `Request` |
 | `<ns>/algorithms/pkci/*`、`pkct/*` | 复用包原有 srv | 执行节点 → 推理服务 | 不改 |
 | `<ns>/camera/image` | `sensor_msgs/Image` | 取图 → 执行节点 | 不改 |
 | `<ns>/input/airsim/<vehicle>/cam_<camera>` | `sensor_msgs/Image` | 按需取图 → 本节点执行器 | 有任务使用 `airsim://` 输入时才存在（4.4） |
 | `<ns>/<topic>/compressed` | `sensor_msgs/CompressedImage` | 数据所在节点 → 其他参与节点 | JPEG；只在有订阅者时才编码（4.4） |
-| `<ns>/task/result`、`result_image` | `TaskResult` / `Image` | 执行节点 → 汇总方、网关 | `TaskResult` 新增了字段 |
-| `http://<节点>:18090/api/ue/*` | HTTP/JSON | UE → 任意节点 | 沿用复用包的 `ue_api.py`；task_id 改为 UUID 字符串 |
+| `<ns>/task/result`、`result_image` | `TaskResult` / `Image` | 执行节点 → 汇总方、网关 | `TaskResult` 带执行代次 `(epoch, assign_term)` |
+| `http://<节点>:18090/api/ue/*` | HTTP/JSON | UE → 任意节点 | 沿用复用包的 `ue_api.py`；task_id 是 UUID 字符串 |
 
 ### 2.3 字段和常量
 
@@ -86,11 +98,13 @@
 
 没有独立的一致性协议，也没有节点之间两两建立的 TCP 连接。对网络的唯一要求是 DDS 能在节点之间正常发现和通信。
 
-### 3.2 服务名必须唯一
+### 3.2 跨节点不用 Service；命令和请求带目标
 
-**整个 ROS domain 中，同一个服务名只能有一个服务端。** 因此服务一律放在 `<ns>` 下，全局名字（`/cluster/*`）只用于 topic。
+节点之间的命令、请求一律用 topic，并在消息里写明目标：`Command.targets` 写明发给哪些执行器，`Request.target_leader` 写明由哪个集群主节点处理，收到不是发给自己的就忽略。命令和请求都可以安全地重复（幂等），丢了由对账或调用方重试兜底，所以不需要 Service 的一问一答。
 
-原因：同名服务有多个服务端时，ROS 2 没有定义会发生什么，实际上请求通常会被**每个服务端都执行一遍**。如果把下发接口命名为全局的 `/cluster/start`，换主的过渡期里新旧两个集群主节点都会收到请求，同一个任务就会被执行两次。
+原因：同名服务有多个服务端时，ROS 2 没有定义会发生什么，实际上请求通常会被每个服务端都执行一遍；而按节点命名的服务又要求集群主节点为每个执行器建一个客户端，端点数成百上千，还有服务发现的竞态。目标地址让一条命令可以同时发给多个节点，短暂出现两个集群主节点时一个请求也只会被处理一次。
+
+本机内的接入层入口（`<ns>/api/task/*`）仍然是 Service，它们只在本机调用。
 
 ### 3.3 QoS
 
@@ -98,7 +112,8 @@
 |---|---|---|---|---|
 | `/cluster/node_status` | BEST_EFFORT | KEEP_LAST(1) | VOLATILE | 只有最新值有用，丢一条下一秒就补上 |
 | `<ns>/exec/status` | BEST_EFFORT | KEEP_LAST(1) | VOLATILE | 同上 |
-| `/cluster/task_report` | RELIABLE | KEEP_LAST(100) | VOLATILE | 状态变化不应丢失；即使丢了，也有对账兜底 |
+| `/cluster/task_list` | RELIABLE | 发布端 KEEP_LAST(1)，订阅端 KEEP_LAST(32) | **两端都** TRANSIENT_LOCAL | 只在变化时发，新订阅者要拿到每个节点的最新一份。订阅端不声明 TRANSIENT_LOCAL 就收不到历史；ROS 2 消息没有 key，订阅端的历史槽位是所有发布者共用的，深度为 1 会互相覆盖 |
+| `/cluster/command`、`exec_event`、`request`、`reply` | RELIABLE | KEEP_LAST(32) | VOLATILE | 低频；丢了由对账或重试兜底 |
 | `/cluster/task_status` | RELIABLE | KEEP_LAST(100) | VOLATILE | 事件流 |
 | `<ns>/camera/image` | sensor data 预设 | — | — | 沿用复用包 |
 | `.../input/airsim/...`、`.../compressed` | sensor data 预设 | — | — | 图像流丢一帧没关系，后面的帧会补上 |
@@ -114,7 +129,8 @@ QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义�
 
 | 标识 | 生成方式 | 规则 |
 |---|---|---|
-| `task_id` | 集群主节点在接受任务时生成 UUID（字符串） | 全局唯一，不依赖计数器，换主后也不会重复 |
+| `task_id` | 集群主节点在接受任务时生成 UUID | 全局唯一，不依赖计数器，换主后也不会重复。控制面消息里是 16 字节二进制，对外接口里是字符串 |
+| `node_id` | 部署配置（2.1） | 1～254，集群内唯一；0 表示“无” |
 | `epoch` | 每次（重新）调度时加 1 | 首次调度时为 1；换主后从执行者上报的值继续 |
 | `assign_term` | 每次（重新）调度时设为当前任期 | 换主后接收（Adopt）任务时**不变**：接收只是认领，改了执行器会当成新会话而重启任务 |
 | `term` | 选主时取“已知最大 term 加 1” | 只增不减 |
@@ -143,7 +159,7 @@ QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义�
 
 ### 4.4 任务输入：数据源地址
 
-任务的输入用**数据源地址**（`CreateTask.input`，`StartTask.spec_json` 中的 `input`）表示，由平台按地址取数据。平台不关心数据是什么类型（图像、点云、特征），只关心它在哪里。代码在 `core/input_source.py`。
+任务的输入用**数据源地址**（`CreateTask.input`，即任务规格 `spec_json` 中的 `input`）表示，由平台按地址取数据。平台不关心数据是什么类型（图像、点云、特征），只关心它在哪里。代码在 `core/input_source.py`。
 
 | 地址 | 含义 | 位置属性 | 参与节点怎么拿到数据 |
 |---|---|---|---|
@@ -196,7 +212,8 @@ QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义�
 
 ### 5.3 执行者是事实来源
 
-- **执行者通过 `NodeStatus.tasks`（`TaskState`）上报自己正在运行的每个任务**，包括 task_id、执行代次（`epoch`、`assign_term`）、角色、任务主节点、辅助节点、幂等键、名称和完整的任务规格（`spec_json`）。这是“实际在跑什么”的唯一来源。
+- **执行者上报自己正在运行的每个任务**：心跳里是摘要（task_id、执行代次、角色），`TaskList` 里是完整信息（`TaskState`：再加上任务主节点、辅助节点、幂等键、名称和完整的任务规格 `spec_json`）和墓碑。这是“实际在跑什么”的唯一来源。
+- **执行器没有出声不等于任务没了**：控制进程超过 `executor_timeout`（3 秒）收不到 `ExecutorStatus`，就在心跳里报 `executor_alive=false`，任务列表保持最后一次已知的值；集群主节点等 `executor_stall_grace_s`（10 秒）后才迁移它的任务。只有执行器明确上报“没有这个任务”（包括执行器重启后 `incarnation` 变了），才算任务没了。
 - **新集群主节点重建任务表**：等待 `warmup_s`（等于 `node_offline_timeout_s`）收齐所有存活节点的 NodeStatus，然后在第一次对账时接收所有正在运行的任务。预热期间网关返回 `NO_LEADER`，调用方稍后重试。
 - **任务何时算被接受**：网关只有在任务已经在执行者上跑起来之后，才返回成功。如果在 `create_wait_timeout_s` 内没有跑起来（还在排队、下发被暂时拒绝后重试中，或者中途换主），就返回失败（`TIMEOUT` / `NO_LEADER` / `NOT_LEADER`），能带 task_id 时带上。网关在 `request_timeout_s` 内等不到回复（集群主节点挂了、回复丢了）也返回 `TIMEOUT`。调用方用同一个幂等键重试；如果任务其实已经跑起来了，重试会直接返回原来的任务（`duplicate=true`）。
 - **新任务在下一个控制周期（约 0.1 秒）就调度**，不等每秒一次的对账；对账仍然兜底。
@@ -210,19 +227,19 @@ QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义�
 | 收到的命令 | 处理 |
 |---|---|
 | 命令的目标里没有本节点 | 忽略，不回复，也不记录其中的 `term` |
-| `term` < 已知的最大 `term` | 拒绝，返回 `STALE_TERM` |
-| `StartTask`：同一 `task_id`、同一代次，任务已经在运行 | 返回**成功**（幂等） |
-| `StartTask`：同一 `task_id`、更大的代次 | 先停掉旧会话，再按新代次启动 |
-| `StartTask`：同一 `task_id`、更小的代次 | 拒绝，返回 `STALE_EPOCH` |
-| `StartTask`：本节点**实际**运行的其他任务数（不含同一 `task_id` 的旧会话）已达 `max_tasks_per_node` | 拒绝，返回 `BUSY` |
-| `StopTask`：本节点运行的代次不大于命令里的代次 | 停止 |
-| `StopTask`：本节点运行的代次比命令里的新 | 拒绝，返回 `STALE_EPOCH`，不停新会话 |
-| `StopTask`：任务本来就不在运行 | 返回成功（幂等） |
-| `StopTask` 的原因是销毁（cancel），且没有被拒绝 | 无论任务是否在运行，都留一条墓碑：保留 `tombstone_ttl_s`（600 秒），最多 16 条 |
+| `term` < 已知的最大 `term` | 回 `REJECTED`（`STALE_TERM`） |
+| START：同一 `task_id`、同一代次，任务已经在运行 | 回 `RUNNING`（幂等） |
+| START：同一 `task_id`、更大的代次 | 先停掉旧会话，再按新代次启动 |
+| START：同一 `task_id`、更小的代次 | 回 `REJECTED`（`STALE_EPOCH`） |
+| START：本节点**实际**运行的其他任务数（不含同一 `task_id` 的旧会话）已达 `max_tasks_per_node` | 回 `REJECTED`（`BUSY`） |
+| STOP：本节点运行的代次不大于命令里的代次 | 停止，回 `STOPPED` |
+| STOP：本节点运行的代次比命令里的新 | 回 `REJECTED`（`STALE_EPOCH`），不停新会话 |
+| STOP：任务本来就不在运行 | 回 `STOPPED`（幂等） |
+| STOP 的原因是销毁（cancel），且没有被拒绝 | 无论任务是否在运行，都留一条墓碑：保留 `tombstone_ttl_s`（600 秒），最多 16 条 |
 
 执行器自己做准入检查，是因为调度器按任务表统计的任务数在两个集群主节点并存、刚换主、或有残留副本时可能是错的；执行器按实际运行的任务数检查，是最后一道防线。墓碑让新集群主节点把已被销毁的任务接收为 Cancelled，而不是让它复活。
 
-集群主节点处理 `TaskReport` 时，必须丢弃代次与任务当前代次不同的报告（更小的返回 `STALE_EPOCH`）。汇总方处理 `TaskResult` 时同样按 `(epoch, assign_term)` 丢弃旧代次的结果。
+集群主节点处理 `ExecEvent` 时，必须丢弃代次与任务当前代次不同的报告（更小的返回 `STALE_EPOCH`）。汇总方处理 `TaskResult` 时同样按 `(epoch, assign_term)` 丢弃旧代次的结果。
 
 term 检查是出现两个集群主节点时的第一道防线：只要任期较高的集群主节点向某个执行器发过命令，任期较低的集群主节点就再也无法对这个执行器下发或停止任务。
 
@@ -258,15 +275,15 @@ Pending ──assign(代次+1)───► Scheduled ──report Running──�
 | 观察到的情况 | 动作 |
 |---|---|
 | 某节点运行着任务表**不知道**的任务，或者执行代次**比任务表新**。“某节点”包括在线节点，以及 `offline_retain_s` 内离线节点最后一份 `TaskList` | **接收**（`Adopt`），完整规格取自该节点的 `TaskList`；`TaskList` 还没追上心跳的节点这一轮跳过（任务表不知道的副本也先不停）。同一任务有多份副本时，取代次最大的；代次相同时，优先取任务主节点上的那份；再相同就取节点名最小的。任何节点的 `TaskList` 里有这个任务的墓碑，就接收为 Cancelled。其余副本在下一轮被停掉 |
-| 同上，但这个任务的幂等键已经属于任务表里的另一个任务 | 判定为重复，向该节点发送 `StopTask`（原因 `duplicate`） |
+| 同上，但这个任务的幂等键已经属于任务表里的另一个任务 | 判定为重复，向该节点发送 STOP（原因 `duplicate`） |
 | Pending | 按优先级从高到低调度；超过 `pending_timeout_s` 仍无可用节点，判定 Failed |
 | 任务主节点离线（超过 `node_offline_timeout_s` 没有收到它的 `NodeStatus`） | 重新调度：代次变为 `(epoch + 1, 当前任期)`。**大面积离线保护生效时暂停**（见下文） |
 | 任务主节点在线，但 `executor_alive=false` 已超过 `executor_stall_grace_s`（10 秒） | 重新调度。执行器卡住期间心跳保留最后已知的任务列表，所以下面“丢失任务”那一行不会因此触发 |
 | 节点在线，上报的任务里有它且执行代次一致 | 正常；如果任务表里还是 Scheduled，说明 `Running` 报告丢了，由集群主节点代为提交 `ReportStatus(Running)` |
-| 节点（主或辅）在线但没有这个任务，任务状态是 Scheduled | 每隔 `dispatch_retry_s` 用同一个代次重发 `StartTask`（幂等）；超过 `start_timeout_s` 仍未启动，重新调度 |
-| 任务主节点在线但没有这个任务，任务状态是 Running | 先等待 `missing_grace_s`（`NodeStatus` 可能比 `TaskReport` 晚到）；仍然没有就重新调度 |
-| 某节点运行的任务在任务表中是 Cancelled | 每隔 `stop_retry_s` 发送 `StopTask`（原因 `cancel`，执行器留墓碑） |
-| 某节点运行的任务已经是其他终态、执行代次比任务表旧，或者并没有分配给它 | 每隔 `stop_retry_s` 发送 `StopTask`（原因 `stale` 或 `unassigned`） |
+| 节点（主或辅）在线但没有这个任务，任务状态是 Scheduled | 每隔 `dispatch_retry_s` 用同一个代次重发 START（幂等）；超过 `start_timeout_s` 仍未启动，重新调度 |
+| 任务主节点在线但没有这个任务，任务状态是 Running | 先等待 `missing_grace_s`（心跳可能比 `ExecEvent` 晚到）；仍然没有就重新调度 |
+| 某节点运行的任务在任务表中是 Cancelled | 每隔 `stop_retry_s` 发送 STOP（原因 `cancel`，执行器留墓碑） |
+| 某节点运行的任务已经是其他终态、执行代次比任务表旧，或者并没有分配给它 | 每隔 `stop_retry_s` 发送 STOP（原因 `stale` 或 `unassigned`） |
 
 **大面积离线保护**：集群主节点自己的链路变差时，“看不到很多节点”和“很多节点挂了”在它看来是一样的，照常迁移会把任务塞进少数还看得见的节点，而原副本还在正常运行。所以在 `mass_offline_window_s`（10 秒）内新判定离线的节点数超过窗口开始时在线节点数的 `mass_offline_ratio`（1/3）时，暂停“任务主节点离线 → 重新调度”这一条，其他动作照常。这些节点回来到阈值以下时退出；持续 `mass_offline_hold_s`（30 秒）仍未恢复也退出，恢复迁移。进入和退出都记 WARNING 日志。
 
@@ -281,11 +298,11 @@ Pending ──assign(代次+1)───► Scheduled ──report Running──�
 | `node_status_period_s` | 1.0 | NodeStatus 发布周期，也就是集群主节点的续约周期 |
 | `node_offline_timeout_s` | 5.0 | 连续这么久收不到 NodeStatus，就判定节点离线；也用作选主的启动等待时间和集群主节点的预热时间 |
 | `leader_timeout_s` | 1.0 | 集群主节点被判定离线后，再过这么久，由下一个节点宣布接任 |
-| `dispatch_timeout_s` | 5.0 | 协议 2 过渡期：网关向集群主节点发请求前等待其服务出现的时间（协议 3 删除） |
-| `dispatch_retry_s` | 5.0 | 未启动的任务多久重发一次 `StartTask` |
+| `dispatch_retry_s` | 5.0 | 未启动的任务多久重发一次 START |
 | `start_timeout_s` | 15.0 | Scheduled 这么久仍未在任务主节点上启动，就重新调度 |
 | `missing_grace_s` | 3.0 | Running 的任务从任务主节点的上报中消失多久后重新调度 |
-| `stop_retry_s` | 5.0 | 多余的副本多久重发一次 `StopTask` |
+| `stop_retry_s` | 5.0 | 多余的副本多久重发一次 STOP |
+| `slow_fields_every` | 5 | 心跳每隔几条附带一次资源和链路 |
 | `create_wait_timeout_s` | 10.0 | 集群主节点为创建请求等待任务跑起来的最长时间 |
 | `destroy_wait_timeout_s` | 10.0 | 集群主节点为销毁请求等待参与者确认停止的最长时间 |
 | `request_timeout_s` | 15.0 | 网关等待回复的最长时间（等待时间 10 秒加 5 秒余量） |
@@ -323,7 +340,7 @@ Pending ──assign(代次+1)───► Scheduled ──report Running──�
 
 - 控制进程的入口是 `ros2 run cccp_node control_node`；数据面进程的入口是 `ros2 run cccp_task_executor data_plane`，它用一个 `MultiThreadedExecutor` 同时运行执行器、PKCI、PKCT 三个节点；启动脚本是 `deploy/start_node.sh`。
 - 两个进程之间通过 `<ns>/exec/status` 传递信息：控制进程根据它填写 `NodeStatus` 里的 `tasks` 和 `inference_ready`。
-- 调用方式的选择：**同一进程内直接调用函数**（执行器 → PKCI/PKCT 引擎，`INFERENCE_BACKEND=local`，默认值）；**跨节点的低频调用用 ROS 2 Service**（`StartTask`/`StopTask`、转发给集群主节点的请求）；**跨节点的逐帧数据用 Topic**（`TaskResult` 和其中的协同载荷）。禁止跨节点逐帧传输图像。推理引擎仍然以 `<ns>/algorithms/*` 服务的形式对外提供，设置 `INFERENCE_BACKEND=ros` 可以让执行器改走服务调用。
+- 调用方式的选择：**同一进程内直接调用函数**（执行器 → PKCI/PKCT 引擎，`INFERENCE_BACKEND=local`，默认值）；**跨节点的低频命令和请求用带目标地址的 topic**（`Command`/`ExecEvent`、`Request`/`Reply`，3.2）；**跨节点的逐帧数据用 Topic**（`TaskResult` 和其中的协同载荷）。禁止跨节点逐帧传输图像。推理引擎仍然以 `<ns>/algorithms/*` 服务的形式对外提供，设置 `INFERENCE_BACKEND=ros` 可以让执行器改走服务调用。
 
 ### 6.2 业务逻辑与 ROS 解耦
 
@@ -422,11 +439,13 @@ UE HTTP 接口的状态码必须与上表一致（`ue_api.py`）：可以重试�
 | 场景 | 通过条件 |
 |---|---|
 | 杀掉集群主节点（它没有运行任务） | 约 6 秒内选出新集群主节点，`term` 加 1；正在运行的任务被接收，执行代次不变，没有被重启，也没有被重复执行 |
-| 杀掉集群主节点（它正在运行任务） | 这些任务丢失；调用方用同一个幂等键重试后，任务重新跑起来 |
+| 杀掉集群主节点（它正在运行任务） | 新集群主节点从缓存的 `TaskList` 接收这些任务，在别处以新代次重启，`task_id` 不变 |
 | 杀掉任务主节点 | 在 `node_offline_timeout_s` 之后，任务被重新调度，`epoch` 加 1 |
 | 执行进程重启 | 对账后任务恢复 |
-| 重复发送 `StartTask` | 第二次返回成功，任务不会启动两次 |
-| 用旧 `term` 发送 `StartTask` / `StopTask` | 返回 `STALE_TERM` |
+| 重复发送 START | 第二次回 `RUNNING`，任务不会启动两次 |
+| 执行器卡住（不发 `ExecutorStatus`） | 宽限期内任务不动；超过 `executor_stall_grace_s` 后迁移 |
+| 销毁后立即杀掉集群主节点 | 任务不复活：有墓碑的任务被接收为 Cancelled，剩余副本被停掉 |
+| 用旧 `term` 发送 START / STOP | 回 `REJECTED`（`STALE_TERM`） |
 | 用同一个幂等键提交两次 `CreateTask`（包括换主前后各提交一次） | 返回同一个 `task_id`，并且 `duplicate=true` |
 | 网络分裂，两边各自选出集群主节点，并接受了同一个请求 | 恢复连通后（或者高任期一方已经接触到这些执行器时），只剩一份副本 |
 | 某个节点丢包率达到 30% | 不会被误判为离线，也不会引发频繁换主 |

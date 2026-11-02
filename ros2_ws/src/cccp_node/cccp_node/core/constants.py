@@ -5,6 +5,9 @@ values are mirrored here. test_constants.py reads the .msg/.srv files and
 fails if the two ever drift apart.
 """
 
+# NodeStatus.msg: nodes with another version neither vote nor get tasks (DESIGN 5.7)
+PROTOCOL_VERSION = 3
+
 # TaskStatus.msg
 PENDING = "Pending"
 SCHEDULED = "Scheduled"

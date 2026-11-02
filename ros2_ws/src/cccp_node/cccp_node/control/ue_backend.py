@@ -107,10 +107,11 @@ class UeBackend:
         for name, view in sorted(self._cluster.all().items()):
             nodes.append({
                 "name": name, "status": "Online" if self._cluster.is_online(name, now) else "Offline",
-                "leader": view.is_leader, "term": view.term, "inference_ready": view.inference_ready,
-                "algorithms": list(view.algorithms_ready), "cpu_model": view.cpu_model, "cpu_cores": view.cpu_cores,
+                "node_id": view.node_id, "leader": view.is_leader, "term": view.term,
+                "inference_ready": view.inference_ready, "executor_alive": view.executor_alive,
+                "algorithms": list(view.algorithms_ready), "cpu_cores": view.cpu_cores,
                 "cpu_usage": view.cpu_usage, "mem_total_mb": view.mem_total_mb, "mem_usage": view.mem_usage,
-                "gpu_model": view.gpu_model, "gpu_usage": view.gpu_usage, "battery": view.battery,
+                "gpu_usage": view.gpu_usage, "battery": view.battery,
                 "running_tasks": [t.task_id for t in view.running_tasks],
                 "links": [{"peer": l.peer, "rtt_ms": l.rtt_ms, "jitter_ms": l.jitter_ms, "loss_rate": l.loss_rate}
                           for l in view.links],
