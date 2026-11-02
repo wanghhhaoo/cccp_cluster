@@ -279,3 +279,28 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 1. 10 秒和 3 次这两个值是拍的。AirSim 重启通常要多久？如果超过 10 秒，可以调大 `input_timeout`。
 2. 本机相机输入（空 `input`）的任务停帧后也会迁移，换到别的节点的相机。如果不希望这样，可以让空输入的任务停帧时直接判定失败，改 `controller._requeue_stalled` 一处即可。
 3. 停帧判定失败的计数只存在集群主节点内存里，换主后从 0 重新计，最多多换几次节点。
+
+## 十六、11-02：按设计 0.3 改控制面（进行中，分支 `p3-control-plane`）
+
+设计文档 0.3（`DESIGN3.md`，控制面已定稿）按附录 D 分阶段实施，每个阶段结束时测试全部通过：
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| 1 | 核心逻辑（`core/`，不涉及 ROS）：执行代次、执行栅栏、集群视图、选主、对账、调度过滤、链路量化 | **完成** |
+| 2 | 控制器和网关：`Command`/`ExecEvent` 异步下发、Submit 后下一周期调度、销毁等确认、`Request`/`Reply` | 未开始 |
+| 3 | 接口包按附录 C 重写（协议 3）；`convert`、`control_node`、`dispatcher`、`forwarder`、`qos`、`names`、`fake_ros` | 未开始 |
+| 4 | 执行器：订阅 `Command`、发 `ExecEvent`、墓碑上报、`ExecutorStatus` 独立回调组 | 未开始 |
+| 5 | 接入层、部署脚本；`docs/DESIGN.md` 换成 0.3 并合入第十五节的无输入检测 | 未开始 |
+| 6 | 端到端测试：杀执行任务的集群主节点、销毁后立即换主不复活；心跳大小测试 | 未开始 |
+
+**阶段 1 期间的过渡做法**（阶段 3 换接口时去掉）：
+- 0.2 的 `TaskState`、`TaskReport`、`StartTask`、`StopTask`、`TaskResult` 临时加了 `assign_term` 字段，端到端测试因此现在就覆盖执行代次。
+- 协议 2 的 `NodeStatus` 仍带完整 `TaskState`，`control_node._record` 拿它充当 `TaskList`（版本号取 `seq`），核心逻辑已按 0.3 的“心跳摘要 + TaskList”工作。
+- 选主已支持 `visible_peers` 排序，但 0.2 心跳没有这个字段，控制节点暂时对自己也报 0，大家一致，结果退化为按名字选。
+- STOP 的原因类别（`cancel` 等）目前写进 `StopTask.reason` 文本；执行器还不留墓碑（阶段 4）。
+- `NodeView` 仍保留 `cpu_model`、`gpu_model`：调度器用 `gpu_model` 判断有没有 GPU，0.3 的心跳去掉了型号字符串，阶段 3 要换一个判断（例如 `gpu_mem_total_mb > 0` 或 `gpu_usage >= 0`）。
+
+**与 DESIGN3 不同的地方**（需要回填设计文档）：
+1. 链路量化：设计写“255 表示未知或 ≥ 1 秒”。实现里 255 只表示未知，测量值最大取 254（约 1 秒）。否则 1 秒以上的坏链路会被当成“未测量”，调度器按默认值（30 ms）给它打高分。回显延迟饱和时按未知处理，不用来算 RTT。
+2. 对账：任务表不知道、这一轮又没能接收的副本（它所在节点的 `TaskList` 还没追上心跳）不再当作“unknown task”停掉，而是等下一轮。0.2 会直接停，0.3 的“tasks_version 不一致时跳过”要求等待。如果某个节点的 `TaskList` 一直不来，这个副本会一直没人管，阶段 3 接上真实 `TaskList` 后要观察。
+3. 大面积离线保护的退出条件按“触发时掉线的那批节点回来了多少”计算，而不是按 10 秒窗口内的掉线数（后者 10 秒后自然归零，保护会提前结束）。

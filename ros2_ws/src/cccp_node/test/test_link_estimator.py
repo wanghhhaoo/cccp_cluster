@@ -1,6 +1,8 @@
 import pytest
 
-from cccp_node.core.link_estimator import LinkEstimator
+from cccp_node.core.link_estimator import (
+    UNKNOWN, LinkEstimator, LinkReport, byte_to_echo_delay_ms, byte_to_ms, byte_to_rate, quantize,
+)
 
 
 def exchange(x, y, x_seq, t_send, one_way_s, hold_s):
@@ -68,3 +70,34 @@ def test_restart_resets_peer_and_silent_peers_are_dropped():
     report = est.reports(2.0)[0]
     assert (report.echo_seq, report.echo_delay_ms) == (1, 1000)
     assert est.reports(11.5) == []
+
+
+def test_one_byte_encoding_round_trips_within_a_unit_and_keeps_unknown_apart():
+    report = LinkReport("y", rtt_ms=41.0, jitter_ms=-1.0, loss_rate=0.034, echo_seq=0x12345, echo_delay_ms=700)
+    q = quantize(report)
+    assert q == dict(echo_seq=0x2345, rtt_4ms=10, jitter_4ms=UNKNOWN, loss_pct=3, echo_delay_4ms=175)
+    assert (byte_to_ms(q["rtt_4ms"]), byte_to_ms(q["jitter_4ms"]), byte_to_rate(q["loss_pct"])) == (40.0, -1.0, 0.03)
+    slow = quantize(LinkReport("y", rtt_ms=3000.0, jitter_ms=0.0, loss_rate=1.0, echo_seq=1, echo_delay_ms=5000))
+    assert byte_to_ms(slow["rtt_4ms"]) == 1016.0                  # a very slow link still reads as slow
+    assert byte_to_echo_delay_ms(slow["echo_delay_4ms"]) == -1.0  # but its delay is no use for RTT
+    assert byte_to_rate(slow["loss_pct"]) == 1.0 and byte_to_rate(UNKNOWN) == -1.0
+
+
+def test_rtt_from_quantized_echoes_with_truncated_seq():
+    x, y = LinkEstimator(), LinkEstimator()
+    seq = 0x10005                                                 # past 16 bits
+    x.on_peer_status("y", 1, 1, 9.0)
+    x.on_publish(seq - 1, 9.0)
+    x.on_publish(seq, 10.0)
+    y.on_peer_status("x", 1, seq, 10.020)
+    q = quantize(next(r for r in y.reports(10.720) if r.peer_name == "x"))
+    x.on_peer_echo("y", q["echo_seq"], byte_to_echo_delay_ms(q["echo_delay_4ms"]), 10.740)
+    assert next(r for r in x.reports(11.0) if r.peer_name == "y").rtt_ms == pytest.approx(40.0, abs=4.0)
+
+
+def test_echo_with_unknown_delay_is_not_a_sample():
+    x = LinkEstimator()
+    x.on_peer_status("y", 1, 1, 9.0)
+    x.on_publish(1, 10.0)
+    x.on_peer_echo("y", 1, -1.0, 12.0)
+    assert next(r for r in x.reports(12.0) if r.peer_name == "y").rtt_ms == -1.0
