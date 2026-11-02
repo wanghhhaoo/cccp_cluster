@@ -1,4 +1,11 @@
-"""Blocking ROS service calls to other nodes: StartTask / StopTask from the cluster leader to executors."""
+"""Leader -> executor commands over protocol 2's StartTask / StopTask services.
+
+Stands in for the Command / ExecEvent topics of protocol 3 (DESIGN 2.5) until the
+interfaces change: each command becomes one asynchronous service call per target,
+and each response comes back as an ExecEvent. Nothing blocks; a lost call simply
+produces no event, and reconciliation resends from heartbeats as it would for a
+lost Command.
+"""
 from __future__ import annotations
 
 import threading
@@ -6,28 +13,21 @@ import threading
 from cccp_task_interfaces.srv import StartTask, StopTask
 
 from .. import names
-from ..control.controller import DispatchResult, StartRequest
-from ..core import constants as c
-from ..core.generation import Generation
+from ..control import protocol as p
+from ..control.protocol import ExecCommand, ExecEvent
 from . import convert
 
 
-class ServiceCaller:
-    """Per-node service clients plus a blocking call with a timeout.
+class ServiceClients:
+    """Per-node service clients, created once and reused."""
 
-    Use from a thread that is not an executor callback of the same group (the
-    controller thread, or a reentrant service callback). The node must spin in
-    a MultiThreadedExecutor so responses are processed while the caller waits.
-    """
-
-    def __init__(self, node, callback_group, timeout_s: float):
+    def __init__(self, node, callback_group):
         self._node = node
         self._group = callback_group
-        self.timeout_s = timeout_s
         self._clients = {}
         self._lock = threading.Lock()
 
-    def client(self, srv_type, node_name: str, relative: str):
+    def get(self, srv_type, node_name: str, relative: str):
         key = (relative, node_name)
         with self._lock:
             client = self._clients.get(key)
@@ -37,41 +37,32 @@ class ServiceCaller:
                 self._clients[key] = client
             return client
 
-    def call(self, client, request, timeout_s: float | None = None):
-        timeout_s = self.timeout_s if timeout_s is None else timeout_s
-        if not client.wait_for_service(timeout_sec=min(timeout_s, self.timeout_s)):
-            raise RuntimeError("%s is not available" % client.srv_name)
-        done = threading.Event()
-        future = client.call_async(request)
-        future.add_done_callback(lambda _: done.set())
-        if not done.wait(timeout_s):
-            if hasattr(client, "remove_pending_request"):
-                client.remove_pending_request(future)
-            raise RuntimeError("%s timed out" % client.srv_name)
-        return future.result()
 
+class RosCommandSink:
+    """Implements control.controller.CommandSink; on_event receives the executors' answers."""
 
-class RosDispatcher(ServiceCaller):
-    """Implements control.controller.Dispatcher. Blocking calls: use from the controller thread only."""
+    def __init__(self, node, callback_group, on_event):
+        self._clients = ServiceClients(node, callback_group)
+        self._on_event = on_event
 
-    def __init__(self, node, callback_group, timeout_s: float = 5.0):
-        super().__init__(node, callback_group, timeout_s)
+    def send(self, command: ExecCommand) -> None:
+        for target in command.targets:
+            if command.op == p.START:
+                client = self._clients.get(StartTask, target, names.EXEC_START_SERVICE)
+                request = convert.fill_start_request(StartTask.Request(), command, target)
+                done = p.RUNNING
+            else:
+                client = self._clients.get(StopTask, target, names.EXEC_STOP_SERVICE)
+                request = convert.fill_stop_request(StopTask.Request(), command)
+                done = p.STOPPED
+            if not client.service_is_ready():
+                continue             # as if the command were lost: reconciliation resends
+            future = client.call_async(request)
+            future.add_done_callback(lambda f, node=target, kind=done: self._answered(command, node, kind, f))
 
-    def start(self, node: str, request: StartRequest) -> DispatchResult:
-        client = self.client(StartTask, node, names.EXEC_START_SERVICE)
-        try:
-            reply = self.call(client, convert.fill_start_request(StartTask.Request(), request))
-        except Exception as exc:
-            return DispatchResult(False, c.TIMEOUT, str(exc))
-        return DispatchResult(reply.success, reply.error_code, reply.message)
-
-    def stop(self, node: str, term: int, task_id: str, generation: Generation, kind: str,
-             reason: str) -> DispatchResult:
-        client = self.client(StopTask, node, names.EXEC_STOP_SERVICE)
-        request = StopTask.Request(term=term, task_id=task_id, epoch=generation.epoch,
-                                   assign_term=generation.assign_term, reason="%s: %s" % (kind, reason))
-        try:
-            reply = self.call(client, request)
-        except Exception as exc:
-            return DispatchResult(False, c.TIMEOUT, str(exc))
-        return DispatchResult(reply.success, reply.error_code, reply.message)
+    def _answered(self, command: ExecCommand, node: str, kind: str, future) -> None:
+        response = future.result()
+        if response is None:
+            return
+        self._on_event(ExecEvent(node, 0, 0, command.term, command.request_id, command.task_id, command.generation,
+                                 kind if response.success else p.REJECTED, response.error_code, response.message))

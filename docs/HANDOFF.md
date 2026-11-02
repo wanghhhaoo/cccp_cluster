@@ -287,7 +287,7 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 1 | 核心逻辑（`core/`，不涉及 ROS）：执行代次、执行栅栏、集群视图、选主、对账、调度过滤、链路量化 | **完成** |
-| 2 | 控制器和网关：`Command`/`ExecEvent` 异步下发、Submit 后下一周期调度、销毁等确认、`Request`/`Reply` | 未开始 |
+| 2 | 控制器和网关：`Command`/`ExecEvent` 异步下发、Submit 后下一周期调度、销毁等确认、`Request`/`Reply` | **完成** |
 | 3 | 接口包按附录 C 重写（协议 3）；`convert`、`control_node`、`dispatcher`、`forwarder`、`qos`、`names`、`fake_ros` | 未开始 |
 | 4 | 执行器：订阅 `Command`、发 `ExecEvent`、墓碑上报、`ExecutorStatus` 独立回调组 | 未开始 |
 | 5 | 接入层、部署脚本；`docs/DESIGN.md` 换成 0.3 并合入第十五节的无输入检测 | 未开始 |
@@ -298,9 +298,20 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 - 协议 2 的 `NodeStatus` 仍带完整 `TaskState`，`control_node._record` 拿它充当 `TaskList`（版本号取 `seq`），核心逻辑已按 0.3 的“心跳摘要 + TaskList”工作。
 - 选主已支持 `visible_peers` 排序，但 0.2 心跳没有这个字段，控制节点暂时对自己也报 0，大家一致，结果退化为按名字选。
 - STOP 的原因类别（`cancel` 等）目前写进 `StopTask.reason` 文本；执行器还不留墓碑（阶段 4）。
+- 阶段 2 起，控制器只认 `ExecCommand`/`ExecEvent`/`Request`/`Reply`（`control/protocol.py`）。在协议 2 上：
+  - `ros/dispatcher.py` 把每条命令拆成对各目标的异步 `StartTask`/`StopTask` 调用，服务响应和 `TaskReport` 都转成 `ExecEvent`；目标的服务还没出现就当作命令丢了，由对账重发；
+  - `ros/forwarder.py` 把请求变成对集群主节点 `leader/task/*` 的异步调用，响应转成 `Reply`；集群主节点用 `Gateway.serve_*` 把它交给本机控制器，不再转发。
 - `NodeView` 仍保留 `cpu_model`、`gpu_model`：调度器用 `gpu_model` 判断有没有 GPU，0.3 的心跳去掉了型号字符串，阶段 3 要换一个判断（例如 `gpu_mem_total_mb > 0` 或 `gpu_usage >= 0`）。
 
 **与 DESIGN3 不同的地方**（需要回填设计文档）：
 1. 链路量化：设计写“255 表示未知或 ≥ 1 秒”。实现里 255 只表示未知，测量值最大取 254（约 1 秒）。否则 1 秒以上的坏链路会被当成“未测量”，调度器按默认值（30 ms）给它打高分。回显延迟饱和时按未知处理，不用来算 RTT。
 2. 对账：任务表不知道、这一轮又没能接收的副本（它所在节点的 `TaskList` 还没追上心跳）不再当作“unknown task”停掉，而是等下一轮。0.2 会直接停，0.3 的“tasks_version 不一致时跳过”要求等待。如果某个节点的 `TaskList` 一直不来，这个副本会一直没人管，阶段 3 接上真实 `TaskList` 后要观察。
 3. 大面积离线保护的退出条件按“触发时掉线的那批节点回来了多少”计算，而不是按 10 秒窗口内的掉线数（后者 10 秒后自然归零，保护会提前结束）。
+4. 附录 C.8 的 `Reply` 只有任务快照（状态、代次、分工），而查询接口（`QueryTask`、UE 的 `GET /tasks/<id>`）还要名称、类型、模式、来源、错误信息等。阶段 3 定义消息时需要给 `Reply` 补上查询用的字段（例如 `name`、`spec_json`、`error_message`、`last_event`），或者另定一个查询回复。
+5. 附录 C.7 的 `Request` 没有销毁原因，`DestroyTask` 有 `reason`。阶段 3 建议补一个 `string<=64 reason`。
+
+**阶段 2 的行为变化**：
+- 销毁一个已经 Cancelled 的任务，不再返回 409，而是再发一次停止、等确认后返回 200（设计 4.5 的“重复销毁”）。销毁 Finished/Failed 的任务仍返回 409。
+- `test_ros_integration.py` 里“集群主节点自己跑的任务随它丢失”的测试换成了 0.3 的行为：新集群主节点从缓存的 `TaskList` 接收它，在别处以新代次重启，`task_id` 不变。
+
+**发现的既有问题（未改）**：在任的集群主节点看到更高的 term 时会把自己的 term 提上去继续担任（设计 5.3），但控制器把“term 变了”一律当成新当选，清空任务表并重新预热 5 秒。运行中的任务不受影响（预热后重新接收），排队中的任务会丢，期间请求返回 `NO_LEADER`。可以改成“没有卸任过就保留任务表”，需要确认这样做在两个集群主节点并存时是否安全。

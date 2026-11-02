@@ -37,6 +37,11 @@ class TaskStore:
         with self._lock:
             return {r.task_id: r for r in self._table.tasks()}
 
+    def pending(self) -> list[TaskRecord]:
+        """Pending records in scheduling order (TaskTable.pending_tasks)."""
+        with self._lock:
+            return self._table.pending_tasks()
+
     def get(self, task_id: str) -> TaskRecord | None:
         with self._lock:
             return self._table.get(task_id)

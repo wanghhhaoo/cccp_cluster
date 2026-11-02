@@ -264,22 +264,23 @@ def test_unpinned_task_moves_when_its_primary_dies(cluster):
         reply.task_id, *record.generation)
 
 
-def test_task_running_on_the_leader_is_lost_with_it_and_can_be_resubmitted(cluster):
-    """Accepted trade-off (CONVENTIONS 5.3): only executors remember tasks, so a task whose only
-    runner was the dying leader disappears; the caller resubmits with the same key."""
+def test_task_running_on_the_leader_is_restarted_elsewhere_after_it_dies(cluster):
+    """DESIGN 6.2: every node keeps the dead leader's last TaskList, so the new leader adopts the
+    task it ran and moves it (from the start, at a new generation, under the same task_id)."""
     leader = wait_for(lambda: active_leader(cluster))
     gateway = next(n for n in live(cluster) if n is not leader)
-    request = CreateTask.Request(task_type="PKCT", params_json=PKCT_BBOX, request_node=leader.name,
-                                 idempotency_key="pinned-1")
-    reply = gateway.control._on_create(request, CreateTask.Response())
-    assert reply.success and reply.assigned_node == leader.name
+    for i in range(8):            # the leader is scored lower, so fill the others until it gets one
+        reply = gateway.control._on_create(CreateTask.Request(task_type="PKCI", idempotency_key="k%d" % i),
+                                           CreateTask.Response())
+        assert reply.success, reply.message
+        if reply.assigned_node == leader.name:
+            break
+    else:
+        pytest.fail("no task was placed on the leader")
     kill(leader)
-    wait_for(lambda: active_leader(cluster), timeout=20.0)
-    time.sleep(1.0)
-    assert table_of(cluster).get(reply.task_id) is None and runners(cluster, reply.task_id) == []
-    retry = gateway.control._on_create(CreateTask.Request(task_type="PKCT", params_json=PKCT_BBOX,
-                                                          idempotency_key="pinned-1"), CreateTask.Response())
-    assert retry.success and not retry.duplicate and retry.task_id != reply.task_id
+    record = wait_for(record_where(cluster, reply.task_id, lambda r: r.status == c.RUNNING and r.epoch >= 2),
+                      timeout=30.0)
+    assert record.primary != leader.name and runners(cluster, reply.task_id) == [record.primary]
 
 
 # ------------------------------------------------------------- input sources

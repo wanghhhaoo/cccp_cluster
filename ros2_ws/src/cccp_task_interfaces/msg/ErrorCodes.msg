@@ -19,6 +19,8 @@ string FUSION_ERROR="FUSION_ERROR"
 string STALE_TERM="STALE_TERM"
 # 当前没有集群主节点（例如正在选举），稍后重试
 string NO_LEADER="NO_LEADER"
+# 请求发给的集群主节点已经让位，稍后重试
+string NOT_LEADER="NOT_LEADER"
 # 过滤后没有满足约束的节点
 string NO_FEASIBLE_NODE="NO_FEASIBLE_NODE"
 # 任务不存在

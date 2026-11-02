@@ -32,7 +32,7 @@ CREATE_FIELDS = {
 }
 UINT8_FIELDS = ("drone_id", "helper_count", "min_participants")
 # "Try again shortly" (no leader yet, election, leader busy or slow): 503 so UE retries instead of giving up.
-RETRYABLE = frozenset((c.NO_LEADER, c.BUSY, c.NOT_READY, c.TIMEOUT))
+RETRYABLE = frozenset((c.NO_LEADER, c.NOT_LEADER, c.BUSY, c.NOT_READY, c.TIMEOUT))
 
 
 def failure_status(result, default):

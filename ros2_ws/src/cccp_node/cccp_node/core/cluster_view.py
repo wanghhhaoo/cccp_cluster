@@ -92,6 +92,10 @@ class NodeView:
     def runs(self, task_id: str, generation: Generation) -> bool:
         return any(t.task_id == task_id and t.generation == generation for t in self.running_tasks)
 
+    def lists(self, task_id: str) -> bool:
+        """Runs some generation of the task."""
+        return any(t.task_id == task_id for t in self.running_tasks)
+
 
 # The slow part of a heartbeat: carried over from the previous beat when absent.
 SLOW_FIELDS = ("cpu_model", "cpu_cores", "mem_total_mb", "gpu_model", "gpu_mem_total_mb", "cpu_usage", "mem_usage",

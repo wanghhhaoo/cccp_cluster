@@ -1,30 +1,51 @@
 """UE HTTP API against a real HTTP server on localhost, backed by a leader gateway."""
 import json
 import logging
+import threading
 import urllib.error
 import urllib.request
 from types import SimpleNamespace as NS
 
 import pytest
 
+from cccp_node.control.controller import ControllerConfig, LeaderController
 from cccp_node.control.gateway import Gateway, GatewayConfig
 from cccp_node.control.task_store import TaskStore
 from cccp_node.control.ue_backend import UeBackend
 from cccp_node.core import constants as c
 from cccp_node.core.cluster_view import ClusterView, NodeView
+from cccp_node.core.election import Leadership
 from cccp_node.core.task_table import Assign, ReportStatus, StatusEvent
 from cccp_node.ue_api import EventLog, UeApi, spec_from_body
 
 
+class Election:
+    def __init__(self):
+        self.name = "n1"
+
+    @property
+    def state(self):
+        return Leadership(self.name, 1, self.name == "n1")
+
+
 @pytest.fixture
 def server():
+    """n1 leads; tasks start only when a test makes them (start_on), so reconciliation is off."""
     store = TaskStore()
     ids = iter(["t-1", "t-2", "t-3"])
-    leader = NS(name="n1")
-    gateway = Gateway("n1", store, lambda: leader.name == "n1", lambda: leader.name,
-                      config=GatewayConfig(create_wait_timeout_s=0.05), new_uuid=lambda: next(ids))
+    leader = Election()
     cluster = ClusterView(5.0)
     cluster.update(NodeView("n1", seq=1, is_leader=True, inference_ready=True), now=0.0)
+    gateway = None
+    controller = LeaderController(
+        "n1", store, leader, ClusterView(5.0), NS(send=lambda command: None),   # no nodes: no placement
+        ControllerConfig(warmup_s=0.0, reconcile_period_s=1e9, create_wait_timeout_s=0.05),
+        reply=lambda reply: gateway.on_reply(reply), new_uuid=lambda: next(ids))
+    gateway = Gateway("n1", lambda: controller.active, lambda: leader.state.leader, controller.on_request,
+                      config=GatewayConfig(request_timeout_s=2.0))
+    stop = threading.Event()
+    loop = threading.Thread(target=controller.run, args=(stop, 0.005))
+    loop.start()
     watched = []
     backend = UeBackend("n1", gateway, cluster,
                         watch=lambda node, images: watched.append((node, images)),
@@ -33,6 +54,8 @@ def server():
     yield NS(base="http://127.0.0.1:%d/api/ue" % api.port, backend=backend, watched=watched,
              store=store, leader=leader)
     api.shutdown()
+    stop.set()
+    loop.join()
 
 
 def call(method, url, body=None):
@@ -80,7 +103,7 @@ def test_create_query_destroy(server):
     status, reply = call_json("DELETE", server.base + "/tasks/t-1")
     assert status == 200 and reply["final_status"] == c.CANCELLED
     status, reply = call_json("POST", server.base + "/tasks/t-1/destroy", {"reason": "again"})
-    assert status == 409 and reply["error_code"] == c.INVALID_STATE
+    assert status == 200 and reply["final_status"] == c.CANCELLED          # destroying again is safe
     status, reply = call_json("DELETE", server.base + "/tasks/nope")
     assert status == 404
 
@@ -123,6 +146,8 @@ def test_failed_task_returns_502(server):
     server.store.add_event_listener(fail_on_submit)
     status, body = call_json("POST", server.base + "/tasks", {"task_type": "PKCI", "idempotency_key": "ue:3"})
     assert status == 502 and body["task_id"] == "t-1" and body["error_code"] == c.INFERENCE_ERROR
+    status, body = call_json("DELETE", server.base + "/tasks/t-1")
+    assert status == 409 and body["error_code"] == c.INVALID_STATE
 
 
 def test_events_long_poll_with_status_and_results(server):

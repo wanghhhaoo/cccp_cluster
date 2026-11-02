@@ -1,15 +1,18 @@
-"""CreateTask / DestroyTask / QueryTask logic, shared by the ROS services and the UE HTTP API.
+"""CreateTask / DestroyTask / QueryTask entry points, shared by the ROS services and the UE HTTP API.
 
-Only the cluster leader holds the task table. Every node exposes the public
-entry points (create/destroy/query): the leader handles them itself, any
-other node forwards them to the leader's leader/task/* services, which call
-the *_local methods and never forward again (so requests cannot loop while
-nodes disagree about the leader).
+Every node offers them; only the cluster leader holds the task table. The
+gateway validates and normalizes a create, then sends a Request naming the one
+leader that should handle it and waits for the matching Reply (DESIGN 4.1):
 
-Task acceptance follows CONVENTIONS 5.3: create() succeeds only once the task
-runs on an executor. If it is not running within create_wait_timeout_s, or the
-leader changes meanwhile, the caller gets a failure and retries with the same
-idempotency key, which returns the original task if it did start after all.
+- this node is the ready leader: the Request goes to the local controller;
+- another node leads: the Request goes out through the transport. That leader
+  handles it itself or answers NOT_LEADER at once; it never forwards, so
+  requests cannot travel between nodes that disagree about the leader;
+- no leader known, or this node leads but is still warming up: NO_LEADER.
+
+Nothing comes back within request_timeout_s (the leader died, or the reply was
+lost): TIMEOUT. All of these are worth retrying, a create with the same
+idempotency key, which then returns the original task if it did start.
 """
 from __future__ import annotations
 
@@ -22,15 +25,16 @@ from typing import Callable, Protocol
 from ..core import constants as c
 from ..core import idempotency
 from ..core.task_spec import SpecError, TaskSpec, normalize_spec
-from ..core.task_table import Cancel, StatusEvent, Submit, TaskRecord
-from .task_store import TaskStore
+from ..core.task_table import TaskRecord
+from . import protocol as p
+from .protocol import Reply, Request
 
 
 @dataclass(frozen=True)
 class GatewayConfig:
     task_types: tuple[str, ...] = ("PKCI", "PKCT")
     max_chain_depth: int = 5
-    create_wait_timeout_s: float = 10.0
+    request_timeout_s: float = 15.0      # the leader's create/destroy wait (10 s) plus a margin
 
 
 @dataclass(frozen=True)
@@ -61,145 +65,131 @@ class QueryReply:
     record: TaskRecord | None = None
 
 
-class Forwarder(Protocol):
-    """Calls the leader's leader/task/* services (ros/forwarder.py)."""
-
-    def create(self, leader: str, spec: TaskSpec, idempotency_key: str) -> CreateReply: ...
-
-    def destroy(self, leader: str, task_id: str, reason: str) -> DestroyReply: ...
-
-    def query(self, leader: str, task_id: str) -> QueryReply: ...
+class RequestTransport(Protocol):
+    def send(self, request: Request) -> None:
+        """Deliver to request.target_leader; its Reply comes back through Gateway.on_reply."""
 
 
 class Gateway:
     def __init__(
         self,
         node_name: str,
-        store: TaskStore,
         is_active: Callable[[], bool],
         leader_name: Callable[[], str],
-        forwarder: Forwarder | None = None,
+        local: Callable[[Request], None],
+        transport: RequestTransport | None = None,
         config: GatewayConfig = GatewayConfig(),
+        term: Callable[[], int] = lambda: 0,
+        incarnation: int | None = None,
         new_uuid: Callable[[], str] = lambda: str(uuid.uuid4()),
-        wall_ms: Callable[[], int] = lambda: int(time.time() * 1000),
-        clock: Callable[[], float] = time.monotonic,
     ):
+        """local: hands a Request to this node's controller (LeaderController.on_request)."""
         self.node_name = node_name
-        self._store = store
+        self.incarnation = incarnation if incarnation is not None else int(time.time() * 1000)
         self._is_active = is_active
         self._leader_name = leader_name
-        self._forwarder = forwarder
+        self._local = local
+        self._transport = transport
         self._config = config
+        self._term = term
         self._new_uuid = new_uuid
-        self._wall_ms = wall_ms
-        self._clock = clock
-        self._changed = threading.Condition()
-        store.add_event_listener(self._on_events)
+        self._lock = threading.Lock()
+        self._request_id = 0
+        self._waiting: dict[int, list] = {}      # request_id -> [threading.Event, Reply | None]
 
-    def _on_events(self, events: tuple[StatusEvent, ...]) -> None:
-        with self._changed:
-            self._changed.notify_all()
+    # ------------------------------------------------------- public entry points
+    def create(self, spec: TaskSpec, idempotency_key: str = "") -> CreateReply:
+        try:
+            spec = normalize_spec(spec, task_types=self._config.task_types,
+                                  max_chain_depth=self._config.max_chain_depth)
+        except SpecError as exc:
+            return CreateReply(False, exc.error_code, str(exc))
+        key = idempotency_key.strip() or idempotency.anonymous(self._new_uuid())
+        return _create_reply(self._call(p.CREATE, idempotency_key=key, spec=spec))
+
+    def destroy(self, task_id: str, reason: str = "") -> DestroyReply:
+        return _destroy_reply(self._call(p.DESTROY, task_id=task_id, reason=reason))
+
+    def query(self, task_id: str) -> QueryReply:
+        return _query_reply(self._call(p.QUERY, task_id=task_id))
+
+    def on_reply(self, reply: Reply) -> None:
+        """Thread-safe; called for every Reply seen, including those meant for other gateways."""
+        if (reply.origin_node, reply.origin_incarnation) != (self.node_name, self.incarnation):
+            return
+        with self._lock:
+            waiting = self._waiting.get(reply.request_id)
+            if waiting is None:
+                return                  # timed out already, or a repeat
+            waiting[1] = reply
+        waiting[0].set()
+
+    # ---------------------------------- protocol 2 only (leader/task/* services)
+    # The leader serves forwarded calls by handing them to its own controller, which
+    # answers NOT_LEADER / NO_LEADER itself when it cannot handle them. Removed once
+    # requests travel as messages (protocol 3).
+    def serve_create(self, spec: TaskSpec, idempotency_key: str) -> CreateReply:
+        return _create_reply(self._call(p.CREATE, here=True, idempotency_key=idempotency_key, spec=spec))
+
+    def serve_destroy(self, task_id: str, reason: str = "") -> DestroyReply:
+        return _destroy_reply(self._call(p.DESTROY, here=True, task_id=task_id, reason=reason))
+
+    def serve_query(self, task_id: str) -> QueryReply:
+        return _query_reply(self._call(p.QUERY, here=True, task_id=task_id))
+
+    # ------------------------------------------------------------- internals
+    def _call(self, op: str, here: bool = False, **fields) -> Reply:
+        if here:
+            leader = self.node_name
+        else:
+            leader, problem = self._route()
+            if problem:
+                return self._failure(c.NO_LEADER, problem)
+        with self._lock:
+            self._request_id += 1
+            request = Request(self.node_name, self.incarnation, self._request_id, leader, self._term(), op, **fields)
+            waiting = self._waiting[request.request_id] = [threading.Event(), None]
+        try:
+            if leader == self.node_name:
+                self._local(request)
+            else:
+                self._transport.send(request)
+            waiting[0].wait(self._config.request_timeout_s)
+        finally:
+            with self._lock:
+                self._waiting.pop(request.request_id, None)
+        if waiting[1] is None:
+            return self._failure(c.TIMEOUT, "no reply from leader %s within %.0f s; retry%s" % (
+                leader, self._config.request_timeout_s, " with the same idempotency key" if op == p.CREATE else ""))
+        return waiting[1]
 
     def _route(self) -> tuple[str, str]:
-        """('local', '') on the ready leader, ('forward', leader) elsewhere, ('', reason) if impossible."""
+        """(leader to ask, "") or ("", why there is none to ask)."""
         if self._is_active():
-            return "local", ""
+            return self.node_name, ""
         leader = self._leader_name()
         if leader == self.node_name:
             return "", "leader %s is still collecting the cluster state; retry shortly" % leader
         if not leader:
             return "", "no cluster leader at the moment; retry shortly"
-        if self._forwarder is None:
+        if self._transport is None:
             return "", "cannot reach leader %s from here" % leader
-        return "forward", leader
+        return leader, ""
 
-    def _normalize(self, spec: TaskSpec) -> TaskSpec:
-        return normalize_spec(spec, task_types=self._config.task_types, max_chain_depth=self._config.max_chain_depth)
+    def _failure(self, error_code: str, message: str) -> Reply:
+        return Reply(self.node_name, self.incarnation, 0, "", 0, error_code, message)
 
-    # ------------------------------------------------------- public entry points
-    def create(self, spec: TaskSpec, idempotency_key: str = "") -> CreateReply:
-        try:
-            spec = self._normalize(spec)
-        except SpecError as exc:
-            return CreateReply(False, exc.error_code, str(exc))
-        key = idempotency_key.strip() or idempotency.anonymous(self._new_uuid())
-        route, target = self._route()
-        if route == "local":
-            return self.create_local(spec, key)
-        if route == "forward":
-            return self._forwarder.create(target, spec, key)
-        return CreateReply(False, c.NO_LEADER, target)
 
-    def destroy(self, task_id: str, reason: str = "") -> DestroyReply:
-        route, target = self._route()
-        if route == "local":
-            return self.destroy_local(task_id, reason)
-        if route == "forward":
-            return self._forwarder.destroy(target, task_id, reason)
-        return DestroyReply(False, c.NO_LEADER, target)
+def _create_reply(reply: Reply) -> CreateReply:
+    common = dict(task_id=reply.task_id, duplicate=reply.duplicate, assigned_node=reply.primary)
+    if reply.success:
+        return CreateReply(True, message=reply.message, dispatched_nodes=(reply.primary, *reply.helpers), **common)
+    return CreateReply(False, reply.error_code, reply.message, **common)
 
-    def query(self, task_id: str) -> QueryReply:
-        route, target = self._route()
-        if route == "local":
-            return self.query_local(task_id)
-        if route == "forward":
-            return self._forwarder.query(target, task_id)
-        return QueryReply(False, c.NO_LEADER, target)
 
-    # -------------------------------------------------- leader-only handlers
-    def create_local(self, spec: TaskSpec, idempotency_key: str) -> CreateReply:
-        if not self._is_active():
-            return CreateReply(False, c.NO_LEADER, "%s is not the ready cluster leader" % self.node_name)
-        try:
-            spec = self._normalize(spec)
-        except SpecError as exc:
-            return CreateReply(False, exc.error_code, str(exc))
-        if not idempotency_key:
-            return CreateReply(False, c.INVALID_INPUT, "idempotency_key is required")
-        result = self._store.apply(Submit(self._new_uuid(), idempotency_key, spec, self._wall_ms()))
-        if not result.ok:
-            return CreateReply(False, result.error_code, result.message)
-        record = self._wait(result.task_id, lambda r: r.status == c.RUNNING or r.terminal,
-                            self._config.create_wait_timeout_s)
-        return self._create_reply(record, result.task_id, result.duplicate)
+def _destroy_reply(reply: Reply) -> DestroyReply:
+    return DestroyReply(reply.success, reply.error_code, reply.message, reply.status)
 
-    def _create_reply(self, record: TaskRecord | None, task_id: str, duplicate: bool) -> CreateReply:
-        if record is None:      # the table was reset: this node lost the leadership meanwhile
-            return CreateReply(False, c.NO_LEADER, "leader changed while starting task %s; retry with the same "
-                               "idempotency key" % task_id, task_id=task_id, duplicate=duplicate)
-        common = dict(task_id=task_id, duplicate=duplicate, assigned_node=record.primary)
-        if record.status in (c.FAILED, c.CANCELLED):
-            return CreateReply(False, record.error_code or c.DISPATCH_FAILED,
-                               record.error_message or record.last_event, **common)
-        if record.status in (c.RUNNING, c.FINISHED):
-            return CreateReply(True, message="task %s %s on %s" % (task_id, record.status.lower(), record.primary),
-                               dispatched_nodes=record.nodes, **common)
-        return CreateReply(False, c.TIMEOUT, "task %s not running yet (%s: %s); retry with the same idempotency key"
-                           % (task_id, record.status.lower(), record.last_event), **common)
 
-    def _wait(self, task_id: str, done: Callable[[TaskRecord], bool], timeout: float) -> TaskRecord | None:
-        deadline = self._clock() + timeout
-        with self._changed:
-            while True:
-                record = self._store.get(task_id)
-                remaining = deadline - self._clock()
-                if record is None or done(record) or remaining <= 0:
-                    return record
-                self._changed.wait(min(remaining, 0.5))
-
-    def destroy_local(self, task_id: str, reason: str = "") -> DestroyReply:
-        if not self._is_active():
-            return DestroyReply(False, c.NO_LEADER, "%s is not the ready cluster leader" % self.node_name)
-        result = self._store.apply(Cancel(task_id, reason, self._wall_ms()))
-        if result.ok:
-            return DestroyReply(True, message="task %s cancelled" % task_id, final_status=c.CANCELLED)
-        record = self._store.get(task_id)
-        return DestroyReply(False, result.error_code, result.message, record.status if record else "")
-
-    def query_local(self, task_id: str) -> QueryReply:
-        if not self._is_active():
-            return QueryReply(False, c.NO_LEADER, "%s is not the ready cluster leader" % self.node_name)
-        record = self._store.get(task_id)
-        if record is None:
-            return QueryReply(False, c.NOT_FOUND, "task %s does not exist" % task_id)
-        return QueryReply(True, message="ok", record=record)
+def _query_reply(reply: Reply) -> QueryReply:
+    return QueryReply(reply.success, reply.error_code, reply.message, reply.record)

@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable
 
-from ..control.controller import StartRequest, TaskReportView
+from ..control import protocol as p
 from ..control.gateway import CreateReply, DestroyReply, QueryReply
+from ..control.protocol import ExecCommand, ExecEvent, Reply, Request
+from ..core import constants as c
 from ..core.cluster_view import LinkView, NodeView, TaskStateView
+from ..core.generation import Generation
 from ..core.link_estimator import LinkReport
 from ..core.task_spec import TaskSpec
 from ..core.task_table import StatusEvent, TaskRecord
@@ -106,28 +109,29 @@ def fill_create_request(request: Any, spec: TaskSpec, idempotency_key: str) -> A
     return _set(request, **{name: getattr(spec, name) for name in SPEC_FIELDS})
 
 
-def create_reply_from_response(response: Any) -> CreateReply:
-    return CreateReply(response.success, response.error_code, response.message, response.task_id,
-                       response.duplicate, response.assigned_node, tuple(response.dispatched_nodes),
-                       tuple(response.candidate_nodes))
-
-
-def destroy_reply_from_response(response: Any) -> DestroyReply:
-    return DestroyReply(response.success, response.error_code, response.message, response.final_status)
-
-
-def query_reply_from_response(response: Any, task_id: str) -> QueryReply:
-    """QueryTask.Response -> QueryReply with the fields QueryTask carries (spec details are not included)."""
+def reply_from_response(request: Request, response: Any) -> Reply:
+    """A leader/task/* service response -> the Reply to the request it answers (protocol 2 only)."""
+    common = dict(origin_node=request.origin_node, origin_incarnation=request.origin_incarnation,
+                  request_id=request.request_id, leader=request.target_leader, term=request.term,
+                  error_code="" if response.success else response.error_code or c.TIMEOUT, message=response.message)
+    if request.op == p.CREATE:
+        nodes = tuple(response.dispatched_nodes)
+        return Reply(task_id=response.task_id, duplicate=response.duplicate, primary=response.assigned_node,
+                     helpers=tuple(n for n in nodes if n != response.assigned_node),
+                     status=c.RUNNING if response.success else "", **common)
+    if request.op == p.DESTROY:
+        return Reply(task_id=request.task_id, status=response.final_status, **common)
     if not response.success:
-        return QueryReply(False, response.error_code, response.message)
-    nodes = list(response.target_nodes)
+        return Reply(**common)
+    nodes = list(response.target_nodes)       # QueryTask carries only part of the record
     spec = TaskSpec(task_type=response.task_type, mode=response.mode or "local",
                     origin=response.origin or "manual", parent_task_id=response.parent_task_id)
-    record = TaskRecord(task_id=task_id, idempotency_key="", spec=spec, name=response.name, status=response.status,
-                        epoch=response.epoch, primary=response.node,
+    record = TaskRecord(task_id=request.task_id, idempotency_key="", spec=spec, name=response.name,
+                        status=response.status, epoch=response.epoch, primary=response.node,
                         helpers=tuple(n for n in nodes if n != response.node),
                         error_message=response.error_message, last_event=response.last_event)
-    return QueryReply(True, message=response.message, record=record)
+    return Reply(task_id=request.task_id, status=record.status, primary=record.primary, helpers=record.helpers,
+                 record=record, **common)
 
 
 def fill_create_response(response: Any, reply: CreateReply) -> Any:
@@ -158,16 +162,32 @@ def fill_task_status(msg: Any, event: StatusEvent, term: int, stamp: Any) -> Any
                 node=event.node, epoch=event.epoch, term=term, seq=event.seq, message=event.message, stamp=stamp)
 
 
-def report_from_msg(msg: Any) -> TaskReportView:
-    return TaskReportView(msg.node_name, msg.task_id, msg.epoch, msg.state, msg.error_code, msg.message,
-                          msg.incarnation, msg.seq, msg.assign_term)
+_REPORT_KINDS = {c.REPORT_RUNNING: p.RUNNING, c.REPORT_FAILED: p.FAILED, c.REPORT_STOPPED: p.STOPPED,
+                 c.REPORT_FINISHED: p.FINISHED}
 
 
-def fill_start_request(request: Any, start: StartRequest) -> Any:
-    return _set(request, term=start.term, task_id=start.task_id, epoch=start.generation.epoch,
-                assign_term=start.generation.assign_term, role=start.role,
-                primary_node=start.primary_node, helper_nodes=list(start.helper_nodes),
-                idempotency_key=start.idempotency_key, name=start.name, spec_json=start.spec.to_json())
+def event_from_report(msg: Any) -> ExecEvent | None:
+    """TaskReport (protocol 2) -> ExecEvent; None for an unknown state."""
+    kind = _REPORT_KINDS.get(msg.state)
+    if kind is None:
+        return None
+    return ExecEvent(msg.node_name, msg.incarnation, msg.seq, 0, 0, msg.task_id,
+                     Generation(msg.epoch, msg.assign_term), kind, msg.error_code, msg.message)
+
+
+def fill_start_request(request: Any, command: ExecCommand, target: str) -> Any:
+    """One target's StartTask for a START command (protocol 2)."""
+    return _set(request, term=command.term, task_id=command.task_id, epoch=command.generation.epoch,
+                assign_term=command.generation.assign_term,
+                role=c.ROLE_PRIMARY if target == command.primary else c.ROLE_HELPER,
+                primary_node=command.primary, helper_nodes=list(command.helpers),
+                idempotency_key=command.idempotency_key, name=command.name, spec_json=command.spec.to_json())
+
+
+def fill_stop_request(request: Any, command: ExecCommand) -> Any:
+    """StopTask for a STOP command (protocol 2): the kind travels in the reason text."""
+    return _set(request, term=command.term, task_id=command.task_id, epoch=command.generation.epoch,
+                assign_term=command.generation.assign_term, reason="%s: %s" % (command.stop_kind, command.reason))
 
 
 def result_to_dict(msg: Any) -> dict:

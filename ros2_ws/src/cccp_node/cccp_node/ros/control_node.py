@@ -7,8 +7,9 @@ election claim, link measurements and the tasks this node's executor runs.
 
 Threads: rclpy MultiThreadedExecutor callbacks, the leader controller loop and
 the UE HTTP server. Cross-thread hand-offs go through a queue drained by a ROS
-timer, so ROS entities are only created from executor threads; blocking
-service calls (dispatcher, forwarder) run outside the callback groups they wait on.
+timer, so ROS entities are only created from executor threads. Commands and
+forwarded requests never block the controller: their answers arrive on ROS
+threads (dispatcher.py, forwarder.py).
 """
 from __future__ import annotations
 
@@ -43,8 +44,8 @@ from ..core.task_table import StatusEvent
 from ..monitor.probes import SystemProbe
 from ..ue_api import UeApi
 from . import convert, qos
-from .dispatcher import RosDispatcher
-from .forwarder import RosForwarder
+from .dispatcher import RosCommandSink
+from .forwarder import RosRequestTransport
 
 
 class ControlNode(Node):
@@ -75,14 +76,19 @@ class ControlNode(Node):
         self.store = TaskStore()
         self.controller = LeaderController(
             self.node_name, self.store, self.election, self.cluster,
-            RosDispatcher(self, self._client_group, p["dispatch_timeout"]),
+            RosCommandSink(self, self._client_group, lambda event: self.controller.on_event(event)),
             ControllerConfig(scheduler=SchedulerConfig(protocol_version=protocol), reconcile=ReconcileConfig(),
-                             warmup_s=p["offline_timeout"]),
+                             warmup_s=p["offline_timeout"], create_wait_timeout_s=p["create_wait"],
+                             destroy_wait_timeout_s=p["create_wait"]),
+            reply=lambda reply: self.gateway.on_reply(reply),   # protocol 2: replies only go to this node
         )
-        gateway_config = GatewayConfig(task_types=tuple(p["task_types"]), create_wait_timeout_s=p["create_wait"])
         self.gateway = Gateway(
-            self.node_name, self.store, lambda: self.controller.active, lambda: self.election.state.leader,
-            RosForwarder(self, self._client_group, p["dispatch_timeout"], p["create_wait"] + 5.0), gateway_config,
+            self.node_name, lambda: self.controller.active, lambda: self.election.state.leader,
+            self.controller.on_request,
+            RosRequestTransport(self, self._client_group, lambda reply: self.gateway.on_reply(reply),
+                                p["dispatch_timeout"]),
+            GatewayConfig(task_types=tuple(p["task_types"]), request_timeout_s=p["create_wait"] + 5.0),
+            term=lambda: self.election.state.term, incarnation=self._incarnation,
         )
         self.ue = UeBackend(self.node_name, self.gateway, self.cluster,
                             watch=lambda node, images: self._outbox.put(("watch", (node, images))),
@@ -96,7 +102,7 @@ class ControlNode(Node):
         self.create_subscription(ExecutorStatus, names.EXEC_STATUS_TOPIC, self._on_executor_status,
                                  qos.EXECUTOR_STATUS, callback_group=self._state_group)
         self.create_subscription(TaskReport, names.TASK_REPORT_TOPIC,
-                                 lambda msg: self.controller.report(convert.report_from_msg(msg)), qos.TASK_REPORT)
+                                 self._on_task_report, qos.TASK_REPORT)
         self.create_subscription(TaskStatus, names.TASK_STATUS_TOPIC, self._on_task_status, qos.TASK_STATUS)
         for name, srv, handler in (
             (names.API_CREATE_SERVICE, CreateTask, self._on_create),
@@ -242,14 +248,19 @@ class ControlNode(Node):
         return convert.fill_query_response(response, self.gateway.query(request.task_id))
 
     def _on_leader_create(self, request, response):
-        reply = self.gateway.create_local(convert.spec_from_request(request), request.idempotency_key)
+        reply = self.gateway.serve_create(convert.spec_from_request(request), request.idempotency_key)
         return convert.fill_create_response(response, reply)
 
     def _on_leader_destroy(self, request, response):
-        return convert.fill_destroy_response(response, self.gateway.destroy_local(request.task_id, request.reason))
+        return convert.fill_destroy_response(response, self.gateway.serve_destroy(request.task_id, request.reason))
 
     def _on_leader_query(self, request, response):
-        return convert.fill_query_response(response, self.gateway.query_local(request.task_id))
+        return convert.fill_query_response(response, self.gateway.serve_query(request.task_id))
+
+    def _on_task_report(self, msg):
+        event = convert.event_from_report(msg)
+        if event is not None:
+            self.controller.on_event(event)
 
     def shutdown(self):
         self._stop.set()

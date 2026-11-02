@@ -190,7 +190,7 @@ QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义�
 
 - 任务表（`core/task_table.py`）只保存在**当前集群主节点的内存里**，由 `control/task_store.py` 加锁保护。**唯一的写入口是 `apply(command)`**，记录不可变。
 - 每次以新的 term 当选时，任务表从空开始，在预热期结束后通过 `Adopt` 重建（5.3）。
-- 只有集群主节点的控制面和网关可以写入任务表。其他节点的网关一律转发（`leader/task/*`）。
+- 只有集群主节点的控制器可以写入任务表。每个节点的网关都把创建、销毁、查询做成一条请求（`Request`），写明由哪个集群主节点处理（`target_leader`），然后等对应的回复（`Reply`）：自己是预热完毕的集群主节点就交给本机控制器，否则交给它跟随的集群主节点。收到请求的节点不是 `target_leader` 就忽略；是 `target_leader` 但已经不是集群主节点，立即回复 `NOT_LEADER`，**不再转发**。请求在等结果期间只占集群主节点上的一条等待记录，不占线程。
 - `Assign`、`Requeue`、`MarkFailed` 都带期望的执行代次 `expected`：只有任务仍处于该代次时才生效，否则返回 `STALE_EPOCH`。这样基于同一份视图做出的两次决策，最多只有一次能成功。`Assign`、`Requeue` 把代次改为 `(epoch + 1, 当前任期)`。
 - `Adopt` 只接收比任务表中更新（执行代次更大）的版本，并保持上报的 `assign_term` 不变；如果幂等键已经被另一个任务占用，就拒绝接收。
 
@@ -198,8 +198,10 @@ QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义�
 
 - **执行者通过 `NodeStatus.tasks`（`TaskState`）上报自己正在运行的每个任务**，包括 task_id、执行代次（`epoch`、`assign_term`）、角色、任务主节点、辅助节点、幂等键、名称和完整的任务规格（`spec_json`）。这是“实际在跑什么”的唯一来源。
 - **新集群主节点重建任务表**：等待 `warmup_s`（等于 `node_offline_timeout_s`）收齐所有存活节点的 NodeStatus，然后在第一次对账时接收所有正在运行的任务。预热期间网关返回 `NO_LEADER`，调用方稍后重试。
-- **任务何时算被接受**：网关只有在任务已经在执行者上跑起来之后，才返回成功。如果在 `create_wait_timeout_s` 内没有跑起来（还在排队、下发失败，或者中途换主），就返回失败（`TIMEOUT` / `NO_LEADER`），并附上 task_id。调用方用同一个幂等键重试；如果任务其实已经跑起来了，重试会直接返回原来的任务（`duplicate=true`）。
-- **先写任务表，后下发**：集群主节点必须先把调度结果写入任务表，再调用 `StartTask`。这样在当前任期内，任务表总是领先于实际执行情况，对账才有依据。
+- **任务何时算被接受**：网关只有在任务已经在执行者上跑起来之后，才返回成功。如果在 `create_wait_timeout_s` 内没有跑起来（还在排队、下发被暂时拒绝后重试中，或者中途换主），就返回失败（`TIMEOUT` / `NO_LEADER` / `NOT_LEADER`），能带 task_id 时带上。网关在 `request_timeout_s` 内等不到回复（集群主节点挂了、回复丢了）也返回 `TIMEOUT`。调用方用同一个幂等键重试；如果任务其实已经跑起来了，重试会直接返回原来的任务（`duplicate=true`）。
+- **新任务在下一个控制周期（约 0.1 秒）就调度**，不等每秒一次的对账；对账仍然兜底。
+- **先写任务表，后下发**：集群主节点必须先把调度结果写入任务表，再发出启动命令。一条启动命令同时发给任务主节点和所有辅助节点。下发不等待执行器：结果由执行器的事件（`RUNNING`、`REJECTED` 等）异步送回，事件丢了由心跳和对账兜底。这样在当前任期内，任务表总是领先于实际执行情况，对账才有依据。
+- **销毁以执行者确认为准**：Cancel 之后立即向当前代次的所有参与者发送停止命令（原因 `cancel`）。当前代次的**在线**参与者都确认停止（停止事件，或者心跳里已经没有这个任务）才回复成功；超过 `destroy_wait_timeout_s` 仍未全部确认，回复 `TIMEOUT`，调用方重试销毁（任务已是 Cancelled，重试会再发一次停止并等待确认）。离线的参与者不等，回来后由对账停掉。销毁已经 Finished/Failed 的任务返回 `INVALID_STATE`，不存在的返回 `NOT_FOUND`。
 
 ### 5.4 执行节点检查 `term` 和执行代次
 
@@ -279,12 +281,14 @@ Pending ──assign(代次+1)───► Scheduled ──report Running──�
 | `node_status_period_s` | 1.0 | NodeStatus 发布周期，也就是集群主节点的续约周期 |
 | `node_offline_timeout_s` | 5.0 | 连续这么久收不到 NodeStatus，就判定节点离线；也用作选主的启动等待时间和集群主节点的预热时间 |
 | `leader_timeout_s` | 1.0 | 集群主节点被判定离线后，再过这么久，由下一个节点宣布接任 |
-| `dispatch_timeout_s` | 5.0 | 单次 `StartTask` 调用的超时，也是转发请求时等待服务出现的超时 |
+| `dispatch_timeout_s` | 5.0 | 协议 2 过渡期：网关向集群主节点发请求前等待其服务出现的时间（协议 3 删除） |
 | `dispatch_retry_s` | 5.0 | 未启动的任务多久重发一次 `StartTask` |
 | `start_timeout_s` | 15.0 | Scheduled 这么久仍未在任务主节点上启动，就重新调度 |
 | `missing_grace_s` | 3.0 | Running 的任务从任务主节点的上报中消失多久后重新调度 |
 | `stop_retry_s` | 5.0 | 多余的副本多久重发一次 `StopTask` |
-| `create_wait_timeout_s` | 10.0 | `CreateTask` 等待任务跑起来的最长时间；转发请求的超时比它多 5 秒 |
+| `create_wait_timeout_s` | 10.0 | 集群主节点为创建请求等待任务跑起来的最长时间 |
+| `destroy_wait_timeout_s` | 10.0 | 集群主节点为销毁请求等待参与者确认停止的最长时间 |
+| `request_timeout_s` | 15.0 | 网关等待回复的最长时间（等待时间 10 秒加 5 秒余量） |
 | `pending_timeout_s` | 8.0 | Pending 持续这么久仍无可用节点，就判定 Failed；必须小于 `create_wait_timeout_s` |
 | `avoid_failed_node_s` | 60.0 | 某节点启动任务失败（或运行中没有输入）后，在这段时间内调度该任务时避开它 |
 | `max_input_stalls` | 3 | 累计这么多个任务主节点报告没有输入后，判定任务 Failed（`NOT_READY`） |
@@ -325,7 +329,7 @@ Pending ──assign(代次+1)───► Scheduled ──report Running──�
 
 - 选主、调度、任务表、对账、链路估计这几部分必须写成**不 import rclpy 的纯 Python 模块**（`core/`），ROS 节点只做一层薄的适配。`test_core_is_ros_free.py` 会检查这一点。
 - 这样做有两个好处：单元测试不需要 ROS 环境；以后转 C++ 时可以逐个模块对照翻译。
-- `control/` 层（控制器、网关、UE 后端）也不依赖 ROS：下发、转发等对外调用都通过接口（`Dispatcher`、`Forwarder`）注入，时钟也是注入的。
+- `control/` 层（控制器、网关、UE 后端）也不依赖 ROS：下发命令、发送请求都通过接口（`CommandSink`、`RequestTransport`）注入，时钟也是注入的；节点之间交换的消息在 `control/protocol.py` 里有不依赖 ROS 的对应类型。
 
 ### 6.3 Python
 
@@ -371,7 +375,7 @@ cccp_cluster/
 
 | 错误码 | 调用方能否重试 | 说明 |
 |---|---|---|
-| `NO_LEADER`、`BUSY`、`NOT_READY` | 可以，退避后重试 | 临时状态，例如正在选主，或者新集群主节点还在预热 |
+| `NO_LEADER`、`NOT_LEADER`、`BUSY`、`NOT_READY` | 可以，退避后重试 | 临时状态，例如正在选主、新集群主节点还在预热，或者请求发给的集群主节点刚让位 |
 | `TIMEOUT` | 可以，但**必须使用同一个幂等键** | 超时不代表对方没有执行；CreateTask 超时时，响应里会带上 task_id |
 | `DISPATCH_FAILED` | 由集群主节点决定 | 已经回滚 |
 | `STALE_TERM`、`STALE_EPOCH` | 不可以 | 发出命令的一方已经过期，应当停止 |
@@ -380,7 +384,7 @@ cccp_cluster/
 | `INFERENCE_ERROR`、`FUSION_ERROR` | 不由调用方重试 | 由执行器累计失败次数，超过上限后报告 Failed |
 | `CANCELLED` | 不可以 | 任务已被销毁 |
 
-UE HTTP 接口的状态码必须与上表一致（`ue_api.py`）：可以重试的错误（`NO_LEADER`、`BUSY`、`NOT_READY`、`TIMEOUT`）一律返回 **503**；创建请求本身有问题（没有生成 task_id）返回 400；任务已生成但失败返回 502；任务不存在返回 404；销毁已结束的任务返回 409。不得把可以重试的错误映射成 4xx，否则 UE 会放弃重试。
+UE HTTP 接口的状态码必须与上表一致（`ue_api.py`）：可以重试的错误（`NO_LEADER`、`NOT_LEADER`、`BUSY`、`NOT_READY`、`TIMEOUT`）一律返回 **503**；创建请求本身有问题（没有生成 task_id）返回 400；任务已生成但失败返回 502；任务不存在返回 404；销毁已结束的任务返回 409。不得把可以重试的错误映射成 4xx，否则 UE 会放弃重试。
 
 ### 7.3 日志
 
