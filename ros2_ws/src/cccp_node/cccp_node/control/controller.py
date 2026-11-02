@@ -67,7 +67,9 @@ class LeadershipSource(Protocol):
 class Dispatcher(Protocol):
     def start(self, node: str, request: StartRequest) -> DispatchResult: ...
 
-    def stop(self, node: str, term: int, task_id: str, generation: Generation, reason: str) -> DispatchResult: ...
+    def stop(self, node: str, term: int, task_id: str, generation: Generation, kind: str,
+             reason: str) -> DispatchResult:
+        """kind: constants.STOP_*; reason: for logs."""
 
 
 @dataclass(frozen=True)
@@ -226,17 +228,28 @@ class LeaderController:
     def _reconcile(self, now: float) -> None:
         records = self._store.records()
         online = self._cluster.online(now)
+        listed = {name: self._cluster.task_list(name) for name in (*online, *self._cluster.retained(now))}
+        task_lists = {name: task_list for name, task_list in listed.items() if task_list is not None}
         self._memory.observe(records, now)
         self._memory.prune(records)
-        for action in reconcile(records, online, self._memory, now, self._config.reconcile):
+        protecting = self._memory.protecting
+        actions = reconcile(records, online, task_lists, self._memory, now, self._config.reconcile)
+        if self._memory.protecting != protecting:
+            if self._memory.protecting:
+                log.warning("mass offline: %d nodes dropped out at once; not moving their tasks for now",
+                            len(self._memory.protected[0]))
+            else:
+                log.warning("mass offline protection ended (%s)", "held too long" if
+                            self._memory.protection_spent else "nodes are back")
+        for action in actions:
             record = records.get(getattr(action, "task_id", ""))
             if isinstance(action, AdoptTask):
                 result = self._submit(Adopt(action.task_id, action.idempotency_key, action.name, action.spec,
                                             action.generation, action.primary, action.helpers, action.reported_by,
-                                            now_ms=self._wall_ms()))
+                                            action.cancelled, self._wall_ms()))
                 if result.ok:
-                    log.info("task=%s gen=%s adopted from %s (primary %s)", action.task_id, action.generation,
-                             action.reported_by, action.primary)
+                    log.info("task=%s gen=%s adopted from %s (primary %s)%s", action.task_id, action.generation,
+                             action.reported_by, action.primary, " as cancelled" if action.cancelled else "")
             elif isinstance(action, ScheduleTask):
                 self._place(record, online, now)
             elif isinstance(action, Reschedule):
@@ -307,7 +320,7 @@ class LeaderController:
     def _stop(self, action: StopOrphan, now: float) -> None:
         self._memory.note_stop(action.node, action.task_id, action.generation, now)
         result = self._dispatcher.stop(action.node, self._ready_term, action.task_id, action.generation,
-                                       action.reason)
+                                       action.kind, action.reason)
         if not result.success:
             log.warning("task=%s gen=%s node=%s stop failed: %s", action.task_id, action.generation,
                         action.node, result.message)

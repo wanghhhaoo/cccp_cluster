@@ -122,6 +122,8 @@ def hard_reason(spec: TaskSpec, node: NodeView, config: SchedulerConfig) -> str 
     """Checks that apply even to explicitly requested nodes."""
     if node.protocol_version != config.protocol_version:
         return "protocol_mismatch"
+    if not node.executor_alive:
+        return "executor_stalled"
     if not node.inference_ready:
         return "not_ready"
     if spec.task_type not in node.algorithms_ready:

@@ -1,12 +1,12 @@
 from cccp_node.core import constants as c
-from cccp_node.core.cluster_view import NodeView, TaskStateView
+from cccp_node.core.cluster_view import NodeView, TaskListView, TaskStateView
 from cccp_node.core.generation import Generation
 from cccp_node.core.reconciler import (
     AdoptTask, ConfirmRunning, Dispatch, FailTask, LeaderMemory, ReconcileConfig, Reschedule, ScheduleTask,
     StopOrphan, reconcile,
 )
 from cccp_node.core.task_spec import TaskSpec
-from cccp_node.core.task_table import Adopt, Assign, Cancel, ReportStatus, Submit, TaskTable
+from cccp_node.core.task_table import Adopt, Assign, Cancel, MarkFailed, ReportStatus, Submit, TaskTable
 
 CONFIG = ReconcileConfig()
 SPEC = TaskSpec(task_type="PKCI")
@@ -30,7 +30,11 @@ class World:
         self.table = TaskTable()
         self.memory = LeaderMemory()
         self.running = {}          # node -> list of TaskStateView
+        self.tombstones = {}       # node -> task ids
         self.online = set()
+        self.retained = set()      # offline nodes whose last TaskList is still kept
+        self.lagging = set()       # nodes whose TaskList has not caught up with their heartbeat
+        self.stalled = set()       # nodes whose executor went quiet
 
     def submit(self, key="k", **kw):
         kw.setdefault("task_type", "PKCI")
@@ -43,12 +47,17 @@ class World:
         self.running.setdefault(node, []).append(state(task_id, epoch, role, **kw))
 
     def nodes(self):
-        return {n: NodeView(n, running_tasks=tuple(self.running.get(n, ()))) for n in self.online}
+        return {n: NodeView(n, running_tasks=tuple(self.running.get(n, ())), executor_alive=n not in self.stalled)
+                for n in self.online}
 
-    def step(self, now):
+    def task_lists(self):
+        return {n: TaskListView(n, 1, 1, tuple(self.running.get(n, ())), tuple(self.tombstones.get(n, ())))
+                for n in (self.online | self.retained) - self.lagging}
+
+    def step(self, now, config=CONFIG):
         records = {r.task_id: r for r in self.table.tasks()}
         self.memory.observe(records, now)
-        return reconcile(records, self.nodes(), self.memory, now, CONFIG)
+        return reconcile(records, self.nodes(), self.task_lists(), self.memory, now, config)
 
 
 # ------------------------------------------------------------ table-driven
@@ -219,3 +228,149 @@ def test_memory_timers_restart_when_state_changes_and_prune():
     w.table.apply(Assign(task_id, g(1), T, "n1"))
     w.memory.prune({r.task_id: r for r in w.table.tasks()})
     assert w.memory.dispatched == {}
+
+
+# ------------------------------------------------------------- 0.3 rules
+
+def adopt_all(w, actions):
+    for a in actions:
+        if isinstance(a, AdoptTask):
+            w.table.apply(Adopt(a.task_id, a.idempotency_key, a.name, a.spec, a.generation, a.primary, a.helpers,
+                                a.reported_by, a.cancelled))
+
+
+def stops(actions):
+    return sorted((a.node, a.task_id, a.kind) for a in actions if isinstance(a, StopOrphan))
+
+
+def test_pending_tasks_are_scheduled_by_priority():
+    w = World()
+    low, high, mid = w.submit("a"), w.submit("b", priority=200), w.submit("c", priority=100)
+    assert [a.task_id for a in w.step(0.0)] == [high, mid, low]
+
+
+def test_tasks_of_an_offline_node_are_adopted_from_its_retained_task_list_then_moved():
+    """Row 1: the old leader ran the task itself and is gone; other nodes kept its TaskList."""
+    w = World()
+    w.online, w.retained = {"n2"}, {"n1"}
+    w.runs("n1", "t-x", 2, primary="n1", key="kx", term=4)
+    [adopt] = w.step(0.0)
+    assert (adopt.task_id, adopt.generation, adopt.reported_by, adopt.cancelled) == ("t-x", (2, 4), "n1", False)
+    adopt_all(w, [adopt])
+    assert w.step(1.0) == [Reschedule("t-x", (2, 4), "primary n1 offline")]
+
+
+def test_tombstone_anywhere_adopts_the_task_as_cancelled_and_stops_its_copies():
+    """Destroyed just before the leader died: n1 stopped and buried it, n2 still runs it."""
+    w = World()
+    w.online = {"n1", "n2"}
+    w.runs("n2", "t-x", 1, role=c.ROLE_HELPER, primary="n1", helpers=("n2",), key="kx")
+    w.tombstones["n1"] = ["t-x"]
+    [adopt] = w.step(0.0)
+    assert adopt.cancelled
+    adopt_all(w, [adopt])
+    assert w.table.get("t-x").status == c.CANCELLED
+    assert stops(w.step(1.0)) == [("n2", "t-x", c.STOP_CANCEL)]
+
+
+def test_unknown_task_waits_for_its_nodes_task_list():
+    w = World()
+    w.online, w.lagging = {"n1"}, {"n1"}
+    w.runs("n1", "t-x", 1, key="kx")
+    assert w.step(0.0) == []                                      # neither adopted nor stopped
+    w.lagging.clear()
+    assert [type(a) for a in w.step(1.0)] == [AdoptTask]
+
+
+def test_stop_kinds():
+    w = World()
+    w.online = {"n1", "n2", "n3"}
+    cancelled, failed, moved, known = w.submit("a"), w.submit("b"), w.submit("c"), w.submit("d")
+    for task_id in (cancelled, failed, moved, known):
+        w.table.apply(Assign(task_id, g(0), T, "n1"))
+    w.table.apply(Cancel(cancelled))
+    w.table.apply(MarkFailed(failed, g(1), c.DISPATCH_FAILED))
+    w.table.apply(Assign(moved, g(1), T, "n2"))
+    for task_id in (cancelled, failed, moved, known):
+        w.runs("n1", task_id, 1)
+    w.runs("n3", known, 1)                                        # n3 has no part in it
+    w.runs("n3", "t-dup", 1, key="d")                             # same key as `known`
+    assert stops(w.step(0.0)) == [
+        ("n1", cancelled, c.STOP_CANCEL), ("n1", failed, c.STOP_STALE), ("n1", moved, c.STOP_STALE),
+        ("n3", known, c.STOP_UNASSIGNED), ("n3", "t-dup", c.STOP_DUPLICATE)]
+
+
+def test_stalled_executor_moves_its_tasks_only_after_the_grace_period():
+    """Row 5. Its heartbeat keeps the last known tasks, so row 8 (task lost) does not fire."""
+    w = World()
+    w.online = {"n1", "n2"}
+    task_id = w.submit()
+    w.table.apply(Assign(task_id, g(0), T, "n1"))
+    w.table.apply(ReportStatus("n1", task_id, g(1), c.REPORT_RUNNING))
+    w.runs("n1", task_id, 1)
+    w.stalled = {"n1"}
+    assert w.step(0.0) == [] and w.step(9.9) == []
+    assert w.step(10.0) == [Reschedule(task_id, g(1), "executor on n1 silent for 10 s")]
+    w.stalled.clear()                                            # recovered in time elsewhere: timer resets
+    w.step(11.0)
+    w.stalled = {"n1"}
+    assert w.step(12.0) == []
+
+
+def mass_offline_world(nodes=6, config=CONFIG):
+    w = World()
+    w.online = {"n%d" % i for i in range(1, nodes + 1)}
+    ids = []
+    for i in range(1, nodes + 1):
+        task_id = w.submit("k%d" % i)
+        w.table.apply(Assign(task_id, g(0), T, "n%d" % i))
+        w.table.apply(ReportStatus("n%d" % i, task_id, g(1), c.REPORT_RUNNING))
+        w.runs("n%d" % i, task_id, 1)
+        ids.append(task_id)
+    w.step(0.0, config)
+    return w, ids
+
+
+def reschedules(actions):
+    return sorted(a.task_id for a in actions if isinstance(a, Reschedule))
+
+
+def test_a_few_nodes_going_offline_are_handled_as_usual():
+    w, ids = mass_offline_world()
+    w.online -= {"n5", "n6"}                                      # 2 of 6: not more than a third
+    assert reschedules(w.step(5.0)) == ids[4:] and not w.memory.protecting
+
+
+def test_mass_offline_pauses_moving_tasks_until_the_nodes_return():
+    w, ids = mass_offline_world()
+    w.online -= {"n4", "n5", "n6"}                                # 3 of 6 within the window
+    assert reschedules(w.step(5.0)) == [] and w.memory.protecting
+    assert reschedules(w.step(20.0)) == [] and w.memory.protecting   # still out of the window: held
+    w.online |= {"n4", "n5"}                                      # only n6 still missing
+    assert reschedules(w.step(21.0)) == [ids[5]] and not w.memory.protecting
+
+
+def test_mass_offline_protection_gives_up_after_the_hold_time():
+    w, ids = mass_offline_world()
+    w.online -= {"n4", "n5", "n6"}
+    assert reschedules(w.step(5.0)) == []
+    assert reschedules(w.step(34.9)) == []
+    assert reschedules(w.step(35.0)) == ids[3:] and not w.memory.protecting
+    assert not w.memory.protecting and w.memory.protection_spent
+
+
+def test_mass_offline_counts_drops_spread_over_the_window():
+    w, ids = mass_offline_world()
+    w.online -= {"n6"}
+    assert reschedules(w.step(3.0)) == [ids[5]]                   # the first loss looks ordinary
+    w.online -= {"n4", "n5"}
+    assert reschedules(w.step(8.0)) == [] and w.memory.protecting
+
+
+def test_protection_held_too_long_does_not_restart_while_the_drops_are_recent():
+    config = ReconcileConfig(mass_offline_window_s=10.0, mass_offline_hold_s=4.0)
+    w, ids = mass_offline_world(config=config)
+    w.online -= {"n4", "n5", "n6"}
+    assert reschedules(w.step(5.0, config)) == []
+    assert reschedules(w.step(9.0, config)) == ids[3:]            # gave up after 4 s
+    assert reschedules(w.step(10.0, config)) == ids[3:]           # the drops are still recent: stays off

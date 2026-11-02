@@ -255,14 +255,18 @@ Pending ──assign(代次+1)───► Scheduled ──report Running──�
 
 | 观察到的情况 | 动作 |
 |---|---|
-| 某节点运行着任务表**不知道**的任务，或者执行代次**比任务表新** | **接收**（`Adopt`）。同一任务有多份副本时，取代次最大的；代次相同时，优先取任务主节点上的那份；再相同就取节点名最小的。其余副本在下一轮被停掉 |
-| 同上，但这个任务的幂等键已经属于任务表里的另一个任务 | 判定为重复，向该节点发送 `StopTask`（原因：`duplicate of task <id>`） |
-| Pending | 调度；超过 `pending_timeout_s` 仍无可用节点，判定 Failed |
-| 任务主节点离线（超过 `node_offline_timeout_s` 没有收到它的 `NodeStatus`） | 重新调度：代次变为 `(epoch + 1, 当前任期)` |
+| 某节点运行着任务表**不知道**的任务，或者执行代次**比任务表新**。“某节点”包括在线节点，以及 `offline_retain_s` 内离线节点最后一份 `TaskList` | **接收**（`Adopt`），完整规格取自该节点的 `TaskList`；`TaskList` 还没追上心跳的节点这一轮跳过（任务表不知道的副本也先不停）。同一任务有多份副本时，取代次最大的；代次相同时，优先取任务主节点上的那份；再相同就取节点名最小的。任何节点的 `TaskList` 里有这个任务的墓碑，就接收为 Cancelled。其余副本在下一轮被停掉 |
+| 同上，但这个任务的幂等键已经属于任务表里的另一个任务 | 判定为重复，向该节点发送 `StopTask`（原因 `duplicate`） |
+| Pending | 按优先级从高到低调度；超过 `pending_timeout_s` 仍无可用节点，判定 Failed |
+| 任务主节点离线（超过 `node_offline_timeout_s` 没有收到它的 `NodeStatus`） | 重新调度：代次变为 `(epoch + 1, 当前任期)`。**大面积离线保护生效时暂停**（见下文） |
+| 任务主节点在线，但 `executor_alive=false` 已超过 `executor_stall_grace_s`（10 秒） | 重新调度。执行器卡住期间心跳保留最后已知的任务列表，所以下面“丢失任务”那一行不会因此触发 |
 | 节点在线，上报的任务里有它且执行代次一致 | 正常；如果任务表里还是 Scheduled，说明 `Running` 报告丢了，由集群主节点代为提交 `ReportStatus(Running)` |
 | 节点（主或辅）在线但没有这个任务，任务状态是 Scheduled | 每隔 `dispatch_retry_s` 用同一个代次重发 `StartTask`（幂等）；超过 `start_timeout_s` 仍未启动，重新调度 |
 | 任务主节点在线但没有这个任务，任务状态是 Running | 先等待 `missing_grace_s`（`NodeStatus` 可能比 `TaskReport` 晚到）；仍然没有就重新调度 |
-| 某节点运行的任务已经结束、执行代次比任务表旧，或者并没有分配给它 | 每隔 `stop_retry_s` 向该节点发送 `StopTask` |
+| 某节点运行的任务在任务表中是 Cancelled | 每隔 `stop_retry_s` 发送 `StopTask`（原因 `cancel`，执行器留墓碑） |
+| 某节点运行的任务已经是其他终态、执行代次比任务表旧，或者并没有分配给它 | 每隔 `stop_retry_s` 发送 `StopTask`（原因 `stale` 或 `unassigned`） |
+
+**大面积离线保护**：集群主节点自己的链路变差时，“看不到很多节点”和“很多节点挂了”在它看来是一样的，照常迁移会把任务塞进少数还看得见的节点，而原副本还在正常运行。所以在 `mass_offline_window_s`（10 秒）内新判定离线的节点数超过窗口开始时在线节点数的 `mass_offline_ratio`（1/3）时，暂停“任务主节点离线 → 重新调度”这一条，其他动作照常。这些节点回来到阈值以下时退出；持续 `mass_offline_hold_s`（30 秒）仍未恢复也退出，恢复迁移。进入和退出都记 WARNING 日志。
 
 - 只有任务主节点的副本时，接收的任务就以它为准；如果任务主节点已经挂了、只剩辅助节点的副本，也会照样接收，下一轮对账发现任务主节点离线，再重新调度。这样，迁移途中的任务不会因为换主而丢失。
 - “节点在线”和各种计时一律使用集群主节点本地的单调时钟，只保存在当前集群主节点的内存里；换主后会从头开始计时，结果只是决策晚一点，不会导致非幂等的操作被重复执行。
@@ -287,6 +291,10 @@ Pending ──assign(代次+1)───► Scheduled ──report Running──�
 | `input_timeout`（执行器） | 10.0 | 任务主节点多久收不到一帧就报告 `NOT_READY`；0 表示不检查 |
 | `prune_terminal_after_s` | 3600 | 终态任务保留这么久后从任务表删除 |
 | `max_tasks_per_node` | 4 | 单节点同时运行的任务上限（与 PKCT 的 `MAX_TRACKERS` 一致）；调度器过滤和执行器准入（执行器参数同名）都用它，两边必须一致 |
+| `offline_retain_s` | 300 | 离线节点在集群视图里的条目（含 `TaskList`）保留多久，供新集群主节点接收它的任务 |
+| `executor_stall_grace_s` | 10.0 | 任务主节点的 `executor_alive=false` 持续这么久，才迁移它的任务 |
+| `mass_offline_window_s` / `mass_offline_ratio` / `mass_offline_hold_s` | 10.0 / 1/3 / 30.0 | 大面积离线保护（5.6） |
+| `leader_min_battery` | 0（不启用） | 选主候选的电量下限（5.1），取值待定 |
 | `tombstone_ttl_s`（执行器） | 600 | 墓碑保留多久；最多 16 条，超出时丢弃最旧的 |
 | `max_chain_depth` | 5 | 链式触发的最大深度 |
 | `leader_self_penalty` | 10 | 集群主节点给自己的调度评分扣分（满分 100）。另一个作用是减少“任务只跑在集群主节点上、随它一起丢失”的情况 |

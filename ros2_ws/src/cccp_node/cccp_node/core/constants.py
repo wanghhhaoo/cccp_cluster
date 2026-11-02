@@ -20,6 +20,12 @@ REPORT_FINISHED = "Finished"
 REPORT_FAILED = "Failed"
 REPORT_STOPPED = "Stopped"
 
+# Why the leader stops a copy (Command.STOP_*, protocol 3). Only a cancel leaves a tombstone.
+STOP_CANCEL = "cancel"            # the task was destroyed
+STOP_STALE = "stale"              # an older generation, or the task ended otherwise
+STOP_DUPLICATE = "duplicate"      # another task holds the same idempotency key
+STOP_UNASSIGNED = "unassigned"    # this node has no part in the current generation
+
 # CreateTask.srv
 MODE_LOCAL = "local"
 MODE_REDUNDANT = "redundant"

@@ -132,8 +132,6 @@ class ClusterView:
 
         Returns False for messages older than what is already known: an older
         incarnation (a delayed message from before a restart) or a lower seq.
-        A node back with a new incarnation loses its old TaskList: whatever it
-        ran then is gone.
         """
         with self._lock:
             self._expire(now)
@@ -145,9 +143,6 @@ class ClusterView:
                     return False
                 if not view.slow:
                     view = replace(view, slow=known.slow, **{f: getattr(known, f) for f in SLOW_FIELDS})
-            listed = self._task_lists.get(view.name)
-            if listed is not None and listed.incarnation < view.incarnation:
-                del self._task_lists[view.name], self._listed_at[view.name]
             self._views[view.name] = view
             self._seen_at[view.name] = now
             if view.node_id:
@@ -174,7 +169,8 @@ class ClusterView:
 
     def task_list(self, name: str) -> TaskListView | None:
         """The node's TaskList, if it is as new as its latest heartbeat says. None while the
-        TaskList for a newer tasks_version is still on its way: skip the node for now."""
+        TaskList for a newer tasks_version is still on its way: skip the node for now. That
+        includes a node back with a new incarnation: what it ran before is gone."""
         with self._lock:
             listed = self._task_lists.get(name)
             if listed is None:

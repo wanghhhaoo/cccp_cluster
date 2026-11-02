@@ -34,7 +34,7 @@ from ..control.controller import ControllerConfig, LeaderController
 from ..control.gateway import Gateway, GatewayConfig
 from ..control.task_store import TaskStore
 from ..control.ue_backend import UeBackend
-from ..core.cluster_view import ClusterView, LinkView, NodeView
+from ..core.cluster_view import ClusterView, LinkView, NodeView, TaskListView
 from ..core.election import Election, ElectionConfig
 from ..core.link_estimator import LinkEstimator
 from ..core.reconciler import ReconcileConfig
@@ -167,7 +167,7 @@ class ControlNode(Node):
         self.links.on_publish(self._seq, now)
         self._node_status_pub.publish(msg)
         own_links = tuple(LinkView(r.peer_name, r.rtt_ms, r.jitter_ms, r.loss_rate) for r in reports)
-        self.cluster.update(replace(view, links=own_links), now)
+        self._record(replace(view, links=own_links), now)
 
     def _on_node_status(self, msg):
         if msg.node_name == self.node_name:
@@ -177,7 +177,15 @@ class ControlNode(Node):
         echo = convert.echo_for(msg, self.node_name)
         if echo:
             self.links.on_peer_echo(msg.node_name, echo[0], echo[1], now)
-        self.cluster.update(convert.node_view_from_msg(msg), now)
+        self._record(convert.node_view_from_msg(msg), now)
+
+    def _record(self, view, now):
+        """Protocol 2 has no TaskList: every NodeStatus carries the full TaskStates, so it stands
+        in for one, versioned by its seq."""
+        view = replace(view, tasks_version=view.seq)
+        if self.cluster.update(view, now):
+            self.cluster.update_task_list(TaskListView(view.name, view.incarnation, view.seq, view.running_tasks),
+                                          now)
 
     def _on_executor_status(self, msg):
         if msg.node_name == self.node_name:

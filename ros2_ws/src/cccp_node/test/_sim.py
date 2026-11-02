@@ -6,7 +6,7 @@ target SimNode, so term and generation fencing behave as on real executors.
 """
 from cccp_node.control.controller import DispatchResult, TaskReportView
 from cccp_node.core import constants as c
-from cccp_node.core.cluster_view import ClusterView, NodeView, TaskStateView
+from cccp_node.core.cluster_view import ClusterView, NodeView, TaskListView, TaskStateView
 from cccp_node.core.election import Leadership
 from cccp_node.core.execution_guard import NOOP, REJECT, RESTART, START, STOP, ExecutionGuard
 
@@ -47,14 +47,20 @@ class SimNode:
         self.report_seq = 0
         self.reports = []
 
-    def status(self):
-        self.seq += 1
-        running = tuple(
+    def running(self):
+        return tuple(
             TaskStateView(t, g.epoch, self.starts[t].role, self.starts[t].primary_node, self.starts[t].helper_nodes,
                           self.starts[t].idempotency_key, self.starts[t].name, self.starts[t].spec.to_json(),
                           g.assign_term)
             for t, g in sorted(self.guard.running().items()))
-        return NodeView(self.name, incarnation=1, seq=self.seq, running_tasks=running, **self.view)
+
+    def status(self):
+        """Heartbeat and TaskList; tasks_version simply follows seq here."""
+        self.seq += 1
+        running = self.running()
+        return (NodeView(self.name, incarnation=1, seq=self.seq, tasks_version=self.seq, running_tasks=running,
+                         **self.view),
+                TaskListView(self.name, 1, self.seq, running, self.guard.tombstones()))
 
     def report(self, task_id, generation, state, error_code=""):
         self.report_seq += 1
@@ -86,12 +92,12 @@ class SimDispatcher:
         assert decision.action in (START, RESTART, NOOP)
         return DispatchResult(True, message=decision.action)
 
-    def stop(self, node, term, task_id, generation, reason):
+    def stop(self, node, term, task_id, generation, kind, reason):
         self.stops.append((node, task_id, generation, reason))
         sim = self.nodes.get(node)
         if sim is None or not sim.alive:
             return DispatchResult(False, c.TIMEOUT, "%s unreachable" % node)
-        decision = sim.guard.on_stop(term, task_id, generation)
+        decision = sim.guard.on_stop(term, task_id, generation, cancel=kind == c.STOP_CANCEL)
         if decision.action == STOP:
             sim.guard.stopped(task_id)
         return DispatchResult(decision.success, decision.error_code, decision.message)
@@ -108,7 +114,9 @@ class SimWorld:
         """Every live node publishes NodeStatus; pending TaskReports go to the controller."""
         for node in self.nodes.values():
             if node.alive:
-                self.cluster.update(node.status(), self.clock())
+                beat, task_list = node.status()
+                self.cluster.update(beat, self.clock())
+                self.cluster.update_task_list(task_list, self.clock())
                 if controller is not None:
                     for report in node.reports:
                         controller.report(report)

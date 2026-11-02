@@ -65,10 +65,11 @@ class RosDispatcher(ServiceCaller):
             return DispatchResult(False, c.TIMEOUT, str(exc))
         return DispatchResult(reply.success, reply.error_code, reply.message)
 
-    def stop(self, node: str, term: int, task_id: str, generation: Generation, reason: str) -> DispatchResult:
+    def stop(self, node: str, term: int, task_id: str, generation: Generation, kind: str,
+             reason: str) -> DispatchResult:
         client = self.client(StopTask, node, names.EXEC_STOP_SERVICE)
         request = StopTask.Request(term=term, task_id=task_id, epoch=generation.epoch,
-                                   assign_term=generation.assign_term, reason=reason)
+                                   assign_term=generation.assign_term, reason="%s: %s" % (kind, reason))
         try:
             reply = self.call(client, request)
         except Exception as exc:
