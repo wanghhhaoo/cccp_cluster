@@ -290,7 +290,7 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 | 2 | 控制器和网关：`Command`/`ExecEvent` 异步下发、Submit 后下一周期调度、销毁等确认、`Request`/`Reply` | **完成** |
 | 3 | 接口包按附录 C 重写（协议 3）；`convert`、`control_node`、`dispatcher`、`forwarder`、`qos`、`names`、`fake_ros` | **完成** |
 | 4 | 执行器：订阅 `Command`、发 `ExecEvent`、墓碑上报、`ExecutorStatus` 独立回调组 | **完成**（和阶段 3 一起做：删掉旧接口后两边必须同时改） |
-| 5 | 接入层、部署脚本；`docs/DESIGN.md` 换成 0.3 并合入第十五节的无输入检测 | 未开始 |
+| 5 | 接入层、部署脚本；`docs/DESIGN.md` 换成 0.3 并合入第十五节的无输入检测 | **完成**（接入层和部署随阶段 3 改完；设计文档已换成 0.3，合入了无输入检测和下面列的全部调整，附录 C 直接取自 `.msg` 文件） |
 | 6 | 端到端测试：杀执行任务的集群主节点、销毁后立即换主不复活；心跳大小测试 | 未开始 |
 
 **过渡做法**：阶段 1、2 的过渡层（旧消息上的 `assign_term`、用心跳充当 `TaskList`、`StartTask`/`StopTask`/`leader/task/*` 服务）已在阶段 3 全部删除。现在节点之间只有附录 C 的 6 个 topic。
@@ -304,7 +304,7 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 - UE 的 `GET /nodes` 不再有 `cpu_model`、`gpu_model`（心跳里没有了），新增 `node_id`、`executor_alive`。调度器改为按 `gpu_mem_total_mb > 0` 或 `gpu_usage >= 0` 判断有没有 GPU。
 - 部署：`start_node.sh` 新增 `NODE_ID`（默认从名字推导）、`REQUEST_TIMEOUT`；镜像标签改为 `p3-`。
 
-**与 DESIGN3 不同的地方**（需要回填设计文档）：
+**与 DESIGN3 评审稿不同的地方**（已回填到 `docs/DESIGN.md` 的“实现时的调整”一节和第 10.1 节第 20、21 条）：
 1. 链路量化：设计写“255 表示未知或 ≥ 1 秒”。实现里 255 只表示未知，测量值最大取 254（约 1 秒）。否则 1 秒以上的坏链路会被当成“未测量”，调度器按默认值（30 ms）给它打高分。回显延迟饱和时按未知处理，不用来算 RTT。
 2. 对账：任务表不知道、这一轮又没能接收的副本（它所在节点的 `TaskList` 还没追上心跳）不再当作“unknown task”停掉，而是等下一轮。0.2 会直接停，0.3 的“tasks_version 不一致时跳过”要求等待。如果某个节点的 `TaskList` 一直不来，这个副本会一直没人管，阶段 3 接上真实 `TaskList` 后要观察。
 3. 大面积离线保护的退出条件按“触发时掉线的那批节点回来了多少”计算，而不是按 10 秒窗口内的掉线数（后者 10 秒后自然归零，保护会提前结束）。
