@@ -38,7 +38,7 @@ float32 latency_sensitivity
 # 来源：只用于记录和防止无限链式触发，不影响执行
 string origin                     # manual | schedule | chain | event；为空按 manual 处理
 string origin_source              # 用户 ID / 定时规则 ID / 事件源
-int64 parent_task_id              # origin=chain 时为父任务 ID，否则为 0
+string parent_task_id             # origin=chain 时为父任务 ID，否则为空
 uint8 chain_depth                 # 父任务的深度 + 1；超过上限时返回 CHAIN_TOO_DEEP
 
 # 算法参数
@@ -50,7 +50,7 @@ string params_json                # 例如 PKCT 为 {"bbox":[x,y,w,h]}
 bool success
 string error_code                 # 见 ErrorCodes.msg；成功时为空
 string message
-int64 task_id                     # 0 表示任务没有写入任务表
+string task_id                    # UUID；为空表示任务没有被接受
 bool duplicate                    # true 表示命中幂等键，返回的是已存在的任务
 string assigned_node              # 任务主节点
 string[] dispatched_nodes

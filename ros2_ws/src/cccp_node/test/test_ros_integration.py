@@ -1,24 +1,23 @@
-"""Three control nodes and three executors wired through fake_ros, with real PySyncObj on localhost.
+"""Three control nodes and three executors wired through fake_ros.
 
-Exercises the ROS layer (control_node, dispatcher, convert, executor_node)
-end to end on machines without ROS: creating a task through the CreateTask
-handler, per-frame results reaching another node's UE backend, and the
-leader dying while the task runs. Skipped when the real rclpy is installed.
+Exercises the ROS layer (control_node, election, forwarder, dispatcher,
+convert, executor_node) end to end on machines without ROS: creating a task
+through another node's CreateTask handler (forwarded to the leader),
+per-frame results reaching that node's UE backend, the leader dying while the
+task runs (the new leader rebuilds its table from NodeStatus), and executors
+dying. Skipped when the real rclpy is installed.
 """
-import socket
 import sys
 import threading
 import time
 from types import SimpleNamespace as NS
 
 import pytest
-import yaml
 
 import fake_ros
 
 INSTALLED = fake_ros.install()
 pytestmark = pytest.mark.skipif(not INSTALLED, reason="real ROS present: run the colcon tests instead")
-pytest.importorskip("pysyncobj")
 sys.path.insert(0, str(fake_ros.SRC / "cccp_task_executor"))
 
 from cccp_node.core import constants as c  # noqa: E402
@@ -68,16 +67,6 @@ class FakeAlgorithms(fake_ros.Node):
         self.create_service(InitTracker, "algorithms/pkct/init", engine.init_tracker)
         self.create_service(Track, "algorithms/pkct/track", engine.track)
         self.create_service(ResetTracker, "algorithms/pkct/reset", engine.reset)
-
-
-def free_ports(n):
-    sockets = [socket.socket() for _ in range(n)]
-    for s in sockets:
-        s.bind(("127.0.0.1", 0))
-    ports = [s.getsockname()[1] for s in sockets]
-    for s in sockets:
-        s.close()
-    return ports
 
 
 def wait_for(predicate, timeout=15.0, step=0.05):
@@ -141,27 +130,26 @@ class FakeAirSim:
 
 
 @pytest.fixture(params=["ros_services", "local_calls"])
-def cluster(tmp_path, monkeypatch, request):
+def cluster(monkeypatch, request):
     """Executors reach the algorithms through ROS services or in-process calls (data_plane default).
 
-    @pytest.mark.airsim_mode("relay") selects how airsim:// inputs are fetched (default "each").
+    @pytest.mark.airsim_mode("relay") selects how airsim:// inputs are fetched (default "each");
+    @pytest.mark.input_timeout(s) how long a primary waits for frames (default: longer than any test).
     """
     marker = request.node.get_closest_marker("airsim_mode")
     airsim_mode = marker.args[0] if marker else "each"
+    marker = request.node.get_closest_marker("input_timeout")
+    input_timeout = marker.args[0] if marker else 300.0
     airsim = FakeAirSim()
     monkeypatch.setattr("cccp_node.ros.control_node.SystemProbe", FixedProbe)
-    config = tmp_path / "cluster.yaml"
-    members = [{"name": n, "ip": "127.0.0.1", "port": p} for n, p in zip(NAMES, free_ports(3))]
-    config.write_text(yaml.safe_dump({"protocol_version": 1, "members": members}))
     fake_ros.BUS.reset()
     nodes = Cluster(airsim)
     for name in NAMES:
         fake_ros.BUS.namespace = ros_namespace(name)
         fake_ros.BUS.params = dict(
-            node_name=name, cluster_config=str(config), data_dir="", status_period=0.2, offline_timeout=1.0,
-            executor_timeout=1.0, dispatch_timeout=1.0, service_wait_timeout=0.5, ue_http_port=0,
-            raft_heartbeat=0.05, raft_election_min=0.3, raft_election_max=0.6, raft_leader_fallback=1.0,
-            airsim_fetch_mode=airsim_mode, airsim_fps=20.0,
+            node_name=name, status_period=0.2, offline_timeout=1.0, executor_timeout=1.0, dispatch_timeout=1.0,
+            create_wait=3.0, service_wait_timeout=0.5, ue_http_port=0,
+            airsim_fetch_mode=airsim_mode, airsim_fps=20.0, input_timeout=input_timeout,
         )
         engine = FakeEngine()
         if request.param == "local_calls":
@@ -191,6 +179,20 @@ def active_leader(nodes):
     return leaders[0] if len(leaders) == 1 else None
 
 
+def table_of(nodes):
+    """The task table of the current ready leader."""
+    leader = active_leader(nodes)
+    return leader.control.store if leader else None
+
+
+def record_where(nodes, task_id, predicate):
+    def check():
+        store = table_of(nodes)
+        record = store.get(task_id) if store else None
+        return record if record is not None and predicate(record) else None
+    return check
+
+
 def runners(nodes, task_id):
     return [n.name for n in live(nodes) if task_id in n.executor._tasks]
 
@@ -202,50 +204,45 @@ def publish_frame(node):
 
 def test_task_lifecycle_and_leader_failover(cluster):
     leader = wait_for(lambda: active_leader(cluster))
-    creator = next(n for n in live(cluster) if n is not leader)
+    creator = next(n for n in live(cluster) if n is not leader)       # requests get forwarded to the leader
 
     request = CreateTask.Request(task_type="PKCI", idempotency_key="it-1", name="demo")
     reply = creator.control._on_create(request, CreateTask.Response())
     assert reply.success, reply.message
-    assert reply.task_id == 1 and reply.assigned_node in NAMES
-    assert runners(cluster, 1) == [reply.assigned_node]
+    task_id = reply.task_id
+    assert len(task_id) == 36 and reply.assigned_node in NAMES and reply.assigned_node != leader.name
+    assert runners(cluster, task_id) == [reply.assigned_node]
     again = creator.control._on_create(request, CreateTask.Response())
-    assert again.duplicate and again.task_id == 1
+    assert again.duplicate and again.task_id == task_id
 
     # per-frame results reach the UE backend of the node that was asked
-    creator.control.ue.query(1)
+    assert creator.control.ue.query(task_id)["status"] == c.RUNNING
     wait_for(lambda: (reply.assigned_node, False) in creator.control._watched)
     primary = cluster[reply.assigned_node]
-    wait_for(lambda: (publish_frame(primary), creator.control.ue.latest_result(1))[1])
-    result = creator.control.ue.latest_result(1)
+    wait_for(lambda: (publish_frame(primary), creator.control.ue.latest_result(task_id))[1])
+    result = creator.control.ue.latest_result(task_id)
     assert result["class_name"] == "car" and result["epoch"] == 1 and result["node"] == primary.name
-    # TaskStatus is asynchronous: the leader publishes it from a timer after applying the change
+
     def statuses():
         return [e["status"] for e in creator.control.ue.events.since(0, 0)[0] if e["kind"] == "status"]
-    wait_for(lambda: len(statuses()) >= 3)
+    wait_for(lambda: len(statuses()) >= 3)                              # TaskStatus is asynchronous
     assert statuses()[:3] == [c.PENDING, c.SCHEDULED, c.RUNNING]
 
-    # the leader dies; the task must keep exactly one runner
-    old_primary = reply.assigned_node
+    # the leader dies: a new leader rebuilds its table from the executors and the task keeps running
     kill(leader)
-    new_leader = wait_for(lambda: active_leader(cluster))
-    assert new_leader is not leader
-    record = wait_for(lambda: (lambda r: r if r and r.status == c.RUNNING and runners(cluster, 1) == [r.primary]
-                               else None)(new_leader.control.consensus.get(1)), timeout=20.0)
-    print("killed leader %s, primary was %s, now %s at epoch %d"
-          % (leader.name, old_primary, record.primary, record.epoch))
-    if old_primary == leader.name:
-        assert record.epoch == 2 and record.primary != old_primary
-    else:
-        assert record.epoch == 1 and record.primary == old_primary
-    time.sleep(1.5)                                     # several reconcile rounds later: still one runner
-    assert runners(cluster, 1) == [new_leader.control.consensus.get(1).primary]
+    new_leader = wait_for(lambda: active_leader(cluster), timeout=20.0)
+    record = wait_for(record_where(cluster, task_id, lambda r: r.status == c.RUNNING), timeout=20.0)
+    assert (record.epoch, record.primary, record.idempotency_key) == (1, reply.assigned_node, "it-1")
+    time.sleep(1.5)                                                     # still exactly one runner
+    assert runners(cluster, task_id) == [reply.assigned_node]
+    retry = new_leader.control._on_create(request, CreateTask.Response())
+    assert retry.duplicate and retry.task_id == task_id                 # the key survived the failover
 
-    # destroy through the surviving gateway stops the executor
-    destroy = creator.control if not creator.dead else new_leader.control
-    response = destroy._on_destroy(DestroyTask.Request(task_id=1, reason="done"), DestroyTask.Response())
+    gateway = creator if not creator.dead else new_leader
+    response = gateway.control._on_destroy(DestroyTask.Request(task_id=task_id, reason="done"),
+                                           DestroyTask.Response())
     assert response.success and response.final_status == c.CANCELLED
-    wait_for(lambda: runners(cluster, 1) == [])
+    wait_for(lambda: runners(cluster, task_id) == [])
 
 
 PKCT_BBOX = '{"bbox": [1, 2, 3, 4]}'
@@ -256,31 +253,32 @@ def test_unpinned_task_moves_when_its_primary_dies(cluster):
     gateway = next(n for n in live(cluster) if n is not leader)
     reply = gateway.control._on_create(CreateTask.Request(task_type="PKCT", params_json=PKCT_BBOX),
                                        CreateTask.Response())
-    assert reply.success
+    assert reply.success, reply.message
     primary = cluster[reply.assigned_node]
-    assert primary.executor._tasks[reply.task_id].tracker_id == "task-%d-1" % reply.task_id
+    assert primary.executor._tasks[reply.task_id].tracker_id == "task-%s-1" % reply.task_id
     kill(primary)
-    reader = (gateway if not gateway.dead else leader).control.consensus
-    record = wait_for(lambda: (lambda r: r if r and r.epoch == 2 and r.status == c.RUNNING else None)(
-        reader.get(reply.task_id)), timeout=20.0)
-    print("killed primary %s; task moved to %s" % (primary.name, record.primary))
+    record = wait_for(record_where(cluster, reply.task_id, lambda r: r.epoch == 2 and r.status == c.RUNNING),
+                      timeout=20.0)
     assert record.primary != primary.name and runners(cluster, reply.task_id) == [record.primary]
-    assert cluster[record.primary].executor._tasks[reply.task_id].tracker_id == "task-%d-2" % reply.task_id
+    assert cluster[record.primary].executor._tasks[reply.task_id].tracker_id == "task-%s-2" % reply.task_id
 
 
-def test_pinned_task_waits_when_its_node_dies_even_if_it_was_the_leader(cluster):
-    """request_node is a hard pin: the task is not silently moved to another node's camera."""
+def test_task_running_on_the_leader_is_lost_with_it_and_can_be_resubmitted(cluster):
+    """Accepted trade-off (CONVENTIONS 5.3): only executors remember tasks, so a task whose only
+    runner was the dying leader disappears; the caller resubmits with the same key."""
     leader = wait_for(lambda: active_leader(cluster))
     gateway = next(n for n in live(cluster) if n is not leader)
-    request = CreateTask.Request(task_type="PKCT", params_json=PKCT_BBOX, request_node=leader.name)
+    request = CreateTask.Request(task_type="PKCT", params_json=PKCT_BBOX, request_node=leader.name,
+                                 idempotency_key="pinned-1")
     reply = gateway.control._on_create(request, CreateTask.Response())
     assert reply.success and reply.assigned_node == leader.name
     kill(leader)
-    wait_for(lambda: active_leader(cluster))
-    record = wait_for(lambda: (lambda r: r if r and r.epoch == 2 else None)(
-        gateway.control.consensus.get(reply.task_id)), timeout=20.0)
-    assert record.status == c.PENDING and record.primary == "" and "offline" in record.last_event
-    assert runners(cluster, reply.task_id) == []
+    wait_for(lambda: active_leader(cluster), timeout=20.0)
+    time.sleep(1.0)
+    assert table_of(cluster).get(reply.task_id) is None and runners(cluster, reply.task_id) == []
+    retry = gateway.control._on_create(CreateTask.Request(task_type="PKCT", params_json=PKCT_BBOX,
+                                                          idempotency_key="pinned-1"), CreateTask.Response())
+    assert retry.success and not retry.duplicate and retry.task_id != reply.task_id
 
 
 # ------------------------------------------------------------- input sources
@@ -354,8 +352,8 @@ def test_moved_task_keeps_its_shared_input(cluster):
     assert primary is not leader
     wait_for(lambda: primary.name in results.nodes(reply.task_id, epoch=1))
     kill(primary)
-    record = wait_for(lambda: (lambda r: r if r and r.epoch == 2 and r.status == c.RUNNING else None)(
-        leader.control.consensus.get(reply.task_id)), timeout=20.0)
+    record = wait_for(record_where(cluster, reply.task_id, lambda r: r.epoch == 2 and r.status == c.RUNNING),
+                      timeout=20.0)
     wait_for(lambda: record.primary in results.nodes(reply.task_id, epoch=2))
     assert ("uav_7", "front") in feeds_of(cluster)[record.primary]   # same camera on the new node
 
@@ -364,11 +362,29 @@ def test_node_bound_input_waits_while_its_node_is_down(cluster):
     leader = wait_for(lambda: active_leader(cluster))
     owner = next(n for n in live(cluster) if n is not leader)
     kill(owner)
-    reply = create(leader, input="ros://%s/camera/image" % owner.name)
-    assert reply.assigned_node == "" and "pending" in reply.message
-    time.sleep(2.0)
-    record = leader.control.consensus.get(reply.task_id)
-    assert record.status == c.PENDING and runners(cluster, reply.task_id) == []
+    response = leader.control._on_create(
+        CreateTask.Request(task_type="PKCI", input="ros://%s/camera/image" % owner.name), CreateTask.Response())
+    assert not response.success and response.error_code == c.TIMEOUT and response.task_id   # retry later
+    record = leader.control.store.get(response.task_id)
+    assert record.status == c.PENDING and runners(cluster, response.task_id) == []   # fails after 8 s
+
+
+@pytest.mark.input_timeout(1.0)
+def test_task_without_input_frames_moves_then_fails(cluster):
+    leader = wait_for(lambda: active_leader(cluster))
+    reply = create(leader)
+    primary = cluster[reply.assigned_node]
+    deadline = time.monotonic() + 2.5
+    while time.monotonic() < deadline:                  # frames keep the task where it is
+        publish_frame(primary)
+        time.sleep(0.2)
+    assert table_of(cluster).get(reply.task_id).epoch == 1 and runners(cluster, reply.task_id) == [primary.name]
+    moved = wait_for(record_where(cluster, reply.task_id, lambda r: r.epoch == 3 and r.status == c.RUNNING),
+                     timeout=5.0)
+    assert moved.primary != primary.name                 # requeued (epoch 2), then placed elsewhere
+    record = wait_for(record_where(cluster, reply.task_id, lambda r: r.status == c.FAILED), timeout=10.0)
+    assert record.error_code == c.NOT_READY and "no input frames" in record.error_message
+    wait_for(lambda: runners(cluster, reply.task_id) == [])
 
 
 def test_image_conversions_keep_colour_order():
@@ -398,4 +414,4 @@ def test_fake_messages_are_strict():
     with pytest.raises(AssertionError):
         msg.cpu_usage = 1                               # float field: int rejected, like rosidl
     msg.cpu_usage = 1.0
-    assert NodeStatus.PROTOCOL_VERSION == 1
+    assert NodeStatus.PROTOCOL_VERSION == 2

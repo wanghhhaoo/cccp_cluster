@@ -16,10 +16,11 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from .core import constants as c
 from .core.task_spec import TaskSpec
 
 PREFIX = "/api/ue"
-_TASK = re.compile(r"^%s/tasks/(\d+)(/destroy|/result_image)?$" % PREFIX)
+_TASK = re.compile(r"^%s/tasks/([A-Za-z0-9_-]+)(/destroy|/result_image)?$" % PREFIX)
 
 # UE JSON field -> TaskSpec field type.
 CREATE_FIELDS = {
@@ -30,6 +31,12 @@ CREATE_FIELDS = {
     "image_topic": str,
 }
 UINT8_FIELDS = ("drone_id", "helper_count", "min_participants")
+# "Try again shortly" (no leader yet, election, leader busy or slow): 503 so UE retries instead of giving up.
+RETRYABLE = frozenset((c.NO_LEADER, c.BUSY, c.NOT_READY, c.TIMEOUT))
+
+
+def failure_status(result, default):
+    return 503 if result.get("error_code") in RETRYABLE else default
 
 
 def spec_from_body(body) -> tuple[TaskSpec, str]:
@@ -171,11 +178,11 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(200, {"success": True, "last_seq": last, "events": events})
         match = _TASK.match(url.path)
         if match and match.group(2) is None:
-            result = backend.query(int(match.group(1)))
-            result["latest_result"] = backend.latest_result(int(match.group(1)))
-            return self._send(200 if result["success"] else 404, result)
+            result = backend.query(match.group(1))
+            result["latest_result"] = backend.latest_result(match.group(1))
+            return self._send(200 if result["success"] else failure_status(result, 404), result)
         if match and match.group(2) == "/result_image":
-            jpeg = backend.latest_image_jpeg(int(match.group(1)))
+            jpeg = backend.latest_image_jpeg(match.group(1))
             if jpeg is None:
                 return self._send(404, {"success": False, "message": "no result image yet"})
             return self._send(200, content_type="image/jpeg", raw=jpeg)
@@ -185,23 +192,24 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == PREFIX + "/tasks":
             result = self.api.backend.create(self._json_body())
-            code = 200 if result["success"] else (400 if result["task_id"] == 0 else 502)
+            code = 200 if result["success"] else failure_status(result, 502 if result["task_id"] else 400)
             return self._send(code, result)
         match = _TASK.match(path)
         if match and match.group(2) == "/destroy":
             body = self._json_body()
-            return self._destroy(int(match.group(1)), str(body.get("reason") or ""))
+            return self._destroy(match.group(1), str(body.get("reason") or ""))
         self._send(404, {"success": False, "message": "unknown path"})
 
     def _delete(self):
         match = _TASK.match(urlsplit(self.path).path)
         if match and match.group(2) is None:
-            return self._destroy(int(match.group(1)), "")
+            return self._destroy(match.group(1), "")
         self._send(404, {"success": False, "message": "unknown path"})
 
     def _destroy(self, task_id, reason):
         result = self.api.backend.destroy(task_id, reason)
-        code = 200 if result["success"] else (404 if result.get("error_code") == "NOT_FOUND" else 409)
+        code = 200 if result["success"] else failure_status(result, 404 if result.get("error_code") == c.NOT_FOUND
+                                                             else 409)
         self._send(code, result)
 
 

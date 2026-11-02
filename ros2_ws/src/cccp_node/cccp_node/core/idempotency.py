@@ -14,8 +14,8 @@ def schedule(rule_id: str, planned_fire_unix_ms: int) -> str:
     return "schedule:%s:%d" % (rule_id, planned_fire_unix_ms)
 
 
-def chain(parent_task_id: int, rule: str, frame_id: int | None = None) -> str:
-    key = "chain:%d:%s" % (parent_task_id, rule)
+def chain(parent_task_id: str, rule: str, frame_id: int | None = None) -> str:
+    key = "chain:%s:%s" % (parent_task_id, rule)
     return key if frame_id is None else "%s:%d" % (key, frame_id)
 
 

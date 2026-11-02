@@ -13,6 +13,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("torchvision")
+torch.set_num_threads(min(8, torch.get_num_threads()))   # unbounded threads were ~5x slower on many-core hosts
 
 from collab_inference_ros.engines import PkciEngine, PkctEngine  # noqa: E402
 

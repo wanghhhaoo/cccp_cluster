@@ -57,10 +57,10 @@ def test_collaborative_modes_infer_helpers_from_targets():
 
 
 def test_chain_rules():
-    assert norm(origin="chain", parent_task_id=7, chain_depth=5).parent_task_id == 7
-    assert rejected(origin="chain", parent_task_id=7, chain_depth=6) == c.CHAIN_TOO_DEEP
+    assert norm(origin="chain", parent_task_id="t7", chain_depth=5).parent_task_id == "t7"
+    assert rejected(origin="chain", parent_task_id="t7", chain_depth=6) == c.CHAIN_TOO_DEEP
     assert rejected(origin="chain", chain_depth=1) == c.INVALID_INPUT
-    assert rejected(parent_task_id=7) == c.INVALID_INPUT
+    assert rejected(parent_task_id="t7") == c.INVALID_INPUT
 
 
 @pytest.mark.parametrize("field, value", [

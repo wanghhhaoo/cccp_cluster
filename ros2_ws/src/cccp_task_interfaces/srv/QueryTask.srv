@@ -1,8 +1,8 @@
-# <ns>/api/task/query：可以在任意节点上调用，读取该节点本地的任务表副本。
-# 副本可能比集群主节点落后一个复制周期（亚秒级）。
+# <ns>/api/task/query：可以在任意节点上调用，转发给集群主节点读取它的任务表。
+# <ns>/leader/task/query：同一类型，只由集群主节点处理。
 # 相比复用包 v0.1：新增 error_code、mode、epoch、origin、parent_task_id。
 
-int64 task_id
+string task_id
 ---
 bool success
 string error_code
@@ -15,7 +15,7 @@ string node                       # 任务主节点
 string[] target_nodes             # 全部执行节点，含辅助节点
 uint32 epoch
 string origin
-int64 parent_task_id
+string parent_task_id
 string error_message
 string result_url
 string last_event

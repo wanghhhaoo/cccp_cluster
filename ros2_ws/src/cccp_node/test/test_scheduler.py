@@ -59,7 +59,7 @@ def test_gpu_scores_use_reported_gpu_memory():
 # ---------------------------------------------------------------------- filters
 
 @pytest.mark.parametrize("override, reason", [
-    (dict(protocol_version=2), "protocol_mismatch"),
+    (dict(protocol_version=1), "protocol_mismatch"),
     (dict(inference_ready=False), "not_ready"),
     (dict(algorithms_ready=("PKCT",)), "algorithm_unavailable"),
 ])

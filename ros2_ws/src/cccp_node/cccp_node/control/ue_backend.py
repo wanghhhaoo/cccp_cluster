@@ -33,19 +33,19 @@ class UeBackend:
         self._leader_name = leader_name
         self._clock = clock
         self._lock = threading.Lock()
-        self._latest: OrderedDict[int, dict] = OrderedDict()   # task_id -> {"result": dict, "image": msg}
-        self._last_status_seq = 0
+        self._latest: OrderedDict[str, dict] = OrderedDict()   # task_id -> {"result": dict, "image": msg}
+        self._last_status = (0, 0)                            # (term, seq) of the newest TaskStatus
 
     # --------------------------------------------------------------- inputs
-    def on_status(self, event: StatusEvent) -> None:
-        """A /cluster/task_status message, deduplicated by its table seq."""
+    def on_status(self, event: StatusEvent, term: int) -> None:
+        """A /cluster/task_status message, deduplicated by (term, seq): each leader numbers its own changes."""
         with self._lock:
-            if event.seq <= self._last_status_seq:
+            if (term, event.seq) <= self._last_status:
                 return
-            self._last_status_seq = event.seq
+            self._last_status = (term, event.seq)
         self.events.add("status", {"task_id": event.task_id, "name": event.name, "task_type": event.task_type,
                                    "status": event.status, "node": event.node, "epoch": event.epoch,
-                                   "message": event.message})
+                                   "term": term, "message": event.message})
         if event.status in c.TERMINAL:
             with self._lock:
                 self._latest.pop(event.task_id, None)
@@ -55,11 +55,11 @@ class UeBackend:
             self._entry(data["task_id"])["result"] = data
         self.events.add("result", data)
 
-    def on_result_image(self, task_id: int, image: Any) -> None:
+    def on_result_image(self, task_id: str, image: Any) -> None:
         with self._lock:
             self._entry(task_id)["image"] = image
 
-    def _entry(self, task_id: int) -> dict:
+    def _entry(self, task_id: str) -> dict:
         entry = self._latest.get(task_id)
         if entry is None:
             entry = self._latest[task_id] = {"result": None, "image": None}
@@ -80,7 +80,7 @@ class UeBackend:
                 "task_id": reply.task_id, "duplicate": reply.duplicate, "assigned_node": reply.assigned_node,
                 "dispatched_nodes": list(reply.dispatched_nodes), "candidate_nodes": list(reply.candidate_nodes)}
 
-    def destroy(self, task_id: int, reason: str) -> dict:
+    def destroy(self, task_id: str, reason: str) -> dict:
         reply = self._gateway.destroy(task_id, reason or "destroyed by UE")
         if reply.success:
             with self._lock:
@@ -88,10 +88,11 @@ class UeBackend:
         return {"success": reply.success, "error_code": reply.error_code, "message": reply.message,
                 "final_status": reply.final_status}
 
-    def query(self, task_id: int) -> dict:
-        record = self._gateway.query(task_id)
+    def query(self, task_id: str) -> dict:
+        reply = self._gateway.query(task_id)
+        record = reply.record
         if record is None:
-            return {"success": False, "error_code": c.NOT_FOUND, "message": "task %d does not exist" % task_id,
+            return {"success": False, "error_code": reply.error_code or c.NOT_FOUND, "message": reply.message,
                     "task_id": task_id}
         if record.primary:
             self._watch(record.primary, False)
@@ -116,13 +117,13 @@ class UeBackend:
             })
         return True, nodes, "ok"
 
-    def latest_result(self, task_id: int) -> dict | None:
+    def latest_result(self, task_id: str) -> dict | None:
         with self._lock:
             entry = self._latest.get(task_id)
             return entry["result"] if entry else None
 
-    def latest_image_jpeg(self, task_id: int) -> bytes | None:
-        record = self._gateway.query(task_id)
+    def latest_image_jpeg(self, task_id: str) -> bytes | None:
+        record = self._gateway.query(task_id).record
         if record is not None and record.primary:
             self._watch(record.primary, True)
         with self._lock:

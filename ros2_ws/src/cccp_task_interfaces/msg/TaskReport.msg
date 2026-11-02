@@ -1,6 +1,6 @@
 # /cluster/task_report：执行节点向集群主节点报告某个任务在本节点上的状态变化。
 # 所有节点都订阅，只有集群主节点处理（写入任务表）；不需要知道谁是主节点。
-# 这条消息丢了也不会出错：NodeStatus.running_tasks 每秒全量对账一次，作为兜底。
+# 这条消息丢了也不会出错：NodeStatus.tasks 每秒全量对账一次，作为兜底。
 
 string STATE_RUNNING="Running"
 string STATE_FINISHED="Finished"
@@ -9,7 +9,7 @@ string STATE_FAILED="Failed"
 string STATE_STOPPED="Stopped"
 
 string node_name
-int64 task_id
+string task_id
 uint32 epoch                      # 主节点会丢弃 epoch 小于任务当前 epoch 的报告
 string state
 string error_code                 # 见 ErrorCodes.msg；成功时为空

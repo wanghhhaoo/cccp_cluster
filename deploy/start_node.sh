@@ -1,6 +1,6 @@
 #!/bin/bash
 # Starts the three processes of one cluster node (CONVENTIONS 6.1):
-#   control     cccp_node control_node: Raft replica, leader control plane, gateway, NodeStatus
+#   control     cccp_node control_node: leader election, leader control plane, gateway, NodeStatus
 #   data plane  cccp_task_executor data_plane: task executor + PKCI + PKCT services
 #   camera      cccp_task_executor airsim_camera: only when AIRSIM_HOST is set
 # Adapted from CCCP start_edge_agent.sh.
@@ -14,9 +14,8 @@ if [ -f /ros2_ws/install/setup.bash ]; then
 	source /ros2_ws/install/setup.bash
 fi
 
-NODE_NAME=${NODE_NAME:?NODE_NAME must be set and listed in cluster.yaml}
-CLUSTER_CONFIG=${CLUSTER_CONFIG:-/etc/cccp/cluster.yaml}
-CCCP_DATA_DIR=${CCCP_DATA_DIR:-/var/lib/cccp}
+# Nodes find each other through DDS discovery: no member list, only a unique NODE_NAME per node.
+NODE_NAME=${NODE_NAME:?NODE_NAME must be set (unique per node)}
 UE_HTTP_PORT=${UE_HTTP_PORT:-18090}
 LOG_LEVEL=${LOG_LEVEL:-INFO}
 export RCUTILS_LOGGING_MIN_SEVERITY=$LOG_LEVEL
@@ -45,7 +44,7 @@ case "$ns_token" in
 esac
 NS_ARGS=(-r "__ns:=/${ns_token}")
 
-echo "[start_node] NODE_NAME=$NODE_NAME ns=/${ns_token} CLUSTER_CONFIG=$CLUSTER_CONFIG DATA_DIR=$CCCP_DATA_DIR"
+echo "[start_node] NODE_NAME=$NODE_NAME ns=/${ns_token}"
 echo "[start_node] ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-N/A} RMW=$RMW_IMPLEMENTATION UE_HTTP_PORT=$UE_HTTP_PORT DEVICE=$COLLAB_DEVICE"
 
 if [ "$ENABLE_DATA_PLANE" = "true" ] && { [ "$ENABLE_PKCI" = "true" ] || [ "$ENABLE_PKCT" = "true" ]; }; then
@@ -58,12 +57,8 @@ fi
 pids=()
 
 if [ "$ENABLE_CONTROL" = "true" ]; then
-	test -r "$CLUSTER_CONFIG" || { echo "[start_node] $CLUSTER_CONFIG not readable" >&2; exit 1; }
-	mkdir -p "$CCCP_DATA_DIR"
 	setsid ros2 run cccp_node control_node --ros-args --log-level "$LOG_LEVEL" "${NS_ARGS[@]}" \
 		-p "node_name:=${NODE_NAME}" \
-		-p "cluster_config:=${CLUSTER_CONFIG}" \
-		-p "data_dir:=${CCCP_DATA_DIR}" \
 		-p "ue_http_port:=${UE_HTTP_PORT}" &
 	pids+=("$!")
 fi

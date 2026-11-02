@@ -38,7 +38,7 @@ class TaskSpec:
     latency_sensitivity: float = 0.0
     origin: str = c.ORIGIN_MANUAL
     origin_source: str = ""
-    parent_task_id: int = 0
+    parent_task_id: str = ""
     chain_depth: int = 0
     drone_id: int = 0
     level: str = ""
@@ -54,6 +54,16 @@ class TaskSpec:
         data = asdict(self)
         data["target_nodes"] = list(self.target_nodes)
         return data
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, text: str) -> TaskSpec:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("task spec JSON must be an object")
+        return cls.from_dict(data)
 
     @classmethod
     def from_dict(cls, data: dict) -> TaskSpec:
@@ -115,7 +125,7 @@ def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth
         raise SpecError(c.INVALID_INPUT, "min_participants exceeds 1 + helper_count")
 
     if origin == c.ORIGIN_CHAIN:
-        if spec.parent_task_id <= 0 or spec.chain_depth < 1:
+        if not spec.parent_task_id.strip() or spec.chain_depth < 1:
             raise SpecError(c.INVALID_INPUT, "chain tasks need parent_task_id and chain_depth >= 1")
         if spec.chain_depth > max_chain_depth:
             raise SpecError(c.CHAIN_TOO_DEEP, "chain depth %d exceeds %d" % (spec.chain_depth, max_chain_depth))

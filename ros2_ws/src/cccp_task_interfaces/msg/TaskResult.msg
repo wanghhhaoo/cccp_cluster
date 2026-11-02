@@ -3,7 +3,7 @@
 # success 表示计算过程完成，valid 表示结果满足算法的有效性规则，
 # 两者含义不同：低置信度或“未检测到目标”可以是有效结果，不算失败。
 
-int64 task_id
+string task_id
 uint32 epoch                      # 汇总方丢弃旧代次的结果
 string node_name                  # 产生这条结果的节点
 string task_type                  # PKCI | PKCT

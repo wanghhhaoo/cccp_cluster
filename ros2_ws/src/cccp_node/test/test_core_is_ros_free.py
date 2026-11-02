@@ -1,9 +1,9 @@
-"""cccp_node.core must stay importable without ROS or the consensus library (CONVENTIONS 6.2)."""
+"""cccp_node.core must stay importable without ROS (CONVENTIONS 6.2)."""
 import ast
 from pathlib import Path
 
 CORE = Path(__file__).resolve().parents[1] / "cccp_node" / "core"
-FORBIDDEN = ("rclpy", "rosidl", "builtin_interfaces", "sensor_msgs", "pysyncobj")
+FORBIDDEN = ("rclpy", "rosidl", "builtin_interfaces", "sensor_msgs")
 
 
 def imported_roots(path):
@@ -14,7 +14,7 @@ def imported_roots(path):
             yield node.module.split(".")[0]
 
 
-def test_core_does_not_import_ros_or_consensus():
+def test_core_does_not_import_ros():
     offenders = []
     for path in sorted(CORE.glob("*.py")):
         for root in imported_roots(path):

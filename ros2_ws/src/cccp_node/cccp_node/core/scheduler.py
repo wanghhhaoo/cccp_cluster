@@ -46,7 +46,7 @@ UNMEASURED_LINK = LinkView("", rtt_ms=30.0, jitter_ms=5.0, loss_rate=0.005)
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    protocol_version: int = 1
+    protocol_version: int = 2
     weights: Mapping[str, tuple[float, float, float]] = field(default_factory=dict)  # task_type -> (lrs, brs, net)
     default_weights: tuple[float, float, float] = (0.3, 0.3, 0.4)   # Java "INFERENCE" weights
     default_latency_sensitivity: float = 0.5

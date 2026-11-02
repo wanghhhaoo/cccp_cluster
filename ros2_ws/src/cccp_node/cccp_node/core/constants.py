@@ -32,7 +32,7 @@ ORIGIN_CHAIN = "chain"
 ORIGIN_EVENT = "event"
 ORIGINS = frozenset({ORIGIN_MANUAL, ORIGIN_SCHEDULE, ORIGIN_CHAIN, ORIGIN_EVENT})
 
-# RunningTask.msg, StartTask.srv
+# TaskState.msg, StartTask.srv
 ROLE_PRIMARY = "primary"
 ROLE_HELPER = "helper"
 

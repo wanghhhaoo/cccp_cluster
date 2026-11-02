@@ -15,6 +15,11 @@ API_CREATE_SERVICE = "api/task/create"
 API_DESTROY_SERVICE = "api/task/destroy"
 API_QUERY_SERVICE = "api/task/query"
 
+# Leader-only handlers behind the public api/* services: never forwarded again.
+LEADER_CREATE_SERVICE = "leader/task/create"
+LEADER_DESTROY_SERVICE = "leader/task/destroy"
+LEADER_QUERY_SERVICE = "leader/task/query"
+
 TASK_RESULT_TOPIC = "task/result"
 TASK_RESULT_IMAGE_TOPIC = "task/result_image"
 

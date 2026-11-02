@@ -6,7 +6,8 @@ target SimNode, so term and epoch fencing behave as on real executors.
 """
 from cccp_node.control.controller import DispatchResult, TaskReportView
 from cccp_node.core import constants as c
-from cccp_node.core.cluster_view import ClusterView, NodeView, RunningTaskView
+from cccp_node.core.cluster_view import ClusterView, NodeView, TaskStateView
+from cccp_node.core.election import Leadership
 from cccp_node.core.execution_guard import NOOP, REJECT, RESTART, START, STOP, ExecutionGuard
 
 
@@ -21,11 +22,22 @@ class Clock:
         self.now += seconds
 
 
+class FakeElection:
+    """Election result set by the test."""
+
+    def __init__(self, leader="n1", term=1, me="n1"):
+        self.me = me
+        self.set(leader, term)
+
+    def set(self, leader, term):
+        self.state = Leadership(leader, term, leader == self.me)
+
+
 class SimNode:
     def __init__(self, name, **view):
         self.name = name
         self.guard = ExecutionGuard()
-        self.roles = {}
+        self.starts = {}                # task_id -> StartRequest of the running session
         self.alive = True
         self.fail_start = None          # error_code to return from the next starts
         self.view = dict(inference_ready=True, algorithms_ready=("PKCI", "PKCT"), cpu_cores=8,
@@ -37,7 +49,10 @@ class SimNode:
 
     def status(self):
         self.seq += 1
-        running = tuple(RunningTaskView(t, e, self.roles[t]) for t, e in sorted(self.guard.running().items()))
+        running = tuple(
+            TaskStateView(t, e, self.starts[t].role, self.starts[t].primary_node, self.starts[t].helper_nodes,
+                          self.starts[t].idempotency_key, self.starts[t].name, self.starts[t].spec.to_json())
+            for t, e in sorted(self.guard.running().items()))
         return NodeView(self.name, incarnation=1, seq=self.seq, running_tasks=running, **self.view)
 
     def report(self, task_id, epoch, state, error_code=""):
@@ -64,7 +79,7 @@ class SimDispatcher:
             return DispatchResult(False, decision.error_code, decision.message)
         if decision.action in (START, RESTART):
             sim.guard.started(request.task_id, request.epoch)
-            sim.roles[request.task_id] = request.role
+            sim.starts[request.task_id] = request
             if request.role == c.ROLE_PRIMARY:
                 sim.report(request.task_id, request.epoch, c.REPORT_RUNNING)
         assert decision.action in (START, RESTART, NOOP)

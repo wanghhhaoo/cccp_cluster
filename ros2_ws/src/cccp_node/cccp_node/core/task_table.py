@@ -1,26 +1,23 @@
-"""Replicated task table: the cluster's single source of truth for tasks.
+"""The cluster leader's task table: what should exist and who should run it (CONVENTIONS 5.2).
 
-TaskTable is a deterministic state machine. The consensus layer delivers the
-same commands in the same order to every node, and each node feeds them to
-apply(), so all replicas stay identical (CONVENTIONS 5.1). apply() therefore
-must not read clocks, random sources, files, the environment or any other
-local state (CONVENTIONS 5.2): ids are allocated from counters inside the
-table, and anything else a command needs, such as a timestamp, travels in
-the command itself. Records are immutable, so readers can keep them without
-being able to modify the table behind apply()'s back.
+The table lives only in the current leader's memory. What executors actually
+run is reported in NodeStatus.tasks; after an election the new leader starts
+with an empty table and rebuilds it from those reports (Adopt). Tasks that had
+not reached any executor when the old leader died are lost: the caller sees
+its request fail and retries with the same idempotency key (CONVENTIONS 5.3).
 
-Every state change advances a table-wide sequence number and yields a
-StatusEvent, which the cluster leader publishes as a TaskStatus message.
+All changes go through apply(command) and the records are immutable, so
+readers can keep them without being able to change the table. Every status
+change advances the table's sequence number and yields a StatusEvent, which
+the leader publishes as TaskStatus (term, seq).
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, replace
 from typing import Union
 
 from . import constants as c
 from .task_spec import TaskSpec
-
-SNAPSHOT_VERSION = 1
 
 _RANK = {c.PENDING: 0, c.SCHEDULED: 1, c.RUNNING: 2, c.FINISHED: 3, c.FAILED: 3, c.CANCELLED: 3}
 _REPORTED = {c.REPORT_RUNNING: c.RUNNING, c.REPORT_FINISHED: c.FINISHED, c.REPORT_FAILED: c.FAILED}
@@ -28,7 +25,7 @@ _REPORTED = {c.REPORT_RUNNING: c.RUNNING, c.REPORT_FINISHED: c.FINISHED, c.REPOR
 
 @dataclass(frozen=True)
 class TaskRecord:
-    task_id: int
+    task_id: str
     idempotency_key: str
     spec: TaskSpec
     name: str
@@ -39,7 +36,7 @@ class TaskRecord:
     error_code: str = ""
     error_message: str = ""
     last_event: str = ""
-    submitted_ms: int = 0  # caller wall clocks: for display only, never compare (CONVENTIONS 4.3)
+    submitted_ms: int = 0  # wall clocks: for display only, never compare (CONVENTIONS 4.3)
     updated_ms: int = 0
 
     @property
@@ -59,7 +56,7 @@ class TaskRecord:
 @dataclass(frozen=True)
 class StatusEvent:
     seq: int
-    task_id: int
+    task_id: str
     name: str
     task_type: str
     status: str
@@ -73,7 +70,7 @@ class ApplyResult:
     ok: bool
     error_code: str = ""
     message: str = ""
-    task_id: int = 0
+    task_id: str = ""
     duplicate: bool = False
     events: tuple[StatusEvent, ...] = ()
 
@@ -83,22 +80,41 @@ class ApplyResult:
 
 @dataclass(frozen=True)
 class Submit:
-    """Gateway on any node. The gateway generates a key when the caller gave none."""
+    """Gateway on the leader. task_id is a fresh UUID; idempotency_key is never empty."""
 
     OP = "submit"
+    task_id: str
     idempotency_key: str
     spec: TaskSpec
     now_ms: int = 0
 
 
 @dataclass(frozen=True)
+class Adopt:
+    """Leader: take over a task that an executor reports running but this table does not
+    know, or knows at an older epoch (after an election, or a task another leader placed
+    while two leaders coexisted)."""
+
+    OP = "adopt"
+    task_id: str
+    idempotency_key: str
+    name: str
+    spec: TaskSpec
+    epoch: int
+    primary: str
+    helpers: tuple[str, ...] = ()
+    reported_by: str = ""
+    now_ms: int = 0
+
+
+@dataclass(frozen=True)
 class Assign:
     """Leader: (re)schedule. Applies only while the task is still at expected_epoch;
-    the epoch then advances by one, so two decisions made from the same snapshot
+    the epoch then advances by one, so two decisions made from the same view
     cannot both succeed."""
 
     OP = "assign"
-    task_id: int
+    task_id: str
     expected_epoch: int
     primary: str
     helpers: tuple[str, ...] = ()
@@ -107,10 +123,10 @@ class Assign:
 
 @dataclass(frozen=True)
 class Requeue:
-    """Leader: put a task back to Pending (e.g. its primary is gone and no node fits yet)."""
+    """Leader: put a task back to Pending (its primary is gone and no node fits yet)."""
 
     OP = "requeue"
-    task_id: int
+    task_id: str
     expected_epoch: int
     reason: str = ""
     now_ms: int = 0
@@ -122,7 +138,7 @@ class ReportStatus:
 
     OP = "report_status"
     node: str
-    task_id: int
+    task_id: str
     epoch: int
     state: str
     error_code: str = ""
@@ -132,10 +148,10 @@ class ReportStatus:
 
 @dataclass(frozen=True)
 class MarkFailed:
-    """Leader: failures the leader detects itself (dispatch failed, pending timeout)."""
+    """Leader: failures the leader detects itself (dispatch failed, no feasible node)."""
 
     OP = "mark_failed"
-    task_id: int
+    task_id: str
     expected_epoch: int
     error_code: str
     message: str = ""
@@ -144,10 +160,10 @@ class MarkFailed:
 
 @dataclass(frozen=True)
 class Cancel:
-    """Gateway on any node (DestroyTask)."""
+    """Gateway on the leader (DestroyTask)."""
 
     OP = "cancel"
-    task_id: int
+    task_id: str
     reason: str = ""
     now_ms: int = 0
 
@@ -157,53 +173,13 @@ class Prune:
     """Leader: forget finished tasks. Non-terminal ids are skipped."""
 
     OP = "prune"
-    task_ids: tuple[int, ...] = ()
+    task_ids: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
-class Barrier:
-    """Leader: no-op committed right after election.
-
-    A new Raft leader learns which entries of earlier terms are committed only
-    once an entry of its own term commits; until then its replica can lag and
-    miss tasks. The controller waits for this command before acting.
-    """
-
-    OP = "barrier"
-    term: int = 0
+Command = Union[Submit, Adopt, Assign, Requeue, ReportStatus, MarkFailed, Cancel, Prune]
 
 
-Command = Union[Submit, Assign, Requeue, ReportStatus, MarkFailed, Cancel, Prune, Barrier]
-_COMMANDS = {cls.OP: cls for cls in (Submit, Assign, Requeue, ReportStatus, MarkFailed, Cancel, Prune, Barrier)}
-
-
-def command_to_dict(command: Command) -> dict:
-    """JSON-ready form used as the replicated log entry."""
-    data = {"op": command.OP}
-    for f in fields(command):
-        value = getattr(command, f.name)
-        if isinstance(value, TaskSpec):
-            value = value.to_dict()
-        elif isinstance(value, tuple):
-            value = list(value)
-        data[f.name] = value
-    return data
-
-
-def command_from_dict(data: dict) -> Command:
-    values = dict(data)
-    cls = _COMMANDS.get(values.pop("op", None))
-    if cls is None:
-        raise ValueError("unknown command op: %r" % data.get("op"))
-    if "spec" in values:
-        values["spec"] = TaskSpec.from_dict(values["spec"])
-    for key, value in values.items():
-        if isinstance(value, list):
-            values[key] = tuple(value)
-    return cls(**values)
-
-
-def _error(error_code: str, message: str, task_id: int = 0) -> ApplyResult:
+def _error(error_code: str, message: str, task_id: str = "") -> ApplyResult:
     return ApplyResult(False, error_code=error_code, message=message, task_id=task_id)
 
 
@@ -211,9 +187,8 @@ def _error(error_code: str, message: str, task_id: int = 0) -> ApplyResult:
 
 class TaskTable:
     def __init__(self) -> None:
-        self._tasks: dict[int, TaskRecord] = {}
-        self._by_key: dict[str, int] = {}
-        self._next_id = 1
+        self._tasks: dict[str, TaskRecord] = {}
+        self._by_key: dict[str, str] = {}
         self._seq = 0
 
     # ------------------------------------------------------------------ reads
@@ -222,7 +197,7 @@ class TaskTable:
         """Sequence number of the latest status change."""
         return self._seq
 
-    def get(self, task_id: int) -> TaskRecord | None:
+    def get(self, task_id: str) -> TaskRecord | None:
         return self._tasks.get(task_id)
 
     def find_by_key(self, idempotency_key: str) -> TaskRecord | None:
@@ -230,7 +205,7 @@ class TaskTable:
         return None if task_id is None else self._tasks[task_id]
 
     def tasks(self) -> list[TaskRecord]:
-        """All records in task_id order."""
+        """All records in insertion order."""
         return list(self._tasks.values())
 
     def active_tasks(self) -> list[TaskRecord]:
@@ -241,26 +216,50 @@ class TaskTable:
         return getattr(self, "_apply_" + command.OP)(command)
 
     def _apply_submit(self, cmd: Submit) -> ApplyResult:
-        if not cmd.idempotency_key:
-            return _error(c.INVALID_INPUT, "idempotency_key is required")
+        if not cmd.idempotency_key or not cmd.task_id:
+            return _error(c.INVALID_INPUT, "task_id and idempotency_key are required")
         existing = self._by_key.get(cmd.idempotency_key)
         if existing is not None:
-            return ApplyResult(True, message="duplicate of task %d" % existing, task_id=existing, duplicate=True)
-        task_id = self._next_id
-        self._next_id += 1
+            return ApplyResult(True, message="duplicate of task %s" % existing, task_id=existing, duplicate=True)
+        if cmd.task_id in self._tasks:
+            return _error(c.INVALID_INPUT, "task_id %s already exists" % cmd.task_id, cmd.task_id)
         spec = cmd.spec
         record = TaskRecord(
-            task_id=task_id,
+            task_id=cmd.task_id,
             idempotency_key=cmd.idempotency_key,
             spec=spec,
-            name=spec.name or "%s-%d" % (spec.task_type.lower(), task_id),
+            name=spec.name or "%s-%s" % (spec.task_type.lower(), cmd.task_id[:8]),
             last_event="submitted",
             submitted_ms=cmd.now_ms,
             updated_ms=cmd.now_ms,
         )
-        self._tasks[task_id] = record
-        self._by_key[cmd.idempotency_key] = task_id
-        return ApplyResult(True, message="submitted", task_id=task_id, events=(self._emit(record),))
+        self._insert(record)
+        return ApplyResult(True, message="submitted", task_id=cmd.task_id, events=(self._emit(record),))
+
+    def _apply_adopt(self, cmd: Adopt) -> ApplyResult:
+        known = self._tasks.get(cmd.task_id)
+        if known is not None and (known.terminal or cmd.epoch <= known.epoch):
+            return ApplyResult(True, message="no change", task_id=cmd.task_id)
+        key = known.idempotency_key if known is not None else cmd.idempotency_key   # fixed at creation
+        owner = self._by_key.get(key)
+        if owner is not None and owner != cmd.task_id:
+            return _error(c.INVALID_STATE, "idempotency key already used by task %s" % owner, cmd.task_id)
+        message = "adopted epoch %d on %s (reported by %s)" % (cmd.epoch, cmd.primary, cmd.reported_by or "?")
+        record = TaskRecord(
+            task_id=cmd.task_id,
+            idempotency_key=key,
+            spec=cmd.spec,
+            name=cmd.name or "%s-%s" % (cmd.spec.task_type.lower(), cmd.task_id[:8]),
+            status=c.RUNNING,
+            epoch=cmd.epoch,
+            primary=cmd.primary,
+            helpers=tuple(cmd.helpers),
+            last_event=message,
+            submitted_ms=known.submitted_ms if known else cmd.now_ms,
+            updated_ms=cmd.now_ms,
+        )
+        self._insert(record)
+        return ApplyResult(True, message=message, task_id=cmd.task_id, events=(self._emit(record),))
 
     def _apply_assign(self, cmd: Assign) -> ApplyResult:
         record, error = self._changeable(cmd.task_id, cmd.expected_epoch)
@@ -270,7 +269,7 @@ class TaskTable:
         if not cmd.primary or not all(helpers) or len({cmd.primary, *helpers}) != 1 + len(helpers):
             return _error(c.INVALID_INPUT, "primary and helpers must be distinct node names", cmd.task_id)
         if len(helpers) > record.spec.helper_count:
-            return _error(c.INVALID_INPUT, "task %d takes at most %d helpers"
+            return _error(c.INVALID_INPUT, "task %s takes at most %d helpers"
                           % (cmd.task_id, record.spec.helper_count), cmd.task_id)
         message = "scheduled to %s" % cmd.primary
         if helpers:
@@ -288,15 +287,15 @@ class TaskTable:
     def _apply_report_status(self, cmd: ReportStatus) -> ApplyResult:
         record = self._tasks.get(cmd.task_id)
         if record is None:
-            return _error(c.NOT_FOUND, "task %d does not exist" % cmd.task_id, cmd.task_id)
+            return _error(c.NOT_FOUND, "task %s does not exist" % cmd.task_id, cmd.task_id)
         target = _REPORTED.get(cmd.state)
         if target is None and cmd.state != c.REPORT_STOPPED:
             return _error(c.INVALID_INPUT, "unknown report state %r" % cmd.state, cmd.task_id)
         if cmd.epoch < record.epoch:
-            return _error(c.STALE_EPOCH, "report for epoch %d, task %d is at epoch %d"
+            return _error(c.STALE_EPOCH, "report for epoch %d, task %s is at epoch %d"
                           % (cmd.epoch, cmd.task_id, record.epoch), cmd.task_id)
         if cmd.epoch > record.epoch:
-            return _error(c.INVALID_STATE, "report for future epoch %d of task %d"
+            return _error(c.INVALID_STATE, "report for future epoch %d of task %s"
                           % (cmd.epoch, cmd.task_id), cmd.task_id)
         # Only the task primary drives the task state; helper reports, Stopped
         # acknowledgements and late reports for finished tasks change nothing.
@@ -330,23 +329,25 @@ class TaskTable:
             record = self._tasks.get(task_id)
             if record is not None and record.terminal:
                 del self._tasks[task_id]
-                del self._by_key[record.idempotency_key]
+                if self._by_key.get(record.idempotency_key) == task_id:
+                    del self._by_key[record.idempotency_key]
                 pruned += 1
         return ApplyResult(True, message="pruned %d" % pruned)
 
-    def _apply_barrier(self, cmd: Barrier) -> ApplyResult:
-        return ApplyResult(True, message="barrier for term %d" % cmd.term)
-
     # ---------------------------------------------------------------- helpers
-    def _changeable(self, task_id: int, expected_epoch: int | None = None):
+    def _insert(self, record: TaskRecord) -> None:
+        self._tasks[record.task_id] = record
+        self._by_key[record.idempotency_key] = record.task_id
+
+    def _changeable(self, task_id: str, expected_epoch: int | None = None):
         """(record, None) if the task can still change, else (None, error result)."""
         record = self._tasks.get(task_id)
         if record is None:
-            return None, _error(c.NOT_FOUND, "task %d does not exist" % task_id, task_id)
+            return None, _error(c.NOT_FOUND, "task %s does not exist" % task_id, task_id)
         if record.terminal:
-            return None, _error(c.INVALID_STATE, "task %d is already %s" % (task_id, record.status), task_id)
+            return None, _error(c.INVALID_STATE, "task %s is already %s" % (task_id, record.status), task_id)
         if expected_epoch is not None and expected_epoch != record.epoch:
-            return None, _error(c.STALE_EPOCH, "task %d is at epoch %d, not %d"
+            return None, _error(c.STALE_EPOCH, "task %s is at epoch %d, not %d"
                                 % (task_id, record.epoch, expected_epoch), task_id)
         return record, None
 
@@ -362,30 +363,3 @@ class TaskTable:
         self._seq += 1
         return StatusEvent(self._seq, record.task_id, record.name, record.spec.task_type,
                            record.status, record.epoch, record.primary, record.last_event)
-
-    # --------------------------------------------------------------- snapshot
-    def to_snapshot(self) -> dict:
-        """JSON-ready copy of the whole table, for consensus log compaction."""
-        tasks = []
-        for record in self._tasks.values():
-            data = asdict(record)
-            data["spec"] = record.spec.to_dict()
-            data["helpers"] = list(record.helpers)
-            tasks.append(data)
-        return {"version": SNAPSHOT_VERSION, "next_id": self._next_id, "seq": self._seq, "tasks": tasks}
-
-    @classmethod
-    def from_snapshot(cls, data: dict) -> TaskTable:
-        if data.get("version") != SNAPSHOT_VERSION:
-            raise ValueError("unsupported task table snapshot version %r" % data.get("version"))
-        table = cls()
-        table._next_id = data["next_id"]
-        table._seq = data["seq"]
-        for item in data["tasks"]:
-            values = dict(item)
-            values["spec"] = TaskSpec.from_dict(values["spec"])
-            values["helpers"] = tuple(values["helpers"])
-            record = TaskRecord(**values)
-            table._tasks[record.task_id] = record
-            table._by_key[record.idempotency_key] = record.task_id
-        return table

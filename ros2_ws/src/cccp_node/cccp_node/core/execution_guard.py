@@ -43,7 +43,7 @@ class ExecutionGuard:
         self.max_term = term
         return None
 
-    def on_start(self, term: int, task_id: int, epoch: int) -> Decision:
+    def on_start(self, term: int, task_id: str, epoch: int) -> Decision:
         rejected = self._fence(term)
         if rejected:
             return rejected
@@ -51,23 +51,23 @@ class ExecutionGuard:
         if current is None:
             return Decision(START)
         if epoch == current:
-            return Decision(NOOP, message="task %d epoch %d already running" % (task_id, epoch))
+            return Decision(NOOP, message="task %s epoch %d already running" % (task_id, epoch))
         if epoch > current:
             return Decision(RESTART, message="replacing epoch %d with %d" % (current, epoch))
-        return Decision(REJECT, c.STALE_EPOCH, "task %d is running epoch %d, not %d" % (task_id, current, epoch))
+        return Decision(REJECT, c.STALE_EPOCH, "task %s is running epoch %d, not %d" % (task_id, current, epoch))
 
-    def on_stop(self, term: int, task_id: int, epoch: int) -> Decision:
+    def on_stop(self, term: int, task_id: str, epoch: int) -> Decision:
         """epoch 0 stops any epoch; stopping an epoch older than the running one is a no-op."""
         rejected = self._fence(term)
         if rejected:
             return rejected
         current = self._running.get(task_id)
         if current is None or (epoch and epoch < current):
-            return Decision(NOOP, message="task %d epoch %d is not running" % (task_id, epoch))
+            return Decision(NOOP, message="task %s epoch %d is not running" % (task_id, epoch))
         return Decision(STOP)
 
-    def started(self, task_id: int, epoch: int) -> None:
+    def started(self, task_id: str, epoch: int) -> None:
         self._running[task_id] = epoch
 
-    def stopped(self, task_id: int) -> None:
+    def stopped(self, task_id: str) -> None:
         self._running.pop(task_id, None)

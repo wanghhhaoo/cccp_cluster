@@ -14,7 +14,7 @@ SOURCES = {
     "cccp_task_interfaces/msg/TaskReport.msg": lambda name: name.replace("STATE_", "REPORT_"),
     "cccp_task_interfaces/srv/CreateTask.srv": lambda name: name,
     "cccp_task_interfaces/srv/StartTask.srv": lambda name: name,
-    "cccp_cluster_interfaces/msg/RunningTask.msg": lambda name: name,
+    "cccp_cluster_interfaces/msg/TaskState.msg": lambda name: name,
     "cccp_task_interfaces/msg/ErrorCodes.msg": lambda name: "CANCELLED_ERROR" if name == "CANCELLED" else name,
 }
 

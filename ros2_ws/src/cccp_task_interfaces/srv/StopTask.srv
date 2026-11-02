@@ -3,7 +3,7 @@
 # 任务本来就不在运行时返回成功（幂等）。
 
 uint64 term
-int64 task_id
+string task_id
 uint32 epoch                      # 0 表示停止该任务的所有代次
 string reason
 ---

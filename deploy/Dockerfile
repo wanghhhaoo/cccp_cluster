@@ -1,8 +1,7 @@
 # x86_64 node image. Build from the repository root:
-#   docker build -f deploy/Dockerfile -t cccp-node:p1-$(git rev-parse --short HEAD) .
-# Run (host network so DDS and Raft reach the other nodes):
-#   docker run --network host -e NODE_NAME=edge-01 \
-#     -v /etc/cccp/cluster.yaml:/etc/cccp/cluster.yaml:ro -v cccp-raft:/var/lib/cccp cccp-node:p1-...
+#   docker build -f deploy/Dockerfile -t cccp-node:p2-$(git rev-parse --short HEAD) .
+# Run (host network so DDS reaches the other nodes; NODE_NAME must be unique in the cluster):
+#   docker run --network host -e NODE_NAME=edge-01 -e ROS_DOMAIN_ID=10 cccp-node:p2-...
 # Adapted from CCCP edge/Dockerfile_build. The C++ monitor_node is no longer built:
 # resource reporting moved into the control process.
 FROM ros:humble
@@ -18,7 +17,6 @@ RUN apt-get update \
 		python3-pip \
 		python3-numpy \
 		python3-pil \
-		python3-yaml \
 		python3-msgpack \
 		python3-tornado \
 		python3-pytest \
@@ -30,10 +28,8 @@ RUN apt-get update \
 		ca-certificates \
 	&& rm -rf /var/lib/apt/lists/*
 
-# Raft (CONVENTIONS 3.1) and the AirSim RPC client. --no-deps keeps apt's numpy,
-# msgpack and tornado so cv_bridge stays compatible.
-RUN pip3 install --no-cache-dir pysyncobj==0.3.17 \
-	&& pip3 install --no-cache-dir --no-deps cosysairsim==3.3.0 rpc-msgpack==0.6
+# AirSim RPC client. --no-deps keeps apt's numpy, msgpack and tornado so cv_bridge stays compatible.
+RUN pip3 install --no-cache-dir --no-deps cosysairsim==3.3.0 rpc-msgpack==0.6
 
 ENV ROS_DOMAIN_ID=10
 RUN bash -lc "source /opt/ros/humble/setup.bash && colcon build --merge-install \
@@ -48,12 +44,9 @@ RUN if [ "$INSTALL_PYTORCH" = "true" ]; then \
 		pip3 install --no-cache-dir ${TORCH_INDEX_URL:+--index-url "$TORCH_INDEX_URL"} torch torchvision; \
 	fi
 
-ENV CLUSTER_CONFIG=/etc/cccp/cluster.yaml
-ENV CCCP_DATA_DIR=/var/lib/cccp
 ENV UE_HTTP_PORT=18090
 ENV COLLAB_DEVICE=cpu
 ENV MAX_TRACKERS=4
 ENV IMAGE_TOPIC=camera/image
-VOLUME ["/var/lib/cccp"]
 
 CMD ["/ros2_ws/start_node.sh"]

@@ -1,5 +1,12 @@
 """Leader reconciliation (CONVENTIONS 5.6): compare the task table with what
-nodes report in NodeStatus.running_tasks and decide what to do about it.
+nodes report in NodeStatus.tasks and decide what to do about it.
+
+Executors are the source of truth for what runs (CONVENTIONS 5.3): a running
+task the table does not know, or knows at an older epoch, is adopted rather
+than stopped. That is how a new leader rebuilds its table, and how tasks
+placed by a second leader during a split are merged back. Among several
+copies of one task the newest epoch wins; within it the copy on its primary;
+then the smallest node name. Losing copies are stopped in later rounds.
 
 reconcile() is a pure function of the table, the online nodes, the leader's
 local memory of when it saw and did things, and the current monotonic time.
@@ -14,7 +21,8 @@ from dataclasses import dataclass, field
 from typing import Mapping, Union
 
 from . import constants as c
-from .cluster_view import NodeView
+from .cluster_view import NodeView, TaskStateView
+from .task_spec import TaskSpec
 from .task_table import TaskRecord
 
 
@@ -23,7 +31,8 @@ class ReconcileConfig:
     dispatch_retry_s: float = 5.0     # resend StartTask to a node that has not started the task
     start_timeout_s: float = 15.0     # Scheduled this long without the primary running it: reschedule
     missing_grace_s: float = 3.0      # Running but absent from the primary's running_tasks this long: lost
-    pending_timeout_s: float = 30.0   # Pending this long without a feasible node: fail
+    pending_timeout_s: float = 8.0    # Pending this long without a feasible node: fail (shorter than
+                                      # the gateway's create wait, so callers get a definite answer)
     stop_retry_s: float = 5.0         # resend StopTask for an orphan still running
 
 
@@ -31,20 +40,20 @@ class ReconcileConfig:
 
 @dataclass(frozen=True)
 class ScheduleTask:
-    task_id: int
+    task_id: str
     expected_epoch: int
 
 
 @dataclass(frozen=True)
 class Reschedule:
-    task_id: int
+    task_id: str
     expected_epoch: int
     reason: str
 
 
 @dataclass(frozen=True)
 class Dispatch:
-    task_id: int
+    task_id: str
     epoch: int
     node: str
     role: str
@@ -55,28 +64,42 @@ class ConfirmRunning:
     """The primary runs the task but the table still says Scheduled: its Running
     report was lost (typically during a leader change). Record it on its behalf."""
 
-    task_id: int
+    task_id: str
     epoch: int
     node: str
 
 
 @dataclass(frozen=True)
+class AdoptTask:
+    """A running task the table does not know (or knows at an older epoch): take it over."""
+
+    task_id: str
+    epoch: int
+    primary: str
+    helpers: tuple[str, ...]
+    idempotency_key: str
+    name: str
+    spec: TaskSpec
+    reported_by: str
+
+
+@dataclass(frozen=True)
 class StopOrphan:
     node: str
-    task_id: int
+    task_id: str
     epoch: int
     reason: str
 
 
 @dataclass(frozen=True)
 class FailTask:
-    task_id: int
+    task_id: str
     expected_epoch: int
     error_code: str
     message: str
 
 
-Action = Union[ScheduleTask, Reschedule, Dispatch, ConfirmRunning, StopOrphan, FailTask]
+Action = Union[ScheduleTask, Reschedule, Dispatch, ConfirmRunning, AdoptTask, StopOrphan, FailTask]
 
 
 @dataclass
@@ -87,7 +110,7 @@ class LeaderMemory:
     dispatched: dict = field(default_factory=dict)   # (task_id, epoch, node) -> last StartTask sent
     stopped: dict = field(default_factory=dict)      # (node, task_id, epoch) -> last StopTask sent
 
-    def observe(self, records: Mapping[int, TaskRecord], now: float) -> None:
+    def observe(self, records: Mapping[str, TaskRecord], now: float) -> None:
         """Note when each task entered its current (epoch, status); forget removed tasks."""
         for task_id in [t for t in self.observed if t not in records]:
             del self.observed[task_id]
@@ -101,15 +124,15 @@ class LeaderMemory:
         seen = self.observed.get(record.task_id)
         return seen[1] if seen and seen[0] == (record.epoch, record.status) else now
 
-    def note_dispatch(self, task_id: int, epoch: int, node: str, now: float) -> None:
+    def note_dispatch(self, task_id: str, epoch: int, node: str, now: float) -> None:
         self.dispatched[(task_id, epoch, node)] = now
 
-    def note_stop(self, node: str, task_id: int, epoch: int, now: float) -> None:
+    def note_stop(self, node: str, task_id: str, epoch: int, now: float) -> None:
         self.stopped[(node, task_id, epoch)] = now
 
-    def prune(self, records: Mapping[int, TaskRecord]) -> None:
+    def prune(self, records: Mapping[str, TaskRecord]) -> None:
         """Drop send timestamps that refer to epochs the table has moved past."""
-        def live(task_id: int, epoch: int) -> bool:
+        def live(task_id: str, epoch: int) -> bool:
             record = records.get(task_id)
             return record is not None and not record.terminal and record.epoch == epoch
 
@@ -122,16 +145,17 @@ def _due(last: float | None, now: float, period: float) -> bool:
 
 
 def reconcile(
-    records: Mapping[int, TaskRecord],
+    records: Mapping[str, TaskRecord],
     online: Mapping[str, NodeView],
     memory: LeaderMemory,
     now: float,
     config: ReconcileConfig,
 ) -> list[Action]:
-    actions: list[Action] = []
+    adoptions, rejected = _adoptions(records, online)
+    actions: list[Action] = list(adoptions.values())
     for task_id in sorted(records):
         record = records[task_id]
-        if record.terminal:
+        if record.terminal or task_id in adoptions:
             continue
         since = memory.since(record, now)
         if record.status == c.PENDING:
@@ -142,8 +166,40 @@ def reconcile(
                 actions.append(ScheduleTask(task_id, record.epoch))
             continue
         actions.extend(_check_placement(record, online, memory, now, since, config))
-    actions.extend(_orphans(records, online, memory, now, config))
+    actions.extend(_orphans(records, online, memory, now, config, adoptions, rejected))
     return actions
+
+
+def _adoptions(records, online) -> tuple[dict, dict]:
+    """Running copies newer than the table: {task_id: AdoptTask}, {task_id: reason not to adopt}."""
+    copies: dict[str, list[tuple[str, TaskStateView]]] = {}
+    for name in sorted(online):
+        for state in online[name].running_tasks:
+            record = records.get(state.task_id)
+            if record is None or (not record.terminal and state.epoch > record.epoch):
+                copies.setdefault(state.task_id, []).append((name, state))
+    owners = {r.idempotency_key: r.task_id for r in records.values()}
+    adoptions, rejected = {}, {}
+    for task_id, found in sorted(copies.items()):
+        epoch = max(state.epoch for _, state in found)
+        newest = [(node, state) for node, state in found if state.epoch == epoch]
+        node, winner = min(newest, key=lambda copy: (copy[1].role != c.ROLE_PRIMARY or copy[0] != copy[1].primary,
+                                                     copy[0]))
+        owner = owners.get(winner.idempotency_key)
+        if owner is not None and owner != task_id:
+            rejected[task_id] = "duplicate of task %s" % owner
+            continue
+        try:
+            spec = TaskSpec.from_json(winner.spec_json)
+        except ValueError as exc:
+            rejected[task_id] = "unreadable spec: %s" % exc
+            continue
+        primary = winner.primary or node
+        helpers = {h for _, state in newest for h in state.helpers}
+        helpers |= {n for n, state in newest if state.role == c.ROLE_HELPER}
+        adoptions[task_id] = AdoptTask(task_id, epoch, primary, tuple(sorted(helpers - {primary})),
+                                       winner.idempotency_key, winner.name, spec, node)
+    return adoptions, rejected
 
 
 def _check_placement(record, online, memory, now, since, config) -> list[Action]:
@@ -171,16 +227,20 @@ def _check_placement(record, online, memory, now, since, config) -> list[Action]
     return actions
 
 
-def _orphans(records, online, memory, now, config) -> list[Action]:
+def _orphans(records, online, memory, now, config, adoptions, rejected) -> list[Action]:
     actions: list[Action] = []
     for name in sorted(online):
         for running in online[name].running_tasks:
+            if running.task_id in adoptions:
+                continue          # adopted this round; losing copies are stopped next round
             record = records.get(running.task_id)
-            if record is None:
+            if running.task_id in rejected:
+                reason = rejected[running.task_id]
+            elif record is None:
                 reason = "unknown task"
             elif record.terminal:
                 reason = "task %s" % record.status.lower()
-            elif record.epoch != running.epoch:
+            elif running.epoch < record.epoch:
                 reason = "epoch %d superseded by %d" % (running.epoch, record.epoch)
             elif name not in record.nodes:
                 reason = "not assigned to %s" % name

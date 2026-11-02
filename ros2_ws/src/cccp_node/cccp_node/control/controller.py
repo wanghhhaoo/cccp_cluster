@@ -1,10 +1,10 @@
 """Cluster leader control loop: scheduling, dispatch and reconciliation.
 
-Runs on every node and does nothing unless the node is the Raft leader. After
-each election it first commits a Barrier, so the local replica holds every
-task committed under earlier leaders, then waits warmup_s so ClusterView has
-heard from all live nodes. Acting earlier would treat running tasks as
-unknown orphans and stop them.
+Runs on every node and does nothing unless the election says this node leads.
+Each time it becomes leader for a new term it starts from an empty task table
+and waits warmup_s, so ClusterView holds the NodeStatus of every live node;
+the first reconciliation then adopts every running task from those reports
+(CONVENTIONS 5.3). Until then the gateway refuses new tasks.
 
 The controller owns no ROS objects: StartTask/StopTask go through the
 Dispatcher protocol, TaskReports arrive through report(), and the clock is
@@ -20,16 +20,17 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Protocol
 
-from ..consensus.base import Consensus
 from ..core import constants as c
 from ..core.cluster_view import ClusterView
+from ..core.election import Leadership
 from ..core.reconciler import (
-    ConfirmRunning, Dispatch, FailTask, LeaderMemory, ReconcileConfig, Reschedule, ScheduleTask, StopOrphan,
-    reconcile,
+    AdoptTask, ConfirmRunning, Dispatch, FailTask, LeaderMemory, ReconcileConfig, Reschedule, ScheduleTask,
+    StopOrphan, reconcile,
 )
 from ..core.scheduler import SchedulerConfig, schedule
 from ..core.task_spec import TaskSpec
-from ..core.task_table import Assign, Barrier, MarkFailed, Prune, ReportStatus, Requeue, TaskRecord
+from ..core.task_table import Adopt, Assign, MarkFailed, Prune, ReportStatus, Requeue, TaskRecord
+from .task_store import TaskStore
 
 log = logging.getLogger(__name__)
 
@@ -40,11 +41,13 @@ PERMANENT_START_ERRORS = frozenset({c.INVALID_INPUT, c.UNSUPPORTED_VERSION})
 @dataclass(frozen=True)
 class StartRequest:
     term: int
-    task_id: int
+    task_id: str
     epoch: int
     role: str
     primary_node: str
     helper_nodes: tuple[str, ...]
+    idempotency_key: str
+    name: str
     spec: TaskSpec
 
 
@@ -55,10 +58,15 @@ class DispatchResult:
     message: str = ""
 
 
+class LeadershipSource(Protocol):
+    @property
+    def state(self) -> Leadership: ...
+
+
 class Dispatcher(Protocol):
     def start(self, node: str, request: StartRequest) -> DispatchResult: ...
 
-    def stop(self, node: str, term: int, task_id: int, epoch: int, reason: str) -> DispatchResult: ...
+    def stop(self, node: str, term: int, task_id: str, epoch: int, reason: str) -> DispatchResult: ...
 
 
 @dataclass(frozen=True)
@@ -66,7 +74,7 @@ class TaskReportView:
     """A /cluster/task_report message."""
 
     node_name: str
-    task_id: int
+    task_id: str
     epoch: int
     state: str
     error_code: str = ""
@@ -81,8 +89,8 @@ class ControllerConfig:
     reconcile: ReconcileConfig = field(default_factory=ReconcileConfig)
     reconcile_period_s: float = 1.0
     warmup_s: float = 5.0                 # = node_offline_timeout_s (CONVENTIONS 5.6)
-    submit_timeout_s: float = 5.0
     avoid_failed_node_s: float = 60.0     # do not retry a node that failed to start the task
+    max_input_stalls: int = 3             # primaries whose input stopped before the task is failed
     prune_terminal_after_s: float = 3600.0
 
 
@@ -90,7 +98,8 @@ class LeaderController:
     def __init__(
         self,
         node_name: str,
-        consensus: Consensus,
+        store: TaskStore,
+        election: LeadershipSource,
         cluster: ClusterView,
         dispatcher: Dispatcher,
         config: ControllerConfig = ControllerConfig(),
@@ -98,7 +107,8 @@ class LeaderController:
         wall_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     ):
         self.node_name = node_name
-        self._consensus = consensus
+        self._store = store
+        self._election = election
         self._cluster = cluster
         self._dispatcher = dispatcher
         self._config = config
@@ -110,7 +120,8 @@ class LeaderController:
         self._ready_at = 0.0
         self._last_reconcile = float("-inf")
         self._memory = LeaderMemory()
-        self._failures: dict[int, dict[str, float]] = {}   # task_id -> node -> when start failed
+        self._failures: dict[str, dict[str, float]] = {}   # task_id -> node -> when start failed
+        self._stalls: Counter = Counter()                   # task_id -> primaries whose input stopped
 
     # ------------------------------------------------------------- inputs
     def report(self, report: TaskReportView) -> None:
@@ -120,9 +131,14 @@ class LeaderController:
     # ---------------------------------------------------------------- loop
     @property
     def active(self) -> bool:
-        """True while this node is a ready leader past its warm-up."""
-        return (self._ready_term != 0 and self._ready_term == self._consensus.term()
-                and self._consensus.is_leader() and self._clock() - self._ready_at >= self._config.warmup_s)
+        """True while this node is the leader past its warm-up: it then owns the task table."""
+        state = self._election.state
+        return (state.is_self and self._ready_term == state.term
+                and self._clock() - self._ready_at >= self._config.warmup_s)
+
+    @property
+    def term(self) -> int:
+        return self._ready_term
 
     def run(self, stop: threading.Event, period_s: float = 0.1) -> None:
         while not stop.is_set():
@@ -146,23 +162,22 @@ class LeaderController:
             self._reconcile(now)
 
     def _ensure_leadership(self) -> bool:
-        if not self._consensus.is_leader():
+        state = self._election.state
+        if not state.is_self:
             if self._ready_term:
-                log.info("no longer leader (term %d)", self._ready_term)
+                log.info("no longer leader (term %d), now following %s term %d",
+                         self._ready_term, state.leader or "nobody", state.term)
                 self._ready_term = 0
             return False
-        term = self._consensus.term()
-        if self._ready_term == term:
+        if self._ready_term == state.term:
             return True
-        barrier = self._consensus.submit(Barrier(term), self._config.submit_timeout_s)
-        if not barrier.ok:
-            log.warning("leader barrier for term %d failed: %s", term, barrier.message)
-            return False
-        self._ready_term, self._ready_at = term, self._clock()
+        self._store.reset()          # rebuilt from executor reports after the warm-up
+        self._ready_term, self._ready_at = state.term, self._clock()
         self._memory = LeaderMemory()
         self._failures.clear()
-        log.info("leader for term %d with %d tasks; acting after %.1f s warm-up",
-                 term, len(self._consensus.records()), self._config.warmup_s)
+        self._stalls.clear()
+        log.info("leader for term %d; adopting running tasks after %.1f s warm-up",
+                 state.term, self._config.warmup_s)
         return True
 
     def _drain_reports(self, apply: bool) -> None:
@@ -175,25 +190,51 @@ class LeaderController:
             if report.seq and report.seq <= self._last_report_seq.get(key, 0):
                 continue
             self._last_report_seq[key] = report.seq
-            if apply:
+            if apply and not self._requeue_stalled(report):
                 result = self._submit(ReportStatus(report.node_name, report.task_id, report.epoch, report.state,
                                                    report.error_code, report.message, self._wall_ms()))
                 if not result.ok and result.error_code != c.STALE_EPOCH:
-                    log.warning("task=%d epoch=%d node=%s report %s not applied: %s", report.task_id,
+                    log.warning("task=%s epoch=%d node=%s report %s not applied: %s", report.task_id,
                                 report.epoch, report.node_name, report.state, result.message)
+
+    def _requeue_stalled(self, report: TaskReportView) -> bool:
+        """The primary got no input frames for a while (NOT_READY, CONVENTIONS 5.5): the input may
+        still be reachable from another node, so move the task there, avoiding this node. Fails the
+        task (by not handling the report) after max_input_stalls primaries, or when it is pinned."""
+        if report.state != c.REPORT_FAILED or report.error_code != c.NOT_READY:
+            return False
+        record = self._store.get(report.task_id)
+        if (record is None or record.terminal or record.epoch != report.epoch
+                or record.primary != report.node_name or record.spec.request_node):
+            return False
+        self._stalls[record.task_id] += 1
+        if self._stalls[record.task_id] >= self._config.max_input_stalls:
+            return False
+        self._failures.setdefault(record.task_id, {})[report.node_name] = self._clock()
+        self._submit(Requeue(record.task_id, record.epoch, "%s (%d/%d)" % (
+            report.message or "no input on %s" % report.node_name, self._stalls[record.task_id],
+            self._config.max_input_stalls), self._wall_ms()))
+        return True
 
     # ------------------------------------------------------------ reconcile
     def _reconcile(self, now: float) -> None:
-        records = self._consensus.records()
+        records = self._store.records()
         online = self._cluster.online(now)
         self._memory.observe(records, now)
         self._memory.prune(records)
         for action in reconcile(records, online, self._memory, now, self._config.reconcile):
-            record = records.get(getattr(action, "task_id", 0))
-            if isinstance(action, ScheduleTask):
+            record = records.get(getattr(action, "task_id", ""))
+            if isinstance(action, AdoptTask):
+                result = self._submit(Adopt(action.task_id, action.idempotency_key, action.name, action.spec,
+                                            action.epoch, action.primary, action.helpers, action.reported_by,
+                                            self._wall_ms()))
+                if result.ok:
+                    log.info("task=%s epoch=%d adopted from %s (primary %s)", action.task_id, action.epoch,
+                             action.reported_by, action.primary)
+            elif isinstance(action, ScheduleTask):
                 self._place(record, online, now)
             elif isinstance(action, Reschedule):
-                log.info("task=%d epoch=%d reschedule: %s", action.task_id, action.expected_epoch, action.reason)
+                log.info("task=%s epoch=%d reschedule: %s", action.task_id, action.expected_epoch, action.reason)
                 self._place(record, online, now, reason=action.reason)
             elif isinstance(action, Dispatch):
                 self._start(record, action.node, now)
@@ -223,15 +264,15 @@ class LeaderController:
                 self._submit(Requeue(record.task_id, record.epoch, "%s; %s" % (reason, result.message),
                                      self._wall_ms()))
             else:
-                log.debug("task=%d still pending: %s", record.task_id, result.message)
+                log.debug("task=%s still pending: %s", record.task_id, result.message)
             return
         placement = result.placement
         assigned = self._submit(Assign(record.task_id, record.epoch, placement.primary, placement.helpers,
                                        self._wall_ms()))
         if not assigned.ok:
             return
-        updated = self._consensus.get(record.task_id)
-        log.info("task=%d epoch=%d term=%d scheduled primary=%s helpers=%s", updated.task_id, updated.epoch,
+        updated = self._store.get(record.task_id)
+        log.info("task=%s epoch=%d term=%d scheduled primary=%s helpers=%s", updated.task_id, updated.epoch,
                  self._ready_term, updated.primary, ",".join(updated.helpers) or "-")
         for node in updated.nodes:      # commit first, then dispatch (CONVENTIONS 5.3)
             if not self._start(updated, node, now):
@@ -241,11 +282,11 @@ class LeaderController:
         role = c.ROLE_PRIMARY if node == record.primary else c.ROLE_HELPER
         self._memory.note_dispatch(record.task_id, record.epoch, node, now)
         request = StartRequest(self._ready_term, record.task_id, record.epoch, role, record.primary,
-                               record.helpers if role == c.ROLE_PRIMARY else (), record.spec)
+                               record.helpers, record.idempotency_key, record.name, record.spec)
         result = self._dispatcher.start(node, request)
         if result.success:
             return True
-        log.warning("task=%d epoch=%d node=%s start failed: %s %s", record.task_id, record.epoch, node,
+        log.warning("task=%s epoch=%d node=%s start failed: %s %s", record.task_id, record.epoch, node,
                     result.error_code, result.message)
         if result.error_code == c.STALE_TERM:
             return False                # a newer leader exists; it will take over
@@ -261,10 +302,10 @@ class LeaderController:
         self._memory.note_stop(action.node, action.task_id, action.epoch, now)
         result = self._dispatcher.stop(action.node, self._ready_term, action.task_id, action.epoch, action.reason)
         if not result.success:
-            log.warning("task=%d epoch=%d node=%s stop failed: %s", action.task_id, action.epoch,
+            log.warning("task=%s epoch=%d node=%s stop failed: %s", action.task_id, action.epoch,
                         action.node, result.message)
 
-    def _prune(self, records: Mapping[int, TaskRecord], now: float) -> None:
+    def _prune(self, records: Mapping[str, TaskRecord], now: float) -> None:
         old = tuple(sorted(
             task_id for task_id, record in records.items()
             if record.terminal and now - self._memory.since(record, now) >= self._config.prune_terminal_after_s))
@@ -272,21 +313,23 @@ class LeaderController:
             self._submit(Prune(old))
         for task_id in [t for t in self._failures if t not in records or records[t].terminal]:
             del self._failures[task_id]
+        for task_id in [t for t in self._stalls if t not in records or records[t].terminal]:
+            del self._stalls[task_id]
 
     # -------------------------------------------------------------- helpers
-    def _assigned_counts(self, exclude: int) -> Counter:
+    def _assigned_counts(self, exclude: str) -> Counter:
         counts: Counter = Counter()
-        for record in self._consensus.records().values():
+        for record in self._store.records().values():
             if not record.terminal and record.task_id != exclude:
                 counts.update(record.nodes)
         return counts
 
-    def _recent_failures(self, task_id: int, now: float) -> set[str]:
+    def _recent_failures(self, task_id: str, now: float) -> set[str]:
         failed = self._failures.get(task_id, {})
         return {node for node, when in failed.items() if now - when < self._config.avoid_failed_node_s}
 
     def _submit(self, command):
-        result = self._consensus.submit(command, self._config.submit_timeout_s)
+        result = self._store.apply(command)
         if not result.ok and result.error_code not in (c.STALE_EPOCH, c.INVALID_STATE):
             log.warning("%s not applied: %s %s", type(command).__name__, result.error_code, result.message)
         return result

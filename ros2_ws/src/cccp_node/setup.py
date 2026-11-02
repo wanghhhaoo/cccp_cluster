@@ -11,11 +11,11 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
     ],
-    install_requires=["setuptools", "pysyncobj", "pyyaml"],
+    install_requires=["setuptools"],
     zip_safe=False,
     maintainer="CCCP Team",
     maintainer_email="comp@example.com",
-    description="CCCP cluster node: replicated task table, leader control plane, gateway and resource monitor.",
+    description="CCCP cluster node: leader election, leader control plane, gateway and resource monitor.",
     license="Proprietary",
     tests_require=["pytest"],
     entry_points={

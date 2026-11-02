@@ -23,16 +23,23 @@ class LinkView:
 
 
 @dataclass(frozen=True)
-class RunningTaskView:
-    task_id: int
+class TaskStateView:
+    """One task an executor reports running (TaskState.msg): enough to rebuild the leader's table."""
+
+    task_id: str
     epoch: int
     role: str
+    primary: str = ""
+    helpers: tuple[str, ...] = ()
+    idempotency_key: str = ""
+    name: str = ""
+    spec_json: str = ""
 
 
 @dataclass(frozen=True)
 class NodeView:
     name: str
-    protocol_version: int = 1
+    protocol_version: int = 2
     incarnation: int = 0
     seq: int = 0
     leader_name: str = ""
@@ -50,7 +57,7 @@ class NodeView:
     gpu_usage: float = -1.0
     gpu_mem_usage: float = -1.0
     battery: float = -1.0
-    running_tasks: tuple[RunningTaskView, ...] = ()
+    running_tasks: tuple[TaskStateView, ...] = ()
     links: tuple[LinkView, ...] = ()
 
     def link_to(self, peer: str) -> LinkView | None:
@@ -59,7 +66,7 @@ class NodeView:
                 return link
         return None
 
-    def runs(self, task_id: int, epoch: int) -> bool:
+    def runs(self, task_id: str, epoch: int) -> bool:
         return any(t.task_id == task_id and t.epoch == epoch for t in self.running_tasks)
 
 

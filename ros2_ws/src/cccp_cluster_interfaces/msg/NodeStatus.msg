@@ -1,11 +1,12 @@
 # /cluster/node_status：每个节点按 1 Hz 发布，所有节点都订阅。
-# 一条消息同时承担：资源上报、存活心跳、链路测量（丢包看 seq 缺口，RTT 看 links 里的回显）、
-# 任务对账（running_tasks）。
+# 一条消息同时承担：资源上报、存活心跳、选主（leader_name/term/is_leader）、
+# 链路测量（丢包看 seq 缺口，RTT 看 links 里的回显）、任务上报（tasks）。
 # QoS：BEST_EFFORT + KEEP_LAST(1) + VOLATILE，见开发规范 3.3。
 
 # 接口协议版本。cccp_* 接口包有不兼容修改时 +1。
+# 2：task_id 改为 UUID 字符串；running_tasks 改为 tasks（TaskState）；选主不再使用 Raft。
 # 集群主节点不向 protocol_version 与自己不同的节点派发任务。
-uint16 PROTOCOL_VERSION=1
+uint16 PROTOCOL_VERSION=2
 uint16 protocol_version
 
 # ---- 身份与序号 ----
@@ -14,10 +15,10 @@ uint64 incarnation                # 本进程启动时的 Unix 毫秒；变化�
 uint64 seq                        # 每次发布 +1，从 1 开始；incarnation 变化后重新计数
 builtin_interfaces/Time stamp     # 发送方本地时间，只用于显示，不得与其他节点的时间相减
 
-# ---- 本节点看到的集群状态 ----
-string leader_name                # 本节点认为的集群主节点；未知时为空
-uint64 term                       # 本节点已知的最大 Raft 任期
-bool is_leader
+# ---- 选主（开发规范 5.1）：每个节点都广播自己认可的集群主节点 ----
+string leader_name                # 本节点认可的集群主节点；未知时为空
+uint64 term                       # 本节点已知的最大任期
+bool is_leader                    # true 即本节点声明自己是集群主节点；同时也是它的续约
 
 # ---- 就绪状态 ----
 bool inference_ready              # 推理服务整体可用
@@ -38,7 +39,7 @@ float32 gpu_mem_usage             # 0~100
 float32 battery                   # 0~1；非无人机节点填 -1
 
 # ---- 任务 ----
-RunningTask[] running_tasks       # 本节点当前正在执行的全部任务，集群主节点据此每秒对账
+TaskState[] tasks                 # 本节点当前正在执行的全部任务；集群主节点据此对账，换主后据此重建任务表
 
 # ---- 链路：本节点对每个已知邻居的测量 ----
 LinkQuality[] links

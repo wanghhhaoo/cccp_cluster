@@ -9,8 +9,8 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable
 
 from ..control.controller import StartRequest, TaskReportView
-from ..control.gateway import CreateReply
-from ..core.cluster_view import LinkView, NodeView, RunningTaskView
+from ..control.gateway import CreateReply, DestroyReply, QueryReply
+from ..core.cluster_view import LinkView, NodeView, TaskStateView
 from ..core.link_estimator import LinkReport
 from ..core.task_spec import TaskSpec
 from ..core.task_table import StatusEvent, TaskRecord
@@ -45,9 +45,20 @@ def node_view_from_msg(msg: Any) -> NodeView:
         gpu_usage=msg.gpu_usage,
         gpu_mem_usage=msg.gpu_mem_usage,
         battery=msg.battery,
-        running_tasks=tuple(RunningTaskView(t.task_id, t.epoch, t.role) for t in msg.running_tasks),
+        running_tasks=tuple(task_state_from_msg(t) for t in msg.tasks),
         links=tuple(LinkView(l.peer_name, l.rtt_ms, l.jitter_ms, l.loss_rate) for l in msg.links),
     )
+
+
+def task_state_from_msg(msg: Any) -> TaskStateView:
+    return TaskStateView(msg.task_id, msg.epoch, msg.role, msg.primary_node, tuple(msg.helper_nodes),
+                         msg.idempotency_key, msg.name, msg.spec_json)
+
+
+def fill_task_state(msg: Any, state: TaskStateView) -> Any:
+    return _set(msg, task_id=state.task_id, epoch=state.epoch, role=state.role, primary_node=state.primary,
+                helper_nodes=list(state.helpers), idempotency_key=state.idempotency_key, name=state.name,
+                spec_json=state.spec_json)
 
 
 def echo_for(msg: Any, me: str) -> tuple[int, int] | None:
@@ -67,8 +78,7 @@ def fill_node_status(msg: Any, view: NodeView, links: Iterable[LinkReport],
         setattr(msg, name, getattr(view, name))
     msg.node_name = view.name
     msg.algorithms_ready = list(view.algorithms_ready)
-    msg.running_tasks = [_set(task_factory(), task_id=t.task_id, epoch=t.epoch, role=t.role)
-                         for t in view.running_tasks]
+    msg.tasks = [fill_task_state(task_factory(), t) for t in view.running_tasks]
     msg.links = [_set(link_factory(), peer_name=r.peer_name, rtt_ms=float(r.rtt_ms), jitter_ms=float(r.jitter_ms),
                       loss_rate=float(r.loss_rate), echo_seq=r.echo_seq, echo_delay_ms=r.echo_delay_ms)
                  for r in links]
@@ -89,15 +99,51 @@ def spec_from_request(request: Any) -> TaskSpec:
     return TaskSpec(target_nodes=tuple(request.target_nodes), **values)
 
 
+def fill_create_request(request: Any, spec: TaskSpec, idempotency_key: str) -> Any:
+    """TaskSpec -> CreateTask.Request, for forwarding to the leader."""
+    _set(request, idempotency_key=idempotency_key, target_nodes=list(spec.target_nodes))
+    return _set(request, **{name: getattr(spec, name) for name in SPEC_FIELDS})
+
+
+def create_reply_from_response(response: Any) -> CreateReply:
+    return CreateReply(response.success, response.error_code, response.message, response.task_id,
+                       response.duplicate, response.assigned_node, tuple(response.dispatched_nodes),
+                       tuple(response.candidate_nodes))
+
+
+def destroy_reply_from_response(response: Any) -> DestroyReply:
+    return DestroyReply(response.success, response.error_code, response.message, response.final_status)
+
+
+def query_reply_from_response(response: Any, task_id: str) -> QueryReply:
+    """QueryTask.Response -> QueryReply with the fields QueryTask carries (spec details are not included)."""
+    if not response.success:
+        return QueryReply(False, response.error_code, response.message)
+    nodes = list(response.target_nodes)
+    spec = TaskSpec(task_type=response.task_type, mode=response.mode or "local",
+                    origin=response.origin or "manual", parent_task_id=response.parent_task_id)
+    record = TaskRecord(task_id=task_id, idempotency_key="", spec=spec, name=response.name, status=response.status,
+                        epoch=response.epoch, primary=response.node,
+                        helpers=tuple(n for n in nodes if n != response.node),
+                        error_message=response.error_message, last_event=response.last_event)
+    return QueryReply(True, message=response.message, record=record)
+
+
 def fill_create_response(response: Any, reply: CreateReply) -> Any:
     return _set(response, success=reply.success, error_code=reply.error_code, message=reply.message,
                 task_id=reply.task_id, duplicate=reply.duplicate, assigned_node=reply.assigned_node,
                 dispatched_nodes=list(reply.dispatched_nodes), candidate_nodes=list(reply.candidate_nodes))
 
 
-def fill_query_response(response: Any, record: TaskRecord | None, task_id: int, not_found_code: str) -> Any:
+def fill_destroy_response(response: Any, reply: DestroyReply) -> Any:
+    return _set(response, success=reply.success, error_code=reply.error_code, message=reply.message,
+                final_status=reply.final_status)
+
+
+def fill_query_response(response: Any, reply: QueryReply) -> Any:
+    record = reply.record
     if record is None:
-        return _set(response, success=False, error_code=not_found_code, message="task %d does not exist" % task_id)
+        return _set(response, success=False, error_code=reply.error_code, message=reply.message)
     return _set(
         response, success=True, error_code="", message="ok", name=record.name, task_type=record.spec.task_type,
         mode=record.spec.mode, status=record.status, node=record.primary, target_nodes=list(record.nodes),
@@ -117,12 +163,9 @@ def report_from_msg(msg: Any) -> TaskReportView:
 
 
 def fill_start_request(request: Any, start: StartRequest) -> Any:
-    spec = start.spec
     return _set(request, term=start.term, task_id=start.task_id, epoch=start.epoch, role=start.role,
-                primary_node=start.primary_node, helper_nodes=list(start.helper_nodes), task_type=spec.task_type,
-                mode=spec.mode, min_participants=spec.min_participants, input=spec.input,
-                drone_id=spec.drone_id, level=spec.level,
-                image_topic=spec.image_topic, params_json=spec.params_json)
+                primary_node=start.primary_node, helper_nodes=list(start.helper_nodes),
+                idempotency_key=start.idempotency_key, name=start.name, spec_json=start.spec.to_json())
 
 
 def result_to_dict(msg: Any) -> dict:

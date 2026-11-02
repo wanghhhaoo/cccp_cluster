@@ -12,7 +12,10 @@ a newer epoch replaces the running session.
 
 Frames that arrive while a task's previous frame is still being processed are
 skipped, so each task always works on the latest frame and PKCT receives its
-frames strictly in order.
+frames strictly in order. A primary that receives no frame at all for
+input_timeout seconds reports the task Failed with NOT_READY: its input is
+unreachable from this node, and the leader may move it (CONVENTIONS 5.5).
+Helpers do not check, since only the primary's reports drive the task state.
 """
 import json
 import time
@@ -23,7 +26,7 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage, Image
 
-from cccp_cluster_interfaces.msg import ExecutorStatus, RunningTask
+from cccp_cluster_interfaces.msg import ExecutorStatus, TaskState
 from cccp_task_interfaces.msg import TaskReport, TaskResult
 from cccp_task_interfaces.srv import StartTask, StopTask
 from collab_inference_interfaces.srv import Classify, InitTracker, ResetTracker, Track
@@ -32,6 +35,7 @@ from cccp_node import names
 from cccp_node.core import constants as c
 from cccp_node.core.execution_guard import NOOP, REJECT, RESTART, STOP, ExecutionGuard
 from cccp_node.core.input_source import FETCH_EACH, parse_input, plan_input
+from cccp_node.core.task_spec import TaskSpec
 from cccp_node.ros import qos
 
 from .airsim_common import AirSimClient
@@ -62,12 +66,12 @@ def parse_params(task_type, params_json):
 
 def tracker_id(task_id, epoch):
     """PKCT sessions are isolated per task and epoch (CONVENTIONS 4.1)."""
-    return "task-%d-%d" % (task_id, epoch)
+    return "task-%s-%d" % (task_id, epoch)
 
 
 @dataclass
 class ActiveTask:
-    task_id: int
+    task_id: str
     epoch: int
     role: str
     task_type: str
@@ -76,6 +80,11 @@ class ActiveTask:
     image_topic: str             # topic actually subscribed (see input_source.plan_input)
     params: dict
     tracker_id: str = ""
+    primary: str = ""
+    helpers: tuple = ()
+    idempotency_key: str = ""
+    name: str = ""
+    spec_json: str = ""          # reported back in TaskState so a new leader can rebuild its table
     input: str = ""
     compressed: bool = False
     fetch: tuple = None          # (vehicle, camera) of the AirSim feed this task holds
@@ -84,6 +93,7 @@ class ActiveTask:
     frames: int = 0
     failures: int = 0
     reported_first_result: bool = False
+    last_input: float = 0.0      # time.monotonic() of the start or of the last frame received
 
 
 class TaskExecutor(Node):
@@ -95,6 +105,7 @@ class TaskExecutor(Node):
         self.declare_parameter("image_topic", "camera/image")
         self.declare_parameter("publish_annotated", True)
         self.declare_parameter("max_consecutive_failures", 10)
+        self.declare_parameter("input_timeout", 10.0)         # no frame this long: report NOT_READY; 0 disables
         self.declare_parameter("service_wait_timeout", 2.0)
         self.declare_parameter("status_period", 1.0)
         self.declare_parameter("airsim_host", "")             # empty: airsim:// inputs are not served here
@@ -109,6 +120,7 @@ class TaskExecutor(Node):
         self._default_topic = self.get_parameter("image_topic").value
         self._publish_annotated = bool(self.get_parameter("publish_annotated").value)
         self._max_failures = int(self.get_parameter("max_consecutive_failures").value)
+        self._input_timeout = float(self.get_parameter("input_timeout").value)
         self._wait_timeout = float(self.get_parameter("service_wait_timeout").value)
         self._incarnation = int(time.time() * 1000)
         self._status_seq = 0
@@ -140,6 +152,8 @@ class TaskExecutor(Node):
         self.create_service(StartTask, names.EXEC_START_SERVICE, self._on_start)
         self.create_service(StopTask, names.EXEC_STOP_SERVICE, self._on_stop)
         self.create_timer(float(self.get_parameter("status_period").value), self._publish_status)
+        if self._input_timeout > 0:
+            self.create_timer(min(1.0, self._input_timeout / 2), self._check_inputs)
         self.get_logger().info("task executor ready (node_name=%s, image_topic=%s)"
                                % (self._node_name, self._default_topic))
 
@@ -155,8 +169,10 @@ class TaskExecutor(Node):
         msg.seq = self._status_seq
         msg.algorithms_ready = self._algorithms_ready()
         msg.inference_ready = bool(msg.algorithms_ready)
-        msg.running_tasks = [RunningTask(task_id=t.task_id, epoch=t.epoch, role=t.role)
-                             for t in sorted(self._tasks.values(), key=lambda t: t.task_id)]
+        msg.tasks = [TaskState(task_id=t.task_id, epoch=t.epoch, role=t.role, primary_node=t.primary,
+                               helper_nodes=list(t.helpers), idempotency_key=t.idempotency_key, name=t.name,
+                               spec_json=t.spec_json)
+                     for t in sorted(self._tasks.values(), key=lambda t: t.task_id)]
         msg.max_term = self._guard.max_term
         self._status.publish(msg)
 
@@ -176,46 +192,53 @@ class TaskExecutor(Node):
 
     # ------------------------------------------------------------------ services
     def _on_start(self, request, response):
-        decision = self._guard.on_start(int(request.term), int(request.task_id), int(request.epoch))
+        decision = self._guard.on_start(int(request.term), request.task_id, int(request.epoch))
         response.success = decision.success
         response.error_code = decision.error_code
         response.message = decision.message
         if decision.action in (REJECT, NOOP):
             return response
         try:
-            task_type = request.task_type.strip().upper()
+            spec = TaskSpec.from_json(request.spec_json)
+            task_type = spec.task_type.strip().upper()
             if task_type not in TASK_TYPES:
                 raise ValueError("task_type must be PKCI or PKCT")
-            if request.task_id <= 0 or request.epoch <= 0:
-                raise ValueError("task_id and epoch must be positive")
-            params = parse_params(task_type, request.params_json)
+            if not request.task_id or request.epoch <= 0:
+                raise ValueError("task_id must be set and epoch positive")
+            params = parse_params(task_type, spec.params_json)
             unavailable = self._backend.wait_ready(task_type, self._wait_timeout)
             if unavailable:
                 response.success, response.error_code, response.message = False, c.NOT_READY, unavailable
                 return response
             role = request.role or c.ROLE_PRIMARY
-            plan = plan_input(parse_input(request.input), node_name=self._node_name,
-                              default_topic=self._default_topic, image_topic=request.image_topic.strip(),
+            plan = plan_input(parse_input(spec.input), node_name=self._node_name,
+                              default_topic=self._default_topic, image_topic=spec.image_topic.strip(),
                               role=role, primary_node=request.primary_node, airsim_mode=self._airsim_mode)
             if plan.fetch and self._feeds is None:
                 response.success, response.error_code = False, c.NOT_READY
-                response.message = "%s cannot read %s: airsim_host is not set" % (self._node_name, request.input)
+                response.message = "%s cannot read %s: airsim_host is not set" % (self._node_name, spec.input)
                 return response
             if decision.action == RESTART:
-                self._remove(self._tasks[int(request.task_id)], c.REPORT_STOPPED, "replaced by a newer epoch")
+                self._remove(self._tasks[request.task_id], c.REPORT_STOPPED, "replaced by a newer epoch")
             task = ActiveTask(
-                task_id=int(request.task_id),
+                task_id=request.task_id,
                 epoch=int(request.epoch),
                 role=role,
                 task_type=task_type,
-                drone_id=int(request.drone_id),
-                level=request.level or "full",
+                drone_id=int(spec.drone_id),
+                level=spec.level or "full",
                 image_topic=plan.topic,
                 params=params,
-                tracker_id=tracker_id(int(request.task_id), int(request.epoch)),
-                input=request.input,
+                tracker_id=tracker_id(request.task_id, int(request.epoch)),
+                primary=request.primary_node,
+                helpers=tuple(request.helper_nodes),
+                idempotency_key=request.idempotency_key,
+                name=request.name,
+                spec_json=request.spec_json,
+                input=spec.input,
                 compressed=plan.compressed,
                 fetch=plan.fetch,
+                last_input=time.monotonic(),
             )
             if task.fetch:
                 self._feeds.acquire(*task.fetch)
@@ -227,22 +250,22 @@ class TaskExecutor(Node):
                 self.resolve_topic_name(task.image_topic))
             self._report(task, c.REPORT_RUNNING, message=message)
             response.success, response.error_code, response.message = True, "", message
-            self.get_logger().info("task=%d epoch=%d term=%d %s" % (task.task_id, task.epoch, request.term, message))
+            self.get_logger().info("task=%s epoch=%d term=%d %s" % (task.task_id, task.epoch, request.term, message))
         except Exception as exc:
             response.success, response.error_code, response.message = False, c.INVALID_INPUT, str(exc)
-            self.get_logger().error("task=%d start failed: %s" % (request.task_id, exc))
+            self.get_logger().error("task=%s start failed: %s" % (request.task_id, exc))
         return response
 
     def _on_stop(self, request, response):
-        decision = self._guard.on_stop(int(request.term), int(request.task_id), int(request.epoch))
+        decision = self._guard.on_stop(int(request.term), request.task_id, int(request.epoch))
         response.success, response.error_code, response.message = decision.success, decision.error_code, \
             decision.message
         if decision.action == STOP:
-            task = self._tasks.get(int(request.task_id))
+            task = self._tasks.get(request.task_id)
             if task is not None:
                 self._remove(task, c.REPORT_STOPPED, request.reason or "stopped by leader")
-                response.message = "task %d epoch %d stopped on %s" % (task.task_id, task.epoch, self._node_name)
-                self.get_logger().info("task=%d epoch=%d %s (%s)" % (task.task_id, task.epoch,
+                response.message = "task %s epoch %d stopped on %s" % (task.task_id, task.epoch, self._node_name)
+                self.get_logger().info("task=%s epoch=%d %s (%s)" % (task.task_id, task.epoch,
                                                                      response.message, request.reason))
         return response
 
@@ -269,8 +292,12 @@ class TaskExecutor(Node):
                 self.get_logger().warning("bad compressed frame on %s: %s" % (topic, exc),
                                           throttle_duration_sec=5.0)
                 return
+        now = time.monotonic()
         for task in list(self._tasks.values()):
-            if task.image_topic != topic or task.busy:
+            if task.image_topic != topic:
+                continue
+            task.last_input = now
+            if task.busy:
                 continue
             task.busy = True
             if task.task_type == "PKCI":
@@ -304,6 +331,17 @@ class TaskExecutor(Node):
         )
         future = self._backend.track(request)
         future.add_done_callback(lambda f: self._on_tracked(task, msg, f))
+
+    def _check_inputs(self):
+        now = time.monotonic()
+        for task in list(self._tasks.values()):
+            idle = now - task.last_input
+            if task.role != c.ROLE_PRIMARY or idle < self._input_timeout:
+                continue
+            reason = "no input frames for %.0f s from %s (%s)" % (
+                idle, task.input or "local camera", self.resolve_topic_name(task.image_topic))
+            self.get_logger().error("task=%s epoch=%d failed: %s" % (task.task_id, task.epoch, reason))
+            self._remove(task, c.REPORT_FAILED, reason, c.NOT_READY)
 
     # ------------------------------------------------------------------ results
     def _new_result(self, task, msg):
@@ -384,18 +422,18 @@ class TaskExecutor(Node):
                 image = self._bridge.cv2_to_imgmsg(annotate(rgb, result), encoding="rgb8")
                 image.header.stamp = msg.header.stamp
                 # frame_id identifies the task: several tasks may share one board.
-                image.header.frame_id = "task_%d" % task.task_id
+                image.header.frame_id = "task_%s" % task.task_id
                 self._result_images.publish(image)
             except Exception as exc:
-                self.get_logger().warning("result image for task %d failed: %s" % (task.task_id, exc))
+                self.get_logger().warning("result image for task %s failed: %s" % (task.task_id, exc))
         if summary and not task.reported_first_result:
             task.reported_first_result = True
-            self.get_logger().info("task=%d epoch=%d first result: %s" % (task.task_id, task.epoch, summary))
+            self.get_logger().info("task=%s epoch=%d first result: %s" % (task.task_id, task.epoch, summary))
 
     def _failure(self, task, reason):
         task.failures += 1
         self.get_logger().warning(
-            "task=%d epoch=%d frame failed (%d/%d): %s"
+            "task=%s epoch=%d frame failed (%d/%d): %s"
             % (task.task_id, task.epoch, task.failures, self._max_failures, reason)
         )
         if not task.initialized and task.task_type == "PKCT":
@@ -403,7 +441,7 @@ class TaskExecutor(Node):
         elif task.failures < self._max_failures:
             return
         self._remove(task, c.REPORT_FAILED, reason, c.INFERENCE_ERROR)
-        self.get_logger().error("task=%d epoch=%d failed: %s" % (task.task_id, task.epoch, reason))
+        self.get_logger().error("task=%s epoch=%d failed: %s" % (task.task_id, task.epoch, reason))
 
     def _remove(self, task, state, message, error_code=""):
         self._tasks.pop(task.task_id, None)
