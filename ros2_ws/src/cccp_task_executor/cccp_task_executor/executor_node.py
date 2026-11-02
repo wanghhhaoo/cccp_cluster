@@ -113,6 +113,7 @@ class TaskExecutor(Node):
         self.declare_parameter("publish_annotated", True)
         self.declare_parameter("max_consecutive_failures", 10)
         self.declare_parameter("input_timeout", 10.0)         # no frame this long: report NOT_READY; 0 disables
+        self.declare_parameter("max_tasks_per_node", 4)       # admission limit; must match the leader's scheduler
         self.declare_parameter("service_wait_timeout", 2.0)
         self.declare_parameter("status_period", 1.0)
         self.declare_parameter("airsim_host", "")             # empty: airsim:// inputs are not served here
@@ -132,7 +133,7 @@ class TaskExecutor(Node):
         self._incarnation = int(time.time() * 1000)
         self._status_seq = 0
         self._report_seq = 0
-        self._guard = ExecutionGuard()
+        self._guard = ExecutionGuard(max_tasks=int(self.get_parameter("max_tasks_per_node").value))
         self._bridge = CvBridge()
         self._tasks = {}
         self._subscriptions_by_topic = {}

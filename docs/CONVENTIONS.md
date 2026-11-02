@@ -207,11 +207,18 @@ QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义�
 
 | 收到的命令 | 处理 |
 |---|---|
+| 命令的目标里没有本节点 | 忽略，不回复，也不记录其中的 `term` |
 | `term` < 已知的最大 `term` | 拒绝，返回 `STALE_TERM` |
 | `StartTask`：同一 `task_id`、同一代次，任务已经在运行 | 返回**成功**（幂等） |
 | `StartTask`：同一 `task_id`、更大的代次 | 先停掉旧会话，再按新代次启动 |
 | `StartTask`：同一 `task_id`、更小的代次 | 拒绝，返回 `STALE_EPOCH` |
+| `StartTask`：本节点**实际**运行的其他任务数（不含同一 `task_id` 的旧会话）已达 `max_tasks_per_node` | 拒绝，返回 `BUSY` |
+| `StopTask`：本节点运行的代次不大于命令里的代次 | 停止 |
+| `StopTask`：本节点运行的代次比命令里的新 | 拒绝，返回 `STALE_EPOCH`，不停新会话 |
 | `StopTask`：任务本来就不在运行 | 返回成功（幂等） |
+| `StopTask` 的原因是销毁（cancel），且没有被拒绝 | 无论任务是否在运行，都留一条墓碑：保留 `tombstone_ttl_s`（600 秒），最多 16 条 |
+
+执行器自己做准入检查，是因为调度器按任务表统计的任务数在两个集群主节点并存、刚换主、或有残留副本时可能是错的；执行器按实际运行的任务数检查，是最后一道防线。墓碑让新集群主节点把已被销毁的任务接收为 Cancelled，而不是让它复活。
 
 集群主节点处理 `TaskReport` 时，必须丢弃代次与任务当前代次不同的报告（更小的返回 `STALE_EPOCH`）。汇总方处理 `TaskResult` 时同样按 `(epoch, assign_term)` 丢弃旧代次的结果。
 
@@ -279,7 +286,8 @@ Pending ──assign(代次+1)───► Scheduled ──report Running──�
 | `max_input_stalls` | 3 | 累计这么多个任务主节点报告没有输入后，判定任务 Failed（`NOT_READY`） |
 | `input_timeout`（执行器） | 10.0 | 任务主节点多久收不到一帧就报告 `NOT_READY`；0 表示不检查 |
 | `prune_terminal_after_s` | 3600 | 终态任务保留这么久后从任务表删除 |
-| `max_tasks_per_node` | 4 | 单节点同时运行的任务上限（与 PKCT 的 `MAX_TRACKERS` 一致） |
+| `max_tasks_per_node` | 4 | 单节点同时运行的任务上限（与 PKCT 的 `MAX_TRACKERS` 一致）；调度器过滤和执行器准入（执行器参数同名）都用它，两边必须一致 |
+| `tombstone_ttl_s`（执行器） | 600 | 墓碑保留多久；最多 16 条，超出时丢弃最旧的 |
 | `max_chain_depth` | 5 | 链式触发的最大深度 |
 | `leader_self_penalty` | 10 | 集群主节点给自己的调度评分扣分（满分 100）。另一个作用是减少“任务只跑在集群主节点上、随它一起丢失”的情况 |
 | `per_task_penalty` | 5 | 节点上每个已分配任务的调度扣分，避免 CPU 使用率还没反映出新任务时，任务全部挤到同一个节点 |
