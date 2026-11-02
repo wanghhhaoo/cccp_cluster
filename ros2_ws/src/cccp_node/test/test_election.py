@@ -91,3 +91,55 @@ def test_incompatible_claims_are_ignored():
     n5 = Election("n5", CONFIG, 0.0)
     state = n5.update(peers(peer("n2", 6), peer("n3", 9, leader=True, protocol=1)), 20.0)
     assert state.leader == "" and state.term == 6                 # n2 is smaller and should claim
+
+
+def candidate(name, node_id, visible=11, ready=True, battery=-1.0, follows="", **kw):
+    kw.setdefault("leader_name", follows)
+    return NodeView(name, protocol_version=2, node_id=node_id, visible_peers=visible, inference_ready=ready,
+                    battery=battery, **kw)
+
+
+def first_claimant(views, config=CONFIG):
+    """Which of these nodes claims when nobody leads (each runs the rule on the others)."""
+    claimed = []
+    for me in views:
+        e = Election(me.name, config, 0.0, node_id=me.node_id)
+        if e.update(peers(*[v for v in views if v is not me]), 6.0, me=me).is_self:
+            claimed.append(me.name)
+    return claimed
+
+
+def test_candidates_rank_by_visible_peers_then_smaller_id():
+    assert first_claimant([candidate("a", 1), candidate("b", 2), candidate("c", 3)]) == ["a"]
+    assert first_claimant([candidate("a", 1, visible=9), candidate("b", 2, visible=11),
+                           candidate("c", 3, visible=11)]) == ["b"]
+    assert first_claimant([candidate("z", 1), candidate("a", 2)]) == ["z"]      # the id, not the name
+
+
+def test_ineligible_candidates_wait_unless_nobody_is_eligible():
+    config = ElectionConfig(leader_min_battery=20.0)
+    views = [candidate("a", 1, ready=False), candidate("b", 2, battery=10.0), candidate("c", 3, battery=50.0),
+             candidate("d", 4)]
+    assert first_claimant(views, config) == ["c"]                 # unknown battery (d) would also do
+    assert first_claimant([candidate("a", 1, ready=False), candidate("b", 2, ready=False)], config) == ["a"]
+
+
+def test_incumbent_keeps_the_role_against_a_better_connected_node():
+    e = Election("b", CONFIG, 0.0, node_id=2)
+    me = candidate("b", 2, visible=5)
+    e.update(peers(candidate("c", 3, visible=5)), 6.0, me=me)
+    assert e.state.is_self
+    state = e.update(peers(candidate("a", 1, visible=11, follows="b")), 7.0, me=me)
+    assert state.is_self and state.leader == "b"
+
+
+def test_equal_claims_prefer_the_smaller_id():
+    e = Election("z", CONFIG, 0.0, node_id=1)
+    e.update({}, 6.0, me=candidate("z", 1))                      # both claimed term 1 while apart
+    assert e.update(peers(candidate("a", 2, term=1, is_leader=True, leader_name="a")), 7.0,
+                    me=candidate("z", 1)).is_self
+    other = Election("a", CONFIG, 0.0, node_id=2)
+    other.update({}, 6.0, me=candidate("a", 2))
+    state = other.update(peers(candidate("z", 1, term=1, is_leader=True, leader_name="z")), 7.0,
+                         me=candidate("a", 2))
+    assert state.leader == "z" and not state.is_self

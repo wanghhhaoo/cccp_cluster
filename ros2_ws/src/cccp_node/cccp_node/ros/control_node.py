@@ -137,10 +137,13 @@ class ControlNode(Node):
     def _publish_node_status(self):
         now = time.monotonic()
         peers = {n: v for n, v in self.cluster.online(now).items() if n != self.node_name}
-        leadership = self.election.update(peers, now)
+        executor = self._executor_status if now - self._executor_seen < self._executor_timeout else None
+        # visible_peers stays 0 until NodeStatus carries it (protocol 3), as every peer's reads 0 today.
+        me = NodeView(self.node_name, inference_ready=bool(executor and executor.inference_ready),
+                      battery=self._battery)
+        leadership = self.election.update(peers, now, me)
         self._seq += 1
         hw, usage = self.probe.hardware, self.probe.sample()
-        executor = self._executor_status if now - self._executor_seen < self._executor_timeout else None
         reports = self.links.reports(now)
         view = NodeView(
             name=self.node_name,

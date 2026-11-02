@@ -1,13 +1,20 @@
-"""What this node knows about every other node, built from /cluster/node_status.
+"""What this node knows about every other node (DESIGN 3.2, 3.6).
 
-NodeView mirrors one NodeStatus message. ClusterView keeps the latest view per
-node and decides liveness by *local* monotonic time of arrival, never by the
-sender's timestamps (CONVENTIONS 4.3).
+Two messages feed it. NodeView mirrors one heartbeat (NodeStatus, 1 Hz,
+best effort): liveness, election, readiness, a summary of the running tasks,
+and every few beats the slow part (resources, links). TaskListView mirrors one
+TaskList (reliable, sent when it changes): the full TaskState of every task a
+node runs, and its tombstones. A new leader adopts tasks from TaskLists.
+
+ClusterView keeps the latest of both per node and decides liveness by *local*
+monotonic time of arrival, never by the sender's timestamps (CONVENTIONS 4.3).
+Offline nodes are kept for offline_retain_s, so a new leader can still adopt
+what an unreachable node (often the old leader itself) was running.
 """
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .generation import Generation
 
@@ -45,6 +52,10 @@ class TaskStateView:
 
 @dataclass(frozen=True)
 class NodeView:
+    """One heartbeat. running_tasks are summaries (task_id, generation, role); the full
+    TaskState of each is in the node's TaskList. Resources and links form the slow part,
+    sent every few beats: slow=False means this beat did not carry it."""
+
     name: str
     protocol_version: int = 2
     incarnation: int = 0
@@ -54,6 +65,11 @@ class NodeView:
     is_leader: bool = False
     inference_ready: bool = False
     algorithms_ready: tuple[str, ...] = ()
+    node_id: int = 0
+    visible_peers: int = 0           # peers this node sees online (election candidate order)
+    executor_alive: bool = True      # False: the local executor went quiet; running_tasks are the last known
+    tasks_version: int = 0           # matches TaskListView.tasks_version
+    slow: bool = True
     cpu_model: str = ""
     cpu_cores: int = 0
     mem_total_mb: int = 0
@@ -77,34 +93,120 @@ class NodeView:
         return any(t.task_id == task_id and t.generation == generation for t in self.running_tasks)
 
 
+# The slow part of a heartbeat: carried over from the previous beat when absent.
+SLOW_FIELDS = ("cpu_model", "cpu_cores", "mem_total_mb", "gpu_model", "gpu_mem_total_mb", "cpu_usage", "mem_usage",
+               "gpu_usage", "gpu_mem_usage", "battery", "links")
+
+
+@dataclass(frozen=True)
+class TaskListView:
+    """One TaskList: every task a node runs, in full, and the tasks it stopped because
+    they were destroyed (tombstones, task ids)."""
+
+    name: str
+    incarnation: int
+    tasks_version: int
+    tasks: tuple[TaskStateView, ...] = ()
+    tombstones: tuple[str, ...] = ()
+    node_id: int = 0
+
+
 class ClusterView:
-    """Latest NodeView of each node plus the local time it arrived.
+    """Latest NodeView and TaskListView of each node plus the local time the node was last heard.
 
     Thread-safe: ROS callbacks update it while the leader controller reads it.
     """
 
-    def __init__(self, offline_timeout_s: float):
+    def __init__(self, offline_timeout_s: float, offline_retain_s: float = 300.0):
         self._offline_timeout_s = offline_timeout_s
+        self._offline_retain_s = offline_retain_s
         self._lock = threading.Lock()
         self._views: dict[str, NodeView] = {}
         self._seen_at: dict[str, float] = {}
+        self._task_lists: dict[str, TaskListView] = {}
+        self._listed_at: dict[str, float] = {}
+        self._names: dict[int, str] = {}
 
     def update(self, view: NodeView, now: float) -> bool:
-        """Record a NodeStatus received at local monotonic time now.
+        """Record a heartbeat received at local monotonic time now.
 
         Returns False for messages older than what is already known: an older
         incarnation (a delayed message from before a restart) or a lower seq.
+        A node back with a new incarnation loses its old TaskList: whatever it
+        ran then is gone.
         """
         with self._lock:
+            self._expire(now)
             known = self._views.get(view.name)
             if known is not None:
                 if view.incarnation < known.incarnation:
                     return False
                 if view.incarnation == known.incarnation and view.seq <= known.seq:
                     return False
+                if not view.slow:
+                    view = replace(view, slow=known.slow, **{f: getattr(known, f) for f in SLOW_FIELDS})
+            listed = self._task_lists.get(view.name)
+            if listed is not None and listed.incarnation < view.incarnation:
+                del self._task_lists[view.name], self._listed_at[view.name]
             self._views[view.name] = view
             self._seen_at[view.name] = now
+            if view.node_id:
+                self._names[view.node_id] = view.name
             return True
+
+    def update_task_list(self, task_list: TaskListView, now: float) -> bool:
+        """Record a TaskList. TaskLists are reliable and replayed to late joiners, so
+        repeats and lists from before a restart are expected and ignored (False)."""
+        with self._lock:
+            self._expire(now)
+            known = self._views.get(task_list.name)
+            if known is not None and task_list.incarnation < known.incarnation:
+                return False
+            cached = self._task_lists.get(task_list.name)
+            if cached is not None and (task_list.incarnation, task_list.tasks_version) <= (
+                    cached.incarnation, cached.tasks_version):
+                return False
+            self._task_lists[task_list.name] = task_list
+            self._listed_at[task_list.name] = now
+            if task_list.node_id:
+                self._names[task_list.node_id] = task_list.name
+            return True
+
+    def task_list(self, name: str) -> TaskListView | None:
+        """The node's TaskList, if it is as new as its latest heartbeat says. None while the
+        TaskList for a newer tasks_version is still on its way: skip the node for now."""
+        with self._lock:
+            listed = self._task_lists.get(name)
+            if listed is None:
+                return None
+            beat = self._views.get(name)
+            if beat is not None and (beat.incarnation, beat.tasks_version) > (listed.incarnation,
+                                                                              listed.tasks_version):
+                return None
+            return listed
+
+    def name_of(self, node_id: int) -> str | None:
+        with self._lock:
+            return self._names.get(node_id)
+
+    def visible_peers(self, me: str, now: float) -> int:
+        with self._lock:
+            return sum(1 for name in self._views if name != me and self._online(name, now))
+
+    def retained(self, now: float) -> dict[str, NodeView]:
+        """Offline nodes still within offline_retain_s: their last heartbeat."""
+        with self._lock:
+            self._expire(now)
+            return {name: view for name, view in self._views.items() if not self._online(name, now)}
+
+    def _expire(self, now: float) -> None:
+        for name in [n for n, seen in self._seen_at.items() if now - seen >= self._offline_retain_s]:
+            del self._views[name], self._seen_at[name]
+            self._task_lists.pop(name, None)
+            self._listed_at.pop(name, None)
+        for name in [n for n, at in self._listed_at.items()       # TaskLists of nodes never heard beating
+                     if n not in self._seen_at and now - at >= self._offline_retain_s]:
+            del self._task_lists[name], self._listed_at[name]
 
     def get(self, name: str) -> NodeView | None:
         with self._lock:
