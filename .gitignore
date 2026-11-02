@@ -6,3 +6,7 @@ __pycache__/
 
 # 模型权重不进仓库，按 weights/SHA256SUMS 校验后另行拷贝
 ros2_ws/src/collab_inference/weights/*.pt
+
+# 本地的 Claude Code 项目记忆，不进仓库
+/CLAUDE.md
+/docs/MEMORY.md
