@@ -339,4 +339,9 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 
 **新的已知限制**（DESIGN 10.1 第 22、23 条）：`STOPPED` 之后进程最多还活 5 秒；HETEROMAP 任务主节点 Finished 后、STOP 到达辅助节点前集群主节点刚好挂掉，新集群主节点会从辅助节点接收任务并整个重跑。
 
-**没验证的**：真实算法只在远端跑过（本机没有模型和数据），修复后的版本没有在远端重跑；跨物理板卡、无线链路下的 HETEROMAP（每帧每架机上下行约 32 MiB 走共享盘）待部署阶段验证。
+**远端复验（11-08 晚，`d63c356`）**：在 `comp@10.160.4.17:~/cccp_integration_1108/review-d63c356/` 另起一份（原集成副本和它的 6 个容器没动），容器里 colcon 构建 6 个包成功，回归 276 项通过。
+- RSSMAP、FASTLIVO 真实 HTTP 测试（`test_batch_http.py`）3 项全过。注意：这台服务器上 `RSSMAP_PYTHON` 要用 `~/miniconda3/bin/python`（3.13）加 `PYTHONPATH=rsslib`；`radiomap` 环境（3.12）的 triton 是坏的，导入就报错。
+- HETEROMAP：6 个容器、真实 Cyclone DDS（`ROS_DOMAIN_ID=92`），辅助节点故意不按名字排序（edge-04、02、06、03、05）。epoch 1 一次完成，372 秒，120 个文件，下载哈希一致；全局图可观测区域与参考一致 347186 / 347243（99.9836%），和原验收相同。5 个辅助节点都打出“helper part finished, waiting for the primary”，0.4～0.8 秒后收到 STOP（task finished），这正是原来会被重发 START 的窗口。
+- 运行中取消：DELETE 0.11 秒返回 Cancelled，6 个 `bev_job` 进程 0.6 秒内全部退出。
+
+**复验中发现的选主活锁（`e469a52` 就有，与批处理无关，未修）**：第一次 HETEROMAP 和 FASTLIVO 测试同时跑，约 118 秒时 edge-02 判定 edge-01 离线并以 term 2 当选；之后 edge-02 一直收不到 edge-01 的心跳，而其他节点两边都能收到。两个在任者交替“raised past a higher claim”（edge-01：1→3→5…，edge-02：2→4→6…），谁也不卸任，各自重新调度、互相 STOP 对方的代次。原因在 `core/election.py`：在任者只在**直接听到**更好的声明时才卸任；edge-02 听不到 edge-01 的声明，却从跟随者的心跳里看到 edge-01 的 term，于是一直往上抬。用纯 `Election` 类按“edge-02 听不到 edge-01、其他全通”能稳定复现（见 DESIGN 10.1 第 24 条）。这种情况下，“同一代次已经跑过 → `NOT_READY` → `Requeue`”会让任务不停换代次（原代码则直接判定 Failed），活锁一解除就不会再出现。单独重跑时只有一个集群主节点，没有复现。edge-02 为什么长时间收不到 edge-01（负载？DDS 发现？）还没查清。
