@@ -124,6 +124,9 @@ class NodeChange:
     restarted: bool = False   # came back with a new incarnation
 
 
+RETIRED_RUNS_KEPT = 8    # earlier incarnations remembered per node; late messages come from the last one or two
+
+
 class ClusterView:
     """Latest NodeView and TaskListView of each node plus the local time the node was last heard.
 
@@ -144,19 +147,47 @@ class ClusterView:
         self._missed: dict[str, int] = {}         # heartbeats lost since changes() last reported the node
         self._restarted: set[str] = set()
         self._reported_off: dict[str, float] = {}  # last heard, for nodes changes() reported offline
+        self._incarnations: dict[str, int] = {}   # the run of each node messages are taken from
+        self._pending_lists: dict[str, TaskListView] = {}   # TaskList of a lower incarnation, see _current()
+        self._retired: dict[str, dict[int, None]] = {}      # earlier runs of each node, oldest first
+
+    def _current(self, name: str, incarnation: int, now: float) -> bool:
+        """Whether a message of this incarnation is from the node's current run; a new run becomes
+        the current one. A higher incarnation is a restart. A lower one, while the node is online,
+        is a delayed message from before a restart. Once the node is offline any incarnation is
+        taken: incarnations are wall-clock milliseconds, and a board without RTC or NTP restarts
+        with its clock set back (DESIGN 10.1 #27), which would otherwise hide it until its old
+        entry expires (offline_retain_s). A run that has been replaced never comes back: without
+        this, a late message of the run replaced by a lower incarnation would count as a restart."""
+        current = self._incarnations.get(name)
+        if current is None or incarnation == current:
+            self._incarnations[name] = incarnation
+            return True
+        retired = self._retired.setdefault(name, {})
+        if incarnation in retired or (incarnation < current and self._online(name, now)):
+            return False
+        retired[current] = None
+        while len(retired) > RETIRED_RUNS_KEPT:
+            del retired[next(iter(retired))]
+        self._incarnations[name] = incarnation
+        return True
 
     def update(self, view: NodeView, now: float) -> bool:
         """Record a heartbeat received at local monotonic time now.
 
-        Returns False for messages older than what is already known: an older
-        incarnation (a delayed message from before a restart) or a lower seq.
+        Returns False for messages older than what is already known: one from before a restart
+        (see _current) or a lower seq.
         """
         with self._lock:
             self._expire(now)
             known = self._views.get(view.name)
+            if not self._current(view.name, view.incarnation, now):
+                return False
+            pending = self._pending_lists.pop(view.name, None)
+            if pending is not None and pending.incarnation == view.incarnation:
+                # Its TaskList, sent only when it changes, came while its old run still counted as online.
+                self._task_lists[view.name], self._listed_at[view.name] = pending, now
             if known is not None:
-                if view.incarnation < known.incarnation:
-                    return False
                 if view.incarnation == known.incarnation and view.seq <= known.seq:
                     return False
                 if view.incarnation == known.incarnation:
@@ -176,12 +207,16 @@ class ClusterView:
         repeats and lists from before a restart are expected and ignored (False)."""
         with self._lock:
             self._expire(now)
-            known = self._views.get(task_list.name)
-            if known is not None and task_list.incarnation < known.incarnation:
+            name = task_list.name
+            if not self._current(name, task_list.incarnation, now):
+                pending = self._pending_lists.get(name)
+                if pending is None or pending.incarnation != task_list.incarnation or (
+                        pending.tasks_version < task_list.tasks_version):
+                    self._pending_lists[name] = task_list    # taken if its heartbeats are taken later
                 return False
-            cached = self._task_lists.get(task_list.name)
-            if cached is not None and (task_list.incarnation, task_list.tasks_version) <= (
-                    cached.incarnation, cached.tasks_version):
+            cached = self._task_lists.get(name)
+            if cached is not None and cached.incarnation == task_list.incarnation and (
+                    task_list.tasks_version <= cached.tasks_version):
                 return False
             self._task_lists[task_list.name] = task_list
             self._listed_at[task_list.name] = now
@@ -216,11 +251,11 @@ class ClusterView:
         includes a node back with a new incarnation: what it ran before is gone."""
         with self._lock:
             listed = self._task_lists.get(name)
-            if listed is None:
+            if listed is None or listed.incarnation != self._incarnations.get(name, listed.incarnation):
                 return None
             beat = self._views.get(name)
-            if beat is not None and (beat.incarnation, beat.tasks_version) > (listed.incarnation,
-                                                                              listed.tasks_version):
+            if beat is not None and beat.incarnation == listed.incarnation and (
+                    beat.tasks_version > listed.tasks_version):
                 return None
             return listed
 
@@ -258,9 +293,14 @@ class ClusterView:
             del self._views[name], self._seen_at[name]
             self._task_lists.pop(name, None)
             self._listed_at.pop(name, None)
+            self._incarnations.pop(name, None)
+            self._pending_lists.pop(name, None)
+            self._retired.pop(name, None)
         for name in [n for n, at in self._listed_at.items()       # TaskLists of nodes never heard beating
                      if n not in self._seen_at and now - at >= self._offline_retain_s]:
             del self._task_lists[name], self._listed_at[name]
+            self._incarnations.pop(name, None)
+            self._retired.pop(name, None)
 
     def get(self, name: str) -> NodeView | None:
         with self._lock:

@@ -71,6 +71,37 @@ def test_restart_drops_the_old_task_list():
     assert view.task_list("a").incarnation == 2
 
 
+def test_a_node_back_from_offline_is_taken_with_a_lower_incarnation():
+    """Incarnations are wall-clock ms; a board without RTC or NTP restarts with its clock set back."""
+    view = ClusterView(offline_timeout_s=5.0)
+    view.update(beat(incarnation=1_700_000_000_000, seq=40, tasks_version=2), now=10.0)
+    view.update_task_list(listed(incarnation=1_700_000_000_000, version=2,
+                                 tasks=[TaskStateView("t1", 1, "primary")]), now=10.0)
+    assert not view.update(beat(incarnation=5_000, seq=1), now=14.9)        # still online: a stale message
+    assert view.update(beat(incarnation=5_000, seq=1), now=15.0)            # offline: a restart
+    assert view.get("a").incarnation == 5_000 and view.is_online("a", 15.0)
+    assert view.task_list("a") is None                                       # what it ran before is gone
+    assert not view.update(beat(incarnation=1_700_000_000_000, seq=41), now=15.5)
+    assert [c.restarted for c in view.changes(15.5) if c.online] == [True]
+
+
+def test_the_task_list_of_a_restart_with_a_lower_incarnation_is_kept_until_its_heartbeats_count():
+    """A TaskList is sent only when it changes: one that came while the old run still counted as
+    online is taken once the node's heartbeats are taken."""
+    view = ClusterView(offline_timeout_s=5.0)
+    view.update(beat(incarnation=900, seq=40, tasks_version=3), now=10.0)
+    view.update_task_list(listed(incarnation=900, version=3, tasks=[TaskStateView("t1", 1, "primary")]), now=10.0)
+    assert not view.update_task_list(listed(incarnation=7, version=0), now=11.0)
+    assert not view.update_task_list(listed(incarnation=7, version=1, tasks=[TaskStateView("t2", 1, "primary")]),
+                                     now=11.5)
+    assert not view.update_task_list(listed(incarnation=7, version=0), now=11.6)   # repeat of an older one
+    assert not view.update(beat(incarnation=7, seq=1, tasks_version=1), now=12.0)
+    assert view.task_list("a").incarnation == 900
+    assert view.update(beat(incarnation=7, seq=4, tasks_version=1), now=15.0)
+    taken = view.task_list("a")
+    assert (taken.incarnation, taken.tasks_version, [t.task_id for t in taken.tasks]) == (7, 1, ["t2"])
+
+
 def test_offline_nodes_are_retained_then_forgotten():
     view = ClusterView(offline_timeout_s=5.0, offline_retain_s=300.0)
     view.update(beat("a"), now=0.0)

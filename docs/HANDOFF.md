@@ -397,3 +397,16 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 - 规则写进 CONVENTIONS 3.3：心跳的回调组里不做阻塞调用。
 - 测试：fake_ros 记下定时器和订阅的回调组（只记录，仍然一个线程跑所有定时器）。新测试包住每个节点的 `probe.sample`，从调用栈找出是哪个定时器在采样，检查它的回调组不是心跳订阅或心跳定时器的组，并且 FixedProbe 的 20% 送到了所有节点。故意改坏 3 处（心跳里直接采样、采样定时器放进心跳的组、去掉采样定时器）都被发现。
 - 没在远端真机上复测 RTT：本次只改了线程归属，心跳收发路径没变。
+
+## 二十一、11-08：板卡时钟回退后重启的节点不再“隐身”（DESIGN 10.1 第 27 条）
+
+准备真机部署时读代码发现的，容器里碰不到（宿主机时钟不会倒退）。
+- **问题**：`incarnation` 取进程启动时的墙钟毫秒，`ClusterView` 一律丢弃比已知值小的 `incarnation`。无人机板卡常常没有 RTC 电池，外场又没有 NTP，重启后时钟回到出厂时间，新的 `incarnation` 比旧的小：所有节点把它的心跳当成重启前迟到的消息，直到旧条目过期（`offline_retain_s`，5 分钟）；它的 `TaskList` 只在变化时发，被丢掉后不会再来。chrony 往回校时后再重启进程也会这样。
+- **改法**（`core/cluster_view.py` 的 `_current`，DESIGN“实现时的调整”第 23 条、3.8 节）：
+  - 节点在线时，较小的 `incarnation` 仍当作迟到的消息丢掉；节点离线后（`offline_timeout` 没收到心跳），不论大小都算新的一轮。重启通常远超 5 秒，所以实际上立即被接受；进程快速重启又碰上时钟回退时，最多晚 5 秒。
+  - 被替换掉的 `incarnation` 记下来（每个节点最近 8 个），以后一律丢弃。第一版没有这条，测试发现：接受较小的之后，旧一轮迟到的一条（较大）又被当成重启，视图来回翻。
+  - 新一轮的 `TaskList` 如果在旧一轮还算在线时到达，先暂存，它的心跳被接受时装上。
+  - `task_list()` 改为只返回当前这一轮的 `TaskList`（原来按 `(incarnation, tasks_version)` 字典序比较，较小的 `incarnation` 会让旧一轮的 `TaskList` 被当成最新的，集群主节点会以为它还在跑重启前的任务）。
+  - 没改的：`LinkEstimator` 对端沉默 10 秒后自己丢掉状态，之后接受任何 `incarnation`；执行器的 `incarnation` 和请求方的 `origin_incarnation` 只做相等比较。
+- **测试**：`test_cluster_view.py` 新增两项（离线后以较小的 `incarnation` 回来、旧一轮迟到的消息不再接受；离线前到达的 `TaskList` 被暂存后装上）。故意改坏 5 处（恢复旧规则、较小的一律接受、不记被替换的、不装暂存的、`task_list()` 不看当前一轮）都被发现。
+- 部署时仍然建议做时钟同步：日志和多块板卡的抓包要靠墙钟对齐。

@@ -139,7 +139,7 @@ QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义�
 | `assign_term` | 每次（重新）调度时设为当前任期 | 换主后接收（Adopt）任务时**不变**：接收只是认领，改了执行器会当成新会话而重启任务 |
 | `term` | 选主时取“已知最大 term 加 1” | 只增不减 |
 | `TaskStatus.seq` | 集群主节点在本任期内的变更序号 | 订阅方按 `(term, seq)` 去重和排序；换主后从 1 重新开始 |
-| `incarnation` | 进程启动时的 Unix 毫秒 | 用来判断节点是否重启过 |
+| `incarnation` | 进程启动时的 Unix 毫秒 | 用来判断节点是否重启过。**不保证递增**（板卡时钟可能回退）：只做相等比较；集群视图对离线后回来的节点不论大小都接受（DESIGN 3.8） |
 | PKCT `tracker_id` | `task-<task_id>-<epoch>-<assign_term>` | 按 `task_id` + 执行代次隔离会话 |
 
 ### 4.2 幂等键格式
