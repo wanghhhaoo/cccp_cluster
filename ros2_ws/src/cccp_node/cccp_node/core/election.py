@@ -58,6 +58,8 @@ class ElectionConfig:
     startup_grace_s: float = 5.0      # listen this long after start before claiming
     protocol_version: int = c.PROTOCOL_VERSION
     leader_min_battery: float = 0.0   # candidates below this battery (0..1) are not eligible; 0 disables
+    candidate_wait_s: float = 10.0    # no claim for this long while waiting for a better candidate: stop
+                                      # waiting for candidates that follow a leader (DESIGN 5.3)
                                       # (value to be decided, DESIGN 10.5)
 
 
@@ -82,6 +84,7 @@ class Election:
         self._claimed_term = 0
         self._claim_seen = None          # local time a foreign claim was last heard
         self._abstaining_for = ""        # the unheard leader this node last abstained for (logged once)
+        self._waiting_since = None       # local time this node started waiting for another candidate
 
     @property
     def state(self) -> Leadership:
@@ -126,12 +129,20 @@ class Election:
         waited_since = self._claim_seen if self._claim_seen is not None else self._started
         timeout = self._config.leader_timeout_s if self._claim_seen is not None else self._config.startup_grace_s
         if now - waited_since >= timeout:
-            if self._first_candidate([me, *compatible.values()]) is me:
+            candidates = [me, *compatible.values()]
+            if self._waiting_since is not None and now - self._waiting_since >= self._config.candidate_wait_s:
+                # The first candidate never claimed: it still follows a leader this node cannot hear
+                # (and does not, it hears that leader). Stop waiting for nodes that follow anyone.
+                candidates = [me, *(v for v in compatible.values() if not v.leader_name)]
+            if self._first_candidate(candidates) is me:
                 self._term = self._claimed_term = highest + 1
                 self._leader = self.node_name
                 self._abstaining_for = ""
+                self._waiting_since = None
             else:
                 self._leader = ""                             # the first candidate will claim
+                if self._waiting_since is None:
+                    self._waiting_since = now
         return self.state
 
     def _unheard_leaders(self, compatible: Mapping[str, NodeView], supporters) -> list:
@@ -156,6 +167,7 @@ class Election:
         self._leader = ""
         self._term = max(self._term, claim[1])
         self._claim_seen = now
+        self._waiting_since = None
 
     def _first_candidate(self, views: list[NodeView]) -> NodeView:
         eligible = [v for v in views if self._eligible(v)] or views
@@ -168,6 +180,7 @@ class Election:
         _, self._term, (_, self._leader) = claim
         self._claim_seen = now
         self._abstaining_for = ""
+        self._waiting_since = None
 
 
 def _node_key(view: NodeView) -> tuple[int, str]:

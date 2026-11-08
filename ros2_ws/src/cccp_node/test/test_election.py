@@ -191,17 +191,19 @@ def test_a_leader_only_a_minority_follows_does_not_stop_the_others_electing():
 def simulate(n, hears, steps, init=None):
     """n nodes, one Election.update per node per second. hears(t, a, b): does a receive b's heartbeat
     at second t; a peer stays online for a for 5 s after its last heartbeat (node_offline_timeout_s).
-    hears(t, a, a) is False once a is dead. Returns [(t, sorted live claimants, highest term)]."""
+    hears(t, a, a) is False once a is dead. Each node reports as visible_peers the size of its own
+    view, as on real nodes: a node that hears fewer peers ranks lower as a candidate.
+    Returns [(t, sorted live claimants, highest term)]."""
     names = ["edge-%02d" % i for i in range(1, n + 1)]
     nodes = {x: Election(x, CONFIG, 0.0, node_id=i + 1) for i, x in enumerate(names)}
     for x, (leader, term) in (init or {}).items():               # a starting state, as if elected earlier
         e = nodes[x]
         e._leader, e._term, e._claim_seen = leader, term, 0.0
         e._claimed_term = term if leader == x else 0
-    last, history = {}, []
+    last, history, visible = {}, [], {x: n - 1 for x in names}
     for t in range(1, steps + 1):
         views = {x: NodeView(x, node_id=i + 1, leader_name=nodes[x].state.leader, term=nodes[x].state.term,
-                             is_leader=nodes[x].state.is_self, inference_ready=True, visible_peers=n - 1)
+                             is_leader=nodes[x].state.is_self, inference_ready=True, visible_peers=visible[x])
                  for i, x in enumerate(names)}
         for a in names:
             for b in names:
@@ -210,6 +212,7 @@ def simulate(n, hears, steps, init=None):
         alive = [x for x in names if hears(t, x, x) is not False]
         for a in alive:
             seen = {b: v for (r, b), (heard, v) in last.items() if r == a and t - heard < 5}
+            visible[a] = len(seen)
             nodes[a].update(seen, float(t), views[a])
         history.append((t, sorted(x for x in alive if nodes[x].state.is_self),
                         max(nodes[x].state.term for x in alive)))
@@ -274,3 +277,23 @@ def test_abstaining_is_logged_once_per_unheard_leader(caplog):
             e.update(peers(*followers), now)
     [record] = caplog.records
     assert "node=n1 is followed by 4 of the 5 nodes in view (term=3)" in record.getMessage()
+
+
+def test_deaf_node_with_lossy_heartbeats_does_not_split_the_cluster():
+    """What the server showed (HANDOFF 18): edge-02 stops hearing the leader, and its own heartbeats
+    reach the others only part of the time, so their visible_peers drop to its level and it ranks
+    first as a candidate. The rules before indirect evidence split the cluster in all of these."""
+    for seed in range(20):
+        rng, loss = random.Random(seed), {}
+
+        def hears(t, a, b):
+            if a == b:
+                return None
+            if t >= 20 and (a, b) == ("edge-02", "edge-01"):
+                return False
+            if t >= 20 and b == "edge-02":
+                return loss.setdefault((t, a), rng.random() > 0.4)
+            return True
+        history = simulate(6, hears, 90)
+        assert all(claimants == ["edge-01"] for _, claimants, _ in history[-30:]), seed
+        assert history[-1][2] == history[-30][2], seed
