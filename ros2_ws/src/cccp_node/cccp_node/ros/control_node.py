@@ -52,7 +52,7 @@ from ..core.naming import default_node_id
 from ..core.reconciler import ReconcileConfig
 from ..core.scheduler import SchedulerConfig
 from ..core.task_table import StatusEvent
-from ..monitor.probes import SystemProbe
+from ..monitor.probes import SystemProbe, Usage
 from ..ue_api import UeApi
 from . import convert, qos
 from .dispatcher import RosCommandSink
@@ -83,6 +83,9 @@ class ControlNode(Node):
         self._stop = threading.Event()
 
         self._state_group = MutuallyExclusiveCallbackGroup()
+        # nvidia-smi takes 70-320 ms (DESIGN 10.1 #26): sampling in the heartbeat's group would hold
+        # up heartbeats, received ones too, which skews the RTT the link estimator measures.
+        self._probe_group = MutuallyExclusiveCallbackGroup()
         self._api_group = ReentrantCallbackGroup()
 
         self.cluster = ClusterView(p["offline_timeout"], p["offline_retain"])
@@ -91,6 +94,7 @@ class ControlNode(Node):
                                  time.monotonic(), node_id=self.node_id)
         self.links = LinkEstimator()
         self.probe = SystemProbe()
+        self._usage = Usage()                          # unknown until the first sample
         self.store = TaskStore()
         self._commands = RosCommandSink(self.cluster)
         self._leader_endpoints = None                 # (Reply publisher, ExecEvent and Request subscriptions)
@@ -132,6 +136,9 @@ class ControlNode(Node):
         ):
             self.create_service(srv, name, handler, callback_group=self._api_group)
         self.create_timer(p["status_period"], self._publish_node_status, callback_group=self._state_group)
+        # Resources ride only on every slow_fields_every-th heartbeat: sample at that period.
+        self.create_timer(p["status_period"] * self._slow_every, self._sample_resources,
+                          callback_group=self._probe_group)
         self.create_timer(0.05, self._drain_outbox)
         self._publish_task_list()                     # tells everyone this node's name
 
@@ -184,7 +191,7 @@ class ControlNode(Node):
         leadership = self.election.update(peers, now, me)
         self._follow_role(leadership.is_self)
         self._seq += 1
-        hw, usage = self.probe.hardware, self.probe.sample()
+        hw, usage = self.probe.hardware, self._usage
         slow = (self._seq - 1) % self._slow_every == 0
         reports = self.links.reports(now)
         view = NodeView(
@@ -206,6 +213,9 @@ class ControlNode(Node):
         own_links = tuple(LinkView(r.peer_name, r.rtt_ms, r.jitter_ms, r.loss_rate) for r in reports)
         self.cluster.update(replace(view, links=own_links), now)
         self.cluster.update_task_list(self._own_tasks, now)
+
+    def _sample_resources(self):
+        self._usage = self.probe.sample()             # one reference assignment: the heartbeat reads it whole
 
     def _on_node_status(self, msg):
         if msg.node_id == self.node_id:

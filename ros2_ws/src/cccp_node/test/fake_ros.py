@@ -250,8 +250,9 @@ class Publisher(_Entity):
 
 
 class Subscription(_Entity):
-    def __init__(self, node, msg_type, topic, callback, qos=None):
+    def __init__(self, node, msg_type, topic, callback, qos=None, callback_group=None):
         self.node, self.msg_type, self.topic, self.callback, self.qos = node, msg_type, topic, callback, qos
+        self.callback_group = callback_group      # recorded only: every callback runs as if alone in its group
 
 
 class Service(_Entity):
@@ -325,8 +326,8 @@ class Client(_Entity):
 
 
 class Timer(_Entity):
-    def __init__(self, node, period, callback):
-        self.node, self.period, self.callback = node, period, callback
+    def __init__(self, node, period, callback, callback_group=None):
+        self.node, self.period, self.callback, self.callback_group = node, period, callback, callback_group
         self.next_at = time.monotonic() + period
 
     @property
@@ -418,8 +419,8 @@ class Node:
             BUS.publishers.setdefault(publisher.topic, []).append(publisher)
         return publisher
 
-    def create_subscription(self, msg_type, topic, callback, qos, **_):
-        subscription = Subscription(self, msg_type, self.resolve_topic_name(topic), callback, qos)
+    def create_subscription(self, msg_type, topic, callback, qos, callback_group=None, **_):
+        subscription = Subscription(self, msg_type, self.resolve_topic_name(topic), callback, qos, callback_group)
         with BUS.lock:
             BUS.subscriptions.setdefault(subscription.topic, []).append(subscription)
             replay = [m for p in BUS.publishers.get(subscription.topic, []) if p.alive and p.node.alive
@@ -450,8 +451,8 @@ class Node:
     def create_client(self, srv_type, name, **_):
         return Client(self, srv_type, self.resolve_topic_name(name))
 
-    def create_timer(self, period, callback, **_):
-        timer = Timer(self, period, callback)
+    def create_timer(self, period, callback, callback_group=None, **_):
+        timer = Timer(self, period, callback, callback_group)
         with BUS.lock:
             BUS.timers.append(timer)
         return timer

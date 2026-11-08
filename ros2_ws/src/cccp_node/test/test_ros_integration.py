@@ -466,6 +466,32 @@ def test_task_list_reaches_late_subscribers_only_if_both_ends_are_transient_loca
 
 
 @pytest.mark.parametrize("cluster", ["local_calls"], indirect=True)
+def test_resources_are_sampled_outside_the_heartbeat_callback_group(cluster):
+    """nvidia-smi takes 70-320 ms (DESIGN 10.1 #26). Sampled in the group of the heartbeat timer
+    and the NodeStatus subscription, it holds up received heartbeats too and skews the RTT."""
+    import inspect
+    from cccp_node import names
+    groups = {}                    # timer callback group that sampled -> node
+    for node in cluster.values():
+        def sample(original=node.control.probe.sample, name=node.name):
+            frame = next(f for f in inspect.stack() if f.function == "run_timers")
+            groups.setdefault(id(frame.frame.f_locals["timer"].callback_group), set()).add(name)
+            return original()
+        node.control.probe.sample = sample
+    wait_for(lambda: active_leader(cluster))
+    # The slow part carries what the probe sampled (FixedProbe: 20 %) to every peer.
+    wait_for(lambda: all(view.cpu_usage == 20.0 for n in cluster.values()
+                         for view in n.control.cluster.online(time.monotonic()).values()), timeout=5.0)
+    with fake_ros.BUS.lock:
+        heartbeat = {id(s.callback_group) for s in fake_ros.BUS.subscriptions[names.NODE_STATUS_TOPIC]}
+        heartbeat |= {id(t.callback_group) for t in fake_ros.BUS.timers
+                      if getattr(t.callback, "__name__", "") == "_publish_node_status"}
+    assert None not in {s.callback_group for s in fake_ros.BUS.subscriptions[names.NODE_STATUS_TOPIC]}
+    assert set().union(*groups.values()) == set(cluster)
+    assert not set(groups) & heartbeat
+
+
+@pytest.mark.parametrize("cluster", ["local_calls"], indirect=True)
 def test_subscriptions_to_topics_several_nodes_publish_keep_a_sample_from_each_of_12(cluster):
     """A keyless subscription has one history for all publishers. With depth 1, heartbeats of two
     nodes a few milliseconds apart overwrite each other every second (DESIGN 10.1 #25); fake_ros

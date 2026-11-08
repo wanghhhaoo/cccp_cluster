@@ -121,6 +121,8 @@
 
 **多个节点发布的 topic，订阅端深度不小于节点数（12）**：ROS 2 消息没有 key，一个订阅端只有一份历史，所有发布者共用。`test_ros_integration.py` 检查所有这类订阅。
 
+**心跳的回调组里不做阻塞调用**：`NodeStatus` 的收发、`TaskList`/`ExecutorStatus` 的接收和选主在控制进程的同一个互斥回调组里，其中任何一个回调阻塞，收到的心跳就都晚处理，链路 RTT 跟着偏大。调用子进程（`nvidia-smi`）、读慢设备这类事放到单独的回调组，结果用一次引用赋值交给心跳（DESIGN 10.1 第 26 条）。`test_ros_integration.py` 检查资源采样不在心跳的回调组里。
+
 QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义在 `cccp_node/names.py`。各处必须统一引用这两个模块，不允许在各自的代码里临时创建 QoS 或手写端点名。
 
 ---

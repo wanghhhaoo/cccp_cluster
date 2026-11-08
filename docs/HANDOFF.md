@@ -384,8 +384,16 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 - 测试：`test_ros_integration.py` 新增一项，检查所有“多个节点发布”的 topic 的订阅端深度不小于 12（fake_ros 同步投递，复现不了覆盖，只能检查声明；为此 fake_ros 记下了每个端点的 QoS）。故意改坏 2 处（心跳订阅用发布端的 profile、`TaskList` 订阅端深度改 8）都被发现。
 - `tools/rtps_loss.py`：从各节点的 pcap 里按 SEDP 找出某个 topic 的 writer，逐对比较“发送方线路上的序号”和“接收方网卡上收到的序号”，只用标准库。阶段 6 在真机上抓包时可以直接用。
 
-**顺带发现**（DESIGN 10.1 第 26 条，未改）：资源采样在 NVIDIA GPU 的机器上同步调用 `nvidia-smi`（远端实测 70～320 ms，超时 2 秒），而它在心跳定时器里、与心跳订阅同一个互斥回调组。深度 32 后不会因此丢心跳，但会晚处理、链路 RTT 偏大。
+**顺带发现**（DESIGN 10.1 第 26 条，第二十节已改）：资源采样在 NVIDIA GPU 的机器上同步调用 `nvidia-smi`（远端实测 70～320 ms，超时 2 秒），而它在心跳定时器里、与心跳订阅同一个互斥回调组。深度 32 后不会因此丢心跳，但会晚处理、链路 RTT 偏大。
 
 **接口文件没改**：`NodeStatus.msg` 头部注释（以及照抄它的 DESIGN 附录 C）仍写着 “KEEP_LAST(1)”。按 CONVENTIONS，接口包任何改动都要升协议版本、12 个节点一起升级；深度只是本地设置，不影响匹配和互通，为一行注释升协议不划算，所以留着，等下次因别的原因升协议时一并改。
 
 远端留下 `cap/`（35 MB）、`trials/`（180 MB）的抓包和日志，`collide/` 实验脚本；容器和网络都已删除。
+
+## 二十、11-08：资源采样移出心跳的回调组（DESIGN 10.1 第 26 条）
+
+- `ControlNode` 新增 `_probe_group`（互斥回调组）和定时器 `_sample_resources`，周期 `status_period × slow_fields_every`（默认 5 秒）；心跳 `_publish_node_status` 只读 `self._usage`（冻结的 `Usage`，一次引用赋值，不用加锁）。第一次采样之前报 -1，调度器按默认占用率处理（DESIGN“实现时的调整”第 22 条）。
+- 为什么是 5 秒：资源只随每第 5 条心跳发送（`slow_fields_every`），按 1 秒采样时有 4 次结果没人用；`nvidia-smi` 的调用次数降到五分之一，CPU 占用率变成 5 秒内的平均，正好对上发送间隔。
+- 规则写进 CONVENTIONS 3.3：心跳的回调组里不做阻塞调用。
+- 测试：fake_ros 记下定时器和订阅的回调组（只记录，仍然一个线程跑所有定时器）。新测试包住每个节点的 `probe.sample`，从调用栈找出是哪个定时器在采样，检查它的回调组不是心跳订阅或心跳定时器的组，并且 FixedProbe 的 20% 送到了所有节点。故意改坏 3 处（心跳里直接采样、采样定时器放进心跳的组、去掉采样定时器）都被发现。
+- 没在远端真机上复测 RTT：本次只改了线程归属，心跳收发路径没变。
