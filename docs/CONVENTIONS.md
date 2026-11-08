@@ -110,14 +110,16 @@
 
 | 端点 | Reliability | History | Durability | 原因 |
 |---|---|---|---|---|
-| `/cluster/node_status` | BEST_EFFORT | KEEP_LAST(1) | VOLATILE | 只有最新值有用，丢一条下一秒就补上 |
-| `<ns>/exec/status` | BEST_EFFORT | KEEP_LAST(1) | VOLATILE | 同上 |
+| `/cluster/node_status` | BEST_EFFORT | 发布端 KEEP_LAST(1)，订阅端 KEEP_LAST(32) | VOLATILE | 每个节点只有最新值有用，丢一条下一秒就补上。但订阅端的历史槽位是 12 个节点共用的（ROS 2 消息没有 key），深度为 1 时相位相近的两个节点每秒互相覆盖，先到的那个长期丢失（DESIGN 10.1 第 25 条） |
+| `<ns>/exec/status` | BEST_EFFORT | KEEP_LAST(1) | VOLATILE | 只有最新值有用；只有本机执行器一个发布者，不会互相覆盖 |
 | `/cluster/task_list` | RELIABLE | 发布端 KEEP_LAST(1)，订阅端 KEEP_LAST(32) | **两端都** TRANSIENT_LOCAL | 只在变化时发，新订阅者要拿到每个节点的最新一份。订阅端不声明 TRANSIENT_LOCAL 就收不到历史；ROS 2 消息没有 key，订阅端的历史槽位是所有发布者共用的，深度为 1 会互相覆盖 |
 | `/cluster/command`、`exec_event`、`request`、`reply` | RELIABLE | KEEP_LAST(32) | VOLATILE | 低频；丢了由对账或重试兜底 |
 | `/cluster/task_status` | RELIABLE | KEEP_LAST(100) | VOLATILE | 事件流 |
 | `<ns>/camera/image` | sensor data 预设 | — | — | 沿用复用包 |
 | `.../input/airsim/...`、`.../compressed` | sensor data 预设 | — | — | 图像流丢一帧没关系，后面的帧会补上 |
 | `<ns>/task/result` | RELIABLE | KEEP_LAST(10) | VOLATILE | 沿用复用包 |
+
+**多个节点发布的 topic，订阅端深度不小于节点数（12）**：ROS 2 消息没有 key，一个订阅端只有一份历史，所有发布者共用。`test_ros_integration.py` 检查所有这类订阅。
 
 QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义在 `cccp_node/names.py`。各处必须统一引用这两个模块，不允许在各自的代码里临时创建 QoS 或手写端点名。
 

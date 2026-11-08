@@ -8,11 +8,18 @@ def _profile(depth: int, reliability: ReliabilityPolicy,
     return QoSProfile(depth=depth, history=HistoryPolicy.KEEP_LAST, reliability=reliability, durability=durability)
 
 
-NODE_STATUS = _profile(1, ReliabilityPolicy.BEST_EFFORT)
+# ROS 2 messages have no key, so a subscription keeps ONE history for all its publishers: on a
+# topic every node publishes, a depth of 1 lets a sample overwrite another node's sample that
+# arrived just before it and was not yet taken. Heartbeats of two nodes whose 1 Hz timers are a
+# few milliseconds apart then collide every second: the earlier node's are lost at every receiver,
+# for as long as both run (measured on Cyclone DDS: DESIGN 10.1 #25). Such subscriptions hold a
+# sample from each of the 12 nodes with room for a stalled executor.
+NODE_STATUS_PUB = _profile(1, ReliabilityPolicy.BEST_EFFORT)
+NODE_STATUS_SUB = _profile(32, ReliabilityPolicy.BEST_EFFORT)
 EXECUTOR_STATUS = _profile(1, ReliabilityPolicy.BEST_EFFORT)
 # TaskList: both ends must be TRANSIENT_LOCAL, or late joiners get no history. The subscription
-# needs depth for every publisher: ROS 2 messages have no key, so its history is shared by all
-# 12 nodes' TaskLists, and a depth of 1 would let them overwrite each other on (re)connection.
+# needs depth for every publisher, as above; here a depth of 1 would also let the 12 nodes'
+# TaskLists overwrite each other on (re)connection.
 TASK_LIST_PUB = _profile(1, ReliabilityPolicy.RELIABLE, DurabilityPolicy.TRANSIENT_LOCAL)
 TASK_LIST_SUB = _profile(32, ReliabilityPolicy.RELIABLE, DurabilityPolicy.TRANSIENT_LOCAL)
 COMMAND = _profile(32, ReliabilityPolicy.RELIABLE)

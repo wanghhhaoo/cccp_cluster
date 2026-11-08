@@ -463,3 +463,19 @@ def test_task_list_reaches_late_subscribers_only_if_both_ends_are_transient_loca
     node.create_subscription(TaskList, "/cluster/task_list", volatile.append, qos.COMMAND)
     wait_for(lambda: late)
     assert [m.node_name for m in late] == ["edge-01"] and volatile == []
+
+
+@pytest.mark.parametrize("cluster", ["local_calls"], indirect=True)
+def test_subscriptions_to_topics_several_nodes_publish_keep_a_sample_from_each_of_12(cluster):
+    """A keyless subscription has one history for all publishers. With depth 1, heartbeats of two
+    nodes a few milliseconds apart overwrite each other every second (DESIGN 10.1 #25); fake_ros
+    delivers synchronously and cannot show it, so the depth is checked where it is declared."""
+    from cccp_node import names
+    wait_for(lambda: active_leader(cluster))
+    with fake_ros.BUS.lock:
+        shared = {topic for topic, publishers in fake_ros.BUS.publishers.items()
+                  if len({id(p.node) for p in publishers if p.alive}) > 1}
+        subscriptions = {topic: list(fake_ros.BUS.subscriptions.get(topic, [])) for topic in shared}
+    assert {names.NODE_STATUS_TOPIC, names.TASK_LIST_TOPIC, names.EXEC_EVENT_TOPIC} <= shared
+    for topic, subs in subscriptions.items():
+        assert subs and all(s.qos.depth >= 12 for s in subs), topic

@@ -225,7 +225,7 @@ def _transient_local(qos):
 
 class Publisher(_Entity):
     def __init__(self, node, msg_type, topic, qos=None):
-        self.node, self.msg_type, self.topic = node, msg_type, topic
+        self.node, self.msg_type, self.topic, self.qos = node, msg_type, topic, qos
         self.keep = getattr(qos, "depth", 1) if _transient_local(qos) else 0
         self.history = []
 
@@ -250,8 +250,8 @@ class Publisher(_Entity):
 
 
 class Subscription(_Entity):
-    def __init__(self, node, msg_type, topic, callback):
-        self.node, self.msg_type, self.topic, self.callback = node, msg_type, topic, callback
+    def __init__(self, node, msg_type, topic, callback, qos=None):
+        self.node, self.msg_type, self.topic, self.callback, self.qos = node, msg_type, topic, callback, qos
 
 
 class Service(_Entity):
@@ -419,7 +419,7 @@ class Node:
         return publisher
 
     def create_subscription(self, msg_type, topic, callback, qos, **_):
-        subscription = Subscription(self, msg_type, self.resolve_topic_name(topic), callback)
+        subscription = Subscription(self, msg_type, self.resolve_topic_name(topic), callback, qos)
         with BUS.lock:
             BUS.subscriptions.setdefault(subscription.topic, []).append(subscription)
             replay = [m for p in BUS.publishers.get(subscription.topic, []) if p.alive and p.node.alive

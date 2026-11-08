@@ -114,10 +114,10 @@ class ControlNode(Node):
                             leader_name=lambda: self.election.state.leader)
         self.store.add_event_listener(self._on_table_events)
 
-        self._node_status_pub = self.create_publisher(NodeStatus, names.NODE_STATUS_TOPIC, qos.NODE_STATUS)
+        self._node_status_pub = self.create_publisher(NodeStatus, names.NODE_STATUS_TOPIC, qos.NODE_STATUS_PUB)
         self._task_list_pub = self.create_publisher(TaskList, names.TASK_LIST_TOPIC, qos.TASK_LIST_PUB)
         self._task_status_pub = self.create_publisher(TaskStatus, names.TASK_STATUS_TOPIC, qos.TASK_STATUS)
-        self.create_subscription(NodeStatus, names.NODE_STATUS_TOPIC, self._on_node_status, qos.NODE_STATUS,
+        self.create_subscription(NodeStatus, names.NODE_STATUS_TOPIC, self._on_node_status, qos.NODE_STATUS_SUB,
                                  callback_group=self._state_group)
         self.create_subscription(TaskList, names.TASK_LIST_TOPIC, self._on_task_list, qos.TASK_LIST_SUB,
                                  callback_group=self._state_group)
