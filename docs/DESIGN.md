@@ -450,7 +450,7 @@ QoS 集中定义在 `cccp_node/ros/qos.py`，端点名集中定义在 `cccp_node
 | 措施 | 内容 | 状态 |
 |---|---|---|
 | A. 砍掉 ROS 2 自带的开销 | 控制进程和数据面进程中的所有节点，创建时关闭参数服务和 rosout：`Node(name, start_parameter_services=False, enable_rosout=False)`（启动时传入的参数覆盖仍然有效，日志改写本地文件）；考虑把取图进程并入数据面进程，参与者从 36 个降到 24 个。改完后用 `ros2 node list`、`ros2 topic list`、`ros2 service list` 核对只剩自己定义的端点 | 待实施 |
-| B. 调 DDS 配置（XML，不改代码） | `NodeStatus` 走组播，其他消息走单播（无线设备允许的话，调高组播速率）；拉长参与者公告周期和租约（例如 10～30 秒；本系统判断节点是否在线用的是自己的心跳，不依赖 DDS 租约）；拉长可靠发布者的心跳周期（`TaskList` 设 3～5 秒左右，代价是丢失的可靠消息要晚一点才重传） | 待实施；确定 rmw 实现（Fast DDS 或 Cyclone DDS）后写成具体配置 |
+| B. 调 DDS 配置（XML，不改代码） | `NodeStatus` 走组播，其他消息走单播（无线设备允许的话，调高组播速率）；拉长参与者公告周期和租约（例如 10～30 秒；本系统判断节点是否在线用的是自己的心跳，不依赖 DDS 租约）；拉长可靠发布者的心跳周期（`TaskList` 设 3～5 秒左右，代价是丢失的可靠消息要晚一点才重传） | 部分完成：`deploy/cyclonedds.xml` 指定网卡、可切换 `AllowMulticast`（Cyclone 的默认值在无线网卡上只让发现报文走组播，心跳会给每个订阅者各发一份单播）；公告周期和租约等现场抓包后再定（`deploy/README.md`） |
 | C. 压缩心跳 | 节点编号代替名字、链路质量量化、二进制 `task_id`、资源和链路每 5 条心跳附带一次 | **已体现在 0.3 的消息定义中**（第 3.2 节、附录 C） |
 | D. 合并消息 | 讨论过去掉 `TaskReport`；改为 topic 方案后，`TaskReport` 升级为 `ExecEvent`，同时承担命令回执 | 已由 `ExecEvent` 取代 |
 
@@ -1602,7 +1602,7 @@ NET 的参照节点：任务规格有 `input_node`（数据所在节点）时用
 
 ### 10.2 尚未验证
 
-本机没有 ROS 2 Humble 和 Docker 权限，以下全部**没有跑过**。仿 ROS 测试（`test/fake_ros.py`）检查了接线、字段类型、有界数组和有界字符串、`TaskList` 两端是否都声明 TRANSIENT_LOCAL，但不能代替这些项：
+本机没有 ROS 2 Humble 和 Docker 权限。11-08 起在 10.160.4.17 上用容器做了一部分：`colcon build`、6～12 个容器在真实 Cyclone DDS 上运行（选主、换主、HETEROMAP、抓包，HANDOFF 第十七～十九节）、x86_64 镜像构建和 `deploy/` 部署脚本（HANDOFF 第二十二节）。下表各项在**板卡和真实自组网**上都还没有跑过。仿 ROS 测试（`test/fake_ros.py`）检查了接线、字段类型、有界数组和有界字符串、`TaskList` 两端是否都声明 TRANSIENT_LOCAL，但不能代替这些项：
 
 | 项目 | 风险 | 建议 |
 |---|---|---|
@@ -1610,7 +1610,7 @@ NET 的参照节点：任务规格有 `input_node`（数据所在节点）时用
 | 真实 DDS | 发现时间、QoS 匹配（尤其是 `TaskList` 的 TRANSIENT_LOCAL）、`BEST_EFFORT` 下的实际丢包、组播行为 | 单机多容器 → 现场 12 块板卡 |
 | 控制面流量 | 实际带宽和包数是否在第 2.8 节的预算内；rmw 是用组播还是单播；ROS 2 自带端点的开销 | 空闲 60 秒抓包，按 RTPS 子消息类型统计 |
 | 超时参数 | 5 秒离线判定在真实自组网上是否合适（第 6.5 节）；`executor_stall_grace_s`、大面积离线保护的阈值 | 用 `tc netem` 注入丢包和延迟；结果回填附录 A |
-| Docker 镜像构建 | 依赖版本 | — |
+| Docker 镜像构建 | 依赖版本 | x86_64 镜像已在 10.160.4.17 上构建并跑通（HANDOFF 第二十二节）；arm64 镜像要在 JetPack 上构建 |
 | Jetson GPU 采集路径 | `monitor/probes.py` 里的 sysfs 路径 | 在 Orin 上确认 |
 | Orin 上的推理耗时 | NVIDIA 的 torch 2.1 在 Jetson CPU 上跑 EfficientNet 会输出 NaN，必须用 `cuda:0` | 实测；决定是否需要 TensorRT |
 | AirSim 多客户端取图 | `each` 模式下 AirSim RPC 负载和 UE 帧率 | 实测；不行就切 `relay` |

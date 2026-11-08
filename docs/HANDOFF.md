@@ -410,3 +410,20 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
   - 没改的：`LinkEstimator` 对端沉默 10 秒后自己丢掉状态，之后接受任何 `incarnation`；执行器的 `incarnation` 和请求方的 `origin_incarnation` 只做相等比较。
 - **测试**：`test_cluster_view.py` 新增两项（离线后以较小的 `incarnation` 回来、旧一轮迟到的消息不再接受；离线前到达的 `TaskList` 被暂存后装上）。故意改坏 5 处（恢复旧规则、较小的一律接受、不记被替换的、不装暂存的、`task_list()` 不看当前一轮）都被发现。
 - 部署时仍然建议做时钟同步：日志和多块板卡的抓包要靠墙钟对齐。
+
+## 二十二、11-08：真机部署脚本（`deploy/`），在远端容器上验证
+
+**新增**（说明见 `deploy/README.md`）：
+- `cyclonedds.xml`：用 `${CCCP_DDS_INTERFACE}` 指定网卡（板卡上同时有 `wlan0`、`docker0`、USB 等网卡，不指定时 Cyclone 自己选，可能选错），`${CCCP_DDS_MULTICAST:-default}` 切换 `AllowMulticast`，`${CCCP_DDS_TRACE:-warning}` 控制日志。`start_node.sh` 在设置了 `CCCP_DDS_INTERFACE` 且没有 `CYCLONEDDS_URI` 时启用它，网卡不存在就报错退出；两个 Dockerfile 把它复制到 `/ros2_ws/`。
+- `node.env.example` + `run_node.sh`：一块板卡的配置和启动（`--network host`、`--restart unless-stopped`、日志 50 MB × 5、有 nvidia 运行时就加 `--runtime nvidia`、`CCCP_JOB_STORE` 内外同路径挂载）。`DOCKER_NETWORK` 可以改成 bridge 网络，在一台机器上起多个节点做回归。
+- `smoke_check.py`：从各网关的 `/api/ue/health`、`/api/ue/nodes` 检查在线数、集群主节点是否一致、term、执行器、链路丢失率；`--task` 建一个任务、等 Running、再销毁（503 自动重试）。只用标准库。
+
+**远端验证**（`review-d63c356/deploycheck/`，`docker build -f deploy/Dockerfile` 构建出 `cccp-node:p4-a7d2f2f-check`，3 个节点用 `run_node.sh` 起在 bridge 网络 `cccp-deploy-check`、域 93，关掉 PKCI/PKCT）：
+- 镜像构建成功（x86_64，CPU torch）。Cyclone 0.10.5 读到了配置：`Interfaces/NetworkInterface[@name]: eth0 {1}`、`selected interfaces: eth0`；`${X:-默认值}` 的写法也会展开。
+- `smoke_check.py` 全部通过（推理关掉，只有 “inference not ready” 告警）。
+- 杀掉集群主节点 edge-01：6.1 秒后 edge-02 当选，term 3；edge-01 重启回来显示 `online (restarted)`，没有抢回位置。（第一次测时 edge-01 在 1 秒内就重启了，别人还没判它离线，它过了启动等待后以 term 2 重新当选，这是对的。）
+- `CCCP_DDS_MULTICAST=false`：3 个节点互相看不见、各自当选，`smoke_check.py` 报 3 个网关各有一个集群主节点。没有 Peers 列表时发现必须靠组播，所以 `run_node.sh` 改为拒绝 `false`。`true` 正常。
+- 网卡名写错：`start_node.sh` 打印容器里实际有的网卡并退出（容器会按重启策略反复重启，`docker logs` 里能看到原因）。
+- 容器和网络都已删除，镜像 `cccp-node:p4-a7d2f2f-check` 留在远端，以后做单机回归可以直接用。
+
+**没验证的**：arm64 镜像（要在 JetPack 上构建）、无线网卡上 Cyclone `default` 的实际行为（只让 SPDP 走组播是按 Cyclone 的说明，要在板卡上抓包确认）、`--runtime nvidia`、`--task`（远端这次没开推理，只用假网关测过）。

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Cyclone DDS settings of a cluster node (deploy/README.md). start_node.sh points CYCLONEDDS_URI here
+  when CCCP_DDS_INTERFACE is set. Cyclone expands the ${...} references from the environment:
+    CCCP_DDS_INTERFACE  the board's interface on the cluster network (wlan0, ...). Required: a board
+                        also has docker0, USB or wired interfaces, and Cyclone would pick one itself.
+    CCCP_DDS_MULTICAST  AllowMulticast: default | true | spdp. Not false: without a Peers list
+                        discovery needs multicast, and every node would be alone and lead itself
+                        (run_node.sh refuses it). Cyclone's "default" uses
+                        multicast only for discovery (SPDP) on a wireless interface, so heartbeats
+                        go out once per subscriber; "true" sends them once (802.11 multicast: no
+                        retransmission, lowest basic rate). Decide with the field capture
+                        (DESIGN 2.8, measure B); tools/rtps_loss.py prints each writer's destinations.
+    CCCP_DDS_TRACE      Tracing verbosity: warning (default), config (prints the interface and
+                        multicast choice at startup), fine, finest.
+  Discovery timing (measure B: longer participant announcement period and lease) stays at Cyclone's
+  defaults until the capture shows what it costs.
+-->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="${CCCP_DDS_INTERFACE}"/>
+      </Interfaces>
+      <AllowMulticast>${CCCP_DDS_MULTICAST:-default}</AllowMulticast>
+    </General>
+    <Tracing>
+      <Verbosity>${CCCP_DDS_TRACE:-warning}</Verbosity>
+      <OutputFile>stderr</OutputFile>
+    </Tracing>
+  </Domain>
+</CycloneDDS>

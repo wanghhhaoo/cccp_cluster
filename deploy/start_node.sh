@@ -26,6 +26,19 @@ LOG_LEVEL=${LOG_LEVEL:-INFO}
 export RCUTILS_LOGGING_MIN_SEVERITY=$LOG_LEVEL
 export RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
 
+# Which interface DDS uses (deploy/cyclonedds.xml). An explicit CYCLONEDDS_URI wins.
+if [ "$RMW_IMPLEMENTATION" = "rmw_cyclonedds_cpp" ] && [ -z "${CYCLONEDDS_URI:-}" ]; then
+	if [ -n "${CCCP_DDS_INTERFACE:-}" ]; then
+		if [ ! -e "/sys/class/net/${CCCP_DDS_INTERFACE}" ]; then
+			echo "[start_node] CCCP_DDS_INTERFACE=${CCCP_DDS_INTERFACE}: no such interface; here: $(ls /sys/class/net | tr '\n' ' ')" >&2
+			exit 1
+		fi
+		export CYCLONEDDS_URI="file://$(dirname "$(readlink -f "$0")")/cyclonedds.xml"
+	else
+		echo "[start_node] CCCP_DDS_INTERFACE not set: Cyclone DDS picks an interface itself" >&2
+	fi
+fi
+
 ENABLE_CONTROL=${ENABLE_CONTROL:-true}
 ENABLE_DATA_PLANE=${ENABLE_DATA_PLANE:-true}
 export ENABLE_PKCI=${ENABLE_PKCI:-true}
@@ -51,6 +64,7 @@ NS_ARGS=(-r "__ns:=/${ns_token}")
 
 echo "[start_node] NODE_NAME=$NODE_NAME NODE_ID=$NODE_ID ns=/${ns_token}"
 echo "[start_node] ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-N/A} RMW=$RMW_IMPLEMENTATION UE_HTTP_PORT=$UE_HTTP_PORT DEVICE=$COLLAB_DEVICE"
+echo "[start_node] DDS interface=${CCCP_DDS_INTERFACE:-auto} multicast=${CCCP_DDS_MULTICAST:-default} CYCLONEDDS_URI=${CYCLONEDDS_URI:-none}"
 
 if [ "$ENABLE_DATA_PLANE" = "true" ] && { [ "$ENABLE_PKCI" = "true" ] || [ "$ENABLE_PKCT" = "true" ]; }; then
 	python3 -c 'import torch, torchvision, numpy, PIL' || {

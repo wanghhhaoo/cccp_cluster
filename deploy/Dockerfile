@@ -1,7 +1,7 @@
 # x86_64 node image. Build from the repository root:
 #   docker build -f deploy/Dockerfile -t cccp-node:p4-$(git rev-parse --short HEAD) .
 # Run (host network so DDS reaches the other nodes; NODE_NAME must be unique in the cluster):
-#   docker run --network host -e NODE_NAME=edge-01 -e ROS_DOMAIN_ID=10 cccp-node:p4-...
+#   deploy/run_node.sh deploy/node.env   (host network, see deploy/README.md)
 # Adapted from CCCP edge/Dockerfile_build. The C++ monitor_node is no longer built:
 # resource reporting moved into the control process.
 FROM ros:humble
@@ -9,6 +9,7 @@ FROM ros:humble
 WORKDIR /ros2_ws
 COPY ros2_ws/src ./src
 COPY deploy/start_node.sh ./start_node.sh
+COPY deploy/cyclonedds.xml ./cyclonedds.xml
 RUN chmod +x /ros2_ws/start_node.sh
 
 RUN apt-get update \
