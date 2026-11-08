@@ -92,3 +92,21 @@ def test_node_ids_map_to_names_and_visible_peers_count_online_others():
     view.update(beat("edge-03"), now=4.0)
     assert (view.name_of(1), view.name_of(2), view.name_of(3)) == ("edge-01", "edge-02", None)
     assert view.visible_peers("edge-03", 4.0) == 1 and view.visible_peers("edge-03", 5.0) == 0
+
+
+def test_changes_report_nodes_going_offline_and_back_with_the_heartbeats_lost():
+    view = ClusterView(offline_timeout_s=5.0)
+    view.update(beat("a", seq=1), 0.0)
+    assert [(ch.name, ch.online, ch.silent_s) for ch in view.changes(0.0)] == [("a", True, 0.0)]
+    view.update(beat("a", seq=4), 1.0)                     # seq 2 and 3 were lost
+    assert view.changes(1.0) == []
+    [gone] = view.changes(6.0)
+    assert (gone.name, gone.online, gone.silent_s, gone.missed) == ("a", False, 5.0, 2)
+    assert view.changes(7.0) == []                         # reported once
+    view.update(beat("a", seq=24), 21.0)                   # kept sending while unheard: a loss in transit
+    [back] = view.changes(21.0)
+    assert (back.online, back.silent_s, back.missed, back.restarted) == (True, 20.0, 19, False)
+    view.changes(30.0)
+    view.update(beat("a", seq=1, incarnation=2), 40.0)     # restarted: its seq starts again
+    [again] = view.changes(40.0)
+    assert again.online and again.restarted and again.missed == 0

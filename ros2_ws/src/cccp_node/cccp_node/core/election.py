@@ -42,11 +42,13 @@ are therefore short-lived but possible (CONVENTIONS 5.0).
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Mapping
 
 from . import constants as c
 from .cluster_view import NodeView
 
+log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ElectionConfig:
@@ -79,6 +81,7 @@ class Election:
         self._leader = ""
         self._claimed_term = 0
         self._claim_seen = None          # local time a foreign claim was last heard
+        self._abstaining_for = ""        # the unheard leader this node last abstained for (logged once)
 
     @property
     def state(self) -> Leadership:
@@ -107,7 +110,7 @@ class Election:
             if best is not None and _rank(best) > _rank(mine):
                 self._follow(best, now)                       # a better-supported claim: step down
             elif unheard is not None and _rank(unheard) > _rank(mine):
-                self._abstain(unheard, now)                   # the others follow a leader I cannot hear
+                self._abstain(unheard, now, len(compatible) + 1)  # the others follow a leader I cannot hear
             elif highest > self._term:
                 self._term = highest + 1                      # stay ahead of lone claims
             return self.state
@@ -118,7 +121,7 @@ class Election:
 
         self._term = highest
         if unheard is not None:
-            self._abstain(unheard, now)                       # do not claim against it
+            self._abstain(unheard, now, len(compatible) + 1)  # do not claim against it
             return self.state
         waited_since = self._claim_seen if self._claim_seen is not None else self._started
         timeout = self._config.leader_timeout_s if self._claim_seen is not None else self._config.startup_grace_s
@@ -126,6 +129,7 @@ class Election:
             if self._first_candidate([me, *compatible.values()]) is me:
                 self._term = self._claimed_term = highest + 1
                 self._leader = self.node_name
+                self._abstaining_for = ""
             else:
                 self._leader = ""                             # the first candidate will claim
         return self.state
@@ -141,8 +145,14 @@ class Election:
         majority = (len(compatible) + 1) // 2 + 1             # of the nodes in view, this one included
         return [(supporters(x), term, (256, x)) for x, term in terms.items() if supporters(x) >= majority]
 
-    def _abstain(self, claim, now: float) -> None:
+    def _abstain(self, claim, now: float, in_view: int) -> None:
         """Follow nobody (see the module docstring), and wait leader_timeout_s before any claim."""
+        supporters, term, (_, leader) = claim
+        if self._abstaining_for != leader:
+            log.info("node=%s is followed by %d of the %d nodes in view (term=%d) but not heard here: %s",
+                     leader, supporters - 1, in_view, term,
+                     "stepping down, following nobody" if self._leader == self.node_name else "not claiming")
+            self._abstaining_for = leader
         self._leader = ""
         self._term = max(self._term, claim[1])
         self._claim_seen = now
@@ -157,6 +167,7 @@ class Election:
     def _follow(self, claim, now: float) -> None:
         _, self._term, (_, self._leader) = claim
         self._claim_seen = now
+        self._abstaining_for = ""
 
 
 def _node_key(view: NodeView) -> tuple[int, str]:

@@ -172,6 +172,15 @@ class ControlNode(Node):
         visible = self.cluster.visible_peers(self.node_name, now)
         me = NodeView(self.node_name, node_id=self.node_id, visible_peers=visible, inference_ready=inference_ready,
                       battery=self._battery)
+        for change in (ch for ch in self.cluster.changes(now) if ch.name != self.node_name):
+            # A node whose seq jumped by many while unheard kept sending: the loss was in transit
+            # (one-way loss shows as one node losing a peer the others still see), not a stall.
+            if change.online:
+                self.get_logger().info("node=%s online%s, unheard %.1f s, missed=%d heartbeats" % (
+                    change.name, " (restarted)" if change.restarted else "", change.silent_s, change.missed))
+            else:
+                self.get_logger().warning("node=%s offline: last heartbeat %.1f s ago, missed=%d before" % (
+                    change.name, change.silent_s, change.missed))
         leadership = self.election.update(peers, now, me)
         self._follow_role(leadership.is_self)
         self._seq += 1

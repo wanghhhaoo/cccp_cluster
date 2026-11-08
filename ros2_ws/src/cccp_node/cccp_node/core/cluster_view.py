@@ -114,6 +114,16 @@ class TaskListView:
     node_id: int = 0
 
 
+@dataclass(frozen=True)
+class NodeChange:
+    """A node came online or went offline in this node's view (ClusterView.changes)."""
+    name: str
+    online: bool
+    silent_s: float     # going offline: since its last heartbeat; coming back: how long it was unheard
+    missed: int = 0     # heartbeats lost while it was online (gaps in seq of one incarnation)
+    restarted: bool = False   # came back with a new incarnation
+
+
 class ClusterView:
     """Latest NodeView and TaskListView of each node plus the local time the node was last heard.
 
@@ -130,6 +140,10 @@ class ClusterView:
         self._listed_at: dict[str, float] = {}
         self._names: dict[int, str] = {}
         self._ids: dict[str, int] = {}
+        self._reported: dict[str, float] = {}     # online as last reported by changes(): name -> last heard
+        self._missed: dict[str, int] = {}         # heartbeats lost since changes() last reported the node
+        self._restarted: set[str] = set()
+        self._reported_off: dict[str, float] = {}  # last heard, for nodes changes() reported offline
 
     def update(self, view: NodeView, now: float) -> bool:
         """Record a heartbeat received at local monotonic time now.
@@ -145,6 +159,10 @@ class ClusterView:
                     return False
                 if view.incarnation == known.incarnation and view.seq <= known.seq:
                     return False
+                if view.incarnation == known.incarnation:
+                    self._missed[view.name] = self._missed.get(view.name, 0) + view.seq - known.seq - 1
+                else:
+                    self._restarted.add(view.name)
                 if not view.slow:
                     view = replace(view, slow=known.slow, **{f: getattr(known, f) for f in SLOW_FIELDS})
             self._views[view.name] = view
@@ -170,6 +188,27 @@ class ClusterView:
             if task_list.node_id:
                 self._register(task_list.name, task_list.node_id)
             return True
+
+    def changes(self, now: float) -> list[NodeChange]:
+        """Nodes that came online or went offline since the previous call, for the log: one-way
+        heartbeat loss shows up as one node's view losing a node the others still see."""
+        with self._lock:
+            result = []
+            for name in sorted(self._reported):
+                if not self._online(name, now):
+                    seen = self._seen_at.get(name)
+                    result.append(NodeChange(name, False, now - seen if seen is not None else 0.0,
+                                             self._missed.pop(name, 0)))
+                    del self._reported[name]
+            for name in sorted(n for n in self._views if n not in self._reported and self._online(n, now)):
+                silent = self._seen_at[name] - self._reported_off.get(name, self._seen_at[name])
+                result.append(NodeChange(name, True, silent, self._missed.pop(name, 0), name in self._restarted))
+                self._restarted.discard(name)
+                self._reported[name] = self._seen_at[name]
+            for change in result:
+                if not change.online:
+                    self._reported_off[change.name] = self._seen_at.get(change.name, now)
+            return result
 
     def task_list(self, name: str) -> TaskListView | None:
         """The node's TaskList, if it is as new as its latest heartbeat says. None while the

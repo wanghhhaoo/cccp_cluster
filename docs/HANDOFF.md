@@ -354,3 +354,8 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 - 先在临时脚本里比较了几种写法：跟随听不到的 X 会造成“僵尸主节点”（X 死后大家互相引用它）；不要求过半，只有少数节点听得到的集群主节点会让其他节点永远无主；过半条件只加在“不声明”上、不加在“卸任”上，刚声明的节点会被马上劝退，term 照样乱抬。
 - 测试（`test_election.py` 新增 9 项）：卸任但不跟随、不声明、少数跟随不挡选举；按秒推进的多节点仿真 `simulate()`，覆盖服务器上的情况、运行中变单向、双向互相听不到、只有一个节点听得到主节点、主节点死后无僵尸（换主不超过 7 秒）；固定种子的 300 例随机单向丢失扫描（旧规则 24 例多主，已核对）。
 - 故意改坏 6 处，5 处被发现。没被发现的是“无主时不重置声明计时器”：节点离线要 5 秒才判定，一条心跳丢了视图不会变，间接证据不会闪断，所以这个计时器在现有参数下不起作用（叠加 10% 随机丢包的 100 例仿真，有无计时器结果相同）。这是等价改动，保留计时器作为防御。
+
+**阶段 2：可观测性**
+- `ClusterView.changes(now)` 返回自上次调用以来上线、离线的节点（`NodeChange`），控制进程每次发心跳前打日志：离线是 WARNING `node=<名> offline: last heartbeat 5.0 s ago, missed=<n> before`，回来是 INFO `node=<名> online, unheard <秒> s, missed=<n> heartbeats`（重启的标 `(restarted)`）。`missed` 按同一 incarnation 的 seq 缺口计算：回来时缺口大，说明对方一直在发、是传输途中丢了（单向丢失）；缺口约等于 0，说明对方自己停了（例如控制进程被饿死）。阶段 3 就靠这个区分。
+- 选主触发间接证据时打一次 INFO（同一个 X 只打一次）：`node=<X> is followed by <k> of the <n> nodes in view (term=<t>) but not heard here: stepping down, following nobody`（或 `not claiming`）。
+- 测试 2 项，故意改坏 4 处全部被发现。

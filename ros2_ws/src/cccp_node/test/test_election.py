@@ -264,3 +264,13 @@ def test_random_one_way_losses_never_leave_two_leaders():
         history = simulate(n, deaf({(a, b) for a, b in pairs if a != b}), 90)
         assert len(history[-1][1]) == 1, (seed, pairs, history[-1])
         assert history[-1][2] == history[59][2], (seed, pairs)
+
+
+def test_abstaining_is_logged_once_per_unheard_leader(caplog):
+    e = Election("n2", CONFIG, 0.0, node_id=2)
+    followers = [peer("n%d" % i, 3, follows="n1") for i in (3, 4, 5, 6)]
+    with caplog.at_level("INFO", logger="cccp_node.core.election"):
+        for now in (6.0, 7.0, 8.0):
+            e.update(peers(*followers), now)
+    [record] = caplog.records
+    assert "node=n1 is followed by 4 of the 5 nodes in view (term=3)" in record.getMessage()
