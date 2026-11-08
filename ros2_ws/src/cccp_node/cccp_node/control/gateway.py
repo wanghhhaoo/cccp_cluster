@@ -32,7 +32,7 @@ from .protocol import Reply, Request
 
 @dataclass(frozen=True)
 class GatewayConfig:
-    task_types: tuple[str, ...] = ("PKCI", "PKCT")
+    task_types: tuple[str, ...] = c.ALGORITHMS
     max_chain_depth: int = 5
     request_timeout_s: float = 15.0      # the leader's create/destroy wait (10 s) plus a margin
 

@@ -99,7 +99,7 @@ class UeBackend:
         return {"success": True, "message": "ok", "task_id": task_id, "name": record.name,
                 "task_type": record.spec.task_type, "mode": record.spec.mode, "status": record.status,
                 "node": record.primary, "target_nodes": list(record.nodes), "epoch": record.epoch,
-                "error_message": record.error_message, "result_url": "", "last_event": record.last_event}
+                "error_message": record.error_message, "result_url": record.result_url, "last_event": record.last_event}
 
     def list_nodes(self) -> tuple[bool, list, str]:
         now = self._clock()

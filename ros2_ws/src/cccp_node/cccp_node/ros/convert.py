@@ -40,7 +40,7 @@ MAX_PEERS = 15
 NAME_LENGTH, NODE_NAME_LENGTH, REASON_LENGTH, MESSAGE_LENGTH = 64, 32, 64, 128
 
 # uint8 enums. Index = value on the wire.
-ALGORITHMS = ("PKCI", "PKCT")                                   # bit i of algorithms_ready
+ALGORITHMS = c.ALGORITHMS                                   # bit i of algorithms_ready
 ROLES = (c.ROLE_PRIMARY, c.ROLE_HELPER)                          # TaskState.ROLE_*, TaskBrief.ROLE_*
 OPS = {p.START: 1, p.STOP: 2}                                    # Command.OP_*
 STOP_KINDS = {c.STOP_CANCEL: 1, c.STOP_STALE: 2, c.STOP_DUPLICATE: 3, c.STOP_UNASSIGNED: 4}
@@ -333,7 +333,7 @@ def fill_query_response(response: Any, reply: QueryReply) -> Any:
         response, success=True, error_code="", message="ok", name=record.name, task_type=record.spec.task_type,
         mode=record.spec.mode, status=record.status, node=record.primary, target_nodes=list(record.nodes),
         epoch=record.epoch, origin=record.spec.origin, parent_task_id=record.spec.parent_task_id,
-        error_message=record.error_message, result_url="", last_event=record.last_event,
+        error_message=record.error_message, result_url=record.result_url, last_event=record.last_event,
     )
 
 

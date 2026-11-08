@@ -228,6 +228,11 @@ class LeaderController:
         if event.kind == p.REJECTED:
             self._rejected(record, event)
             return
+        if (not record.terminal and record.spec.task_type == "HETEROMAP" and
+                event.node in record.helpers and event.kind == p.FAILED):
+            self._submit(MarkFailed(record.task_id, event.generation, event.error_code or c.INFERENCE_ERROR,
+                                    event.message, self._wall_ms()))
+            return
         if record.terminal or event.node != record.primary:
             return
         if event.kind == p.FAILED and event.error_code == c.NOT_READY and self._requeue_stalled(record, event):

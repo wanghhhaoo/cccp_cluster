@@ -71,6 +71,8 @@ if [ "$ENABLE_CONTROL" = "true" ]; then
 fi
 
 if [ "$ENABLE_DATA_PLANE" = "true" ]; then
+	HOST_ARGS=()
+	if [ -n "$AIRSIM_HOST" ]; then HOST_ARGS=(-p "airsim_host:=$AIRSIM_HOST"); fi
 	# Unbounded torch CPU threads made inference ~5x slower on a 144-core host (docs/HANDOFF.md).
 	# airsim:// task inputs are fetched on demand when AIRSIM_HOST is set (CONVENTIONS 4.4).
 	# AIRSIM_FETCH_MODE=each: every participant queries AirSim; relay: only the task primary does.
@@ -80,7 +82,7 @@ if [ "$ENABLE_DATA_PLANE" = "true" ]; then
 		-p "node_id:=${NODE_ID}" \
 		-p "max_tasks_per_node:=${MAX_TRACKERS}" \
 		-p "image_topic:=${IMAGE_TOPIC}" \
-		-p "airsim_host:=${AIRSIM_HOST}" \
+		"${HOST_ARGS[@]}" \
 		-p "airsim_port:=${AIRSIM_PORT}" \
 		-p "airsim_fps:=${AIRSIM_FPS_PARAM}" \
 		-p "airsim_raw_encoding:=${AIRSIM_RAW_ENCODING}" \

@@ -126,6 +126,14 @@ def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth
             raise SpecError(c.INVALID_INPUT, "%s mode needs helper_count >= 1" % mode)
         if targets and len(targets) != 1 + helper_count:
             raise SpecError(c.INVALID_INPUT, "target_nodes must list the primary and every helper")
+    if task_type in c.BATCH_TYPES:
+        if spec.input or spec.image_topic:
+            raise SpecError(c.INVALID_INPUT, "batch jobs use node-configured input")
+        if task_type == "HETEROMAP":
+            if mode != "fusion" or len(targets) != 6:
+                raise SpecError(c.INVALID_INPUT, "HETEROMAP needs fusion mode and six ordered target_nodes")
+        elif mode != c.MODE_LOCAL:
+            raise SpecError(c.INVALID_INPUT, "single-board job requires local mode")
     if spec.min_participants > 1 + helper_count:
         raise SpecError(c.INVALID_INPUT, "min_participants exceeds 1 + helper_count")
 
@@ -158,6 +166,11 @@ def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth
             raise SpecError(c.INVALID_INPUT, "params_json must be a JSON object")
     else:
         params = {}
+    if task_type in c.BATCH_TYPES:
+        allowed = {"tx", "score"} if task_type == "RSSMAP" else set()
+        if set(params) - allowed or ("tx" in params and not isinstance(params["tx"], str)) or (
+                "score" in params and not isinstance(params["score"], bool)):
+            raise SpecError(c.INVALID_INPUT, "invalid parameters for " + task_type)
     check = PARAM_CHECKS.get(task_type)
     if check is not None:
         check(params)

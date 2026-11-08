@@ -46,6 +46,12 @@ class TaskRecord:
     updated_ms: int = 0
 
     @property
+    def result_url(self):
+        if self.status == c.FINISHED and self.spec.task_type in c.BATCH_TYPES:
+            return f"/api/ue/tasks/{self.task_id}/artifacts/{self.epoch}-{self.assign_term}"
+        return ""
+
+    @property
     def terminal(self) -> bool:
         return self.status in c.TERMINAL
 

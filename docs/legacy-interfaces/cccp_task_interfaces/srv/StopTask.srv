@@ -1,0 +1,12 @@
+# <ns>/exec/task/stop：集群主节点通知执行节点停止任务，只有集群主节点可以调用。
+# 相比复用包 v0.1：新增 term、epoch、reason；服务名改为 <ns>/exec/task/stop。
+# 任务本来就不在运行时返回成功（幂等）。
+
+uint64 term
+int64 task_id
+uint32 epoch                      # 0 表示停止该任务的所有代次
+string reason
+---
+bool success
+string error_code
+string message

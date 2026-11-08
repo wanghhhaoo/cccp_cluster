@@ -51,8 +51,9 @@ from .annotate import annotate
 from .images import decompress
 from .inference import RosServiceBackend
 from .relay import ImageRelay
+from . import batch
 
-TASK_TYPES = ("PKCI", "PKCT")
+TASK_TYPES = c.ALGORITHMS
 
 
 def parse_params(task_type, params_json):
@@ -100,6 +101,7 @@ class ActiveTask:
     busy: bool = False
     frames: int = 0
     failures: int = 0
+    job: object = None
     reported_first_result: bool = False
     last_input: float = 0.0      # time.monotonic() of the start or of the last frame received
     assign_term: int = 0         # with epoch, the generation of this session
@@ -146,6 +148,7 @@ class TaskExecutor(Node):
                                      tombstone_ttl_s=float(self.get_parameter("tombstone_ttl").value))
         self._bridge = CvBridge()
         self._tasks = {}
+        self.create_timer(0.5, self._poll_jobs)
         self._subscriptions_by_topic = {}
 
         self._backend = backend if backend is not None else RosServiceBackend(self)
@@ -177,7 +180,7 @@ class TaskExecutor(Node):
 
     # ------------------------------------------------------------------ status
     def _algorithms_ready(self):
-        return self._backend.algorithms_ready()
+        return list(self._backend.algorithms_ready()) + batch.ready()
 
     def _publish_status(self):
         self._status_seq += 1
@@ -238,11 +241,12 @@ class TaskExecutor(Node):
             spec = TaskSpec.from_json(msg.spec_json)
             task_type = spec.task_type.strip().upper()
             if task_type not in TASK_TYPES:
-                raise ValueError("task_type must be PKCI or PKCT")
+                raise ValueError("unsupported algorithm: " + task_type)
             if generation.epoch <= 0:
                 raise ValueError("epoch must be positive")
             params = parse_params(task_type, spec.params_json)
-            unavailable = self._backend.wait_ready(task_type, self._wait_timeout)
+            unavailable = (("" if task_type in batch.ready() else "batch runtime unavailable")
+                           if task_type in batch.TYPES else self._backend.wait_ready(task_type, self._wait_timeout))
             if unavailable:
                 self._report(task_id, generation, p.REJECTED, c.NOT_READY, unavailable, msg)
                 return
@@ -278,14 +282,20 @@ class TaskExecutor(Node):
                 fetch=plan.fetch,
                 last_input=time.monotonic(),
             )
+            if task_type in batch.TYPES:
+                task.job = batch.start(task, self._node_id)
+                task.fetch = None
             if task.fetch:
                 self._feeds.acquire(*task.fetch)
             self._tasks[task.task_id] = task
             self._guard.started(task.task_id, task.generation)
-            self._ensure_subscription(task.image_topic, task.compressed)
+            if task.job is None:
+                self._ensure_subscription(task.image_topic, task.compressed)
             message = "%s started %s %s as %s, input %s via %s" % (
                 self._node_name, task_type, task.generation, task.role, task.input or "local camera",
                 self.resolve_topic_name(task.image_topic))
+            if task.job is not None:
+                message = f"{task_type} running on {self._node_name} as {task.role}"
             self._report(task_id, generation, p.RUNNING, message=message, command=msg)
             self.get_logger().info("task=%s gen=%s term=%d %s" % (task_id, task.generation, msg.term, message))
         except Exception as exc:
@@ -317,7 +327,7 @@ class TaskExecutor(Node):
                 return
         now = time.monotonic()
         for task in list(self._tasks.values()):
-            if task.image_topic != topic:
+            if task.job is not None or task.image_topic != topic:
                 continue
             task.last_input = now
             if task.busy:
@@ -355,11 +365,34 @@ class TaskExecutor(Node):
         future = self._backend.track(request)
         future.add_done_callback(lambda f: self._on_tracked(task, msg, f))
 
+    def destroy_node(self):
+        for task in list(self._tasks.values()):
+            if task.job is not None:
+                batch.stop(task.job)
+        return super().destroy_node()
+
+    def _poll_jobs(self):
+        for task in list(self._tasks.values()):
+            if task.job is None:
+                continue
+            process, directory = task.job
+            code = process.poll()
+            if code is None:
+                continue
+            if code:
+                with (directory / "run.log").open("rb") as stream:
+                    stream.seek(max(0, stream.seek(0, 2) - 1024))
+                    lines = stream.read().decode(errors="replace").strip().splitlines()
+                reason = lines[-1] if lines else "see run.log"
+                self._remove(task, p.FAILED, f"{task.task_type} exit {code}: {reason}", c.INFERENCE_ERROR)
+            else:
+                self._remove(task, p.FINISHED, str(directory))
+
     def _check_inputs(self):
         now = time.monotonic()
         for task in list(self._tasks.values()):
             idle = now - task.last_input
-            if task.role != c.ROLE_PRIMARY or idle < self._input_timeout:
+            if task.job is not None or task.role != c.ROLE_PRIMARY or idle < self._input_timeout:
                 continue
             reason = "no input frames for %.0f s from %s (%s)" % (
                 idle, task.input or "local camera", self.resolve_topic_name(task.image_topic))
@@ -468,6 +501,8 @@ class TaskExecutor(Node):
         self.get_logger().error("task=%s gen=%s failed: %s" % (task.task_id, task.generation, reason))
 
     def _remove(self, task, kind, message, error_code="", command=None):
+        if task.job is not None:
+            batch.stop(task.job)
         self._tasks.pop(task.task_id, None)
         self._guard.stopped(task.task_id)
         self._release_subscription(task.image_topic)

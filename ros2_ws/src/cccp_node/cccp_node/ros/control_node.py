@@ -157,7 +157,7 @@ class ControlNode(Node):
             "destroy_wait": 10.0,
             "request_timeout": 15.0,
             "battery": -1.0,
-            "task_types": ["PKCI", "PKCT"],
+            "task_types": list(c.ALGORITHMS),
             "ue_http_host": "0.0.0.0",
             "ue_http_port": 18090,
         }

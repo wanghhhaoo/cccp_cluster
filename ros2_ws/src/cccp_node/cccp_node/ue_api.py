@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+from pathlib import Path
+import shutil
 import re
 import threading
 import time
@@ -176,6 +179,28 @@ class _Handler(BaseHTTPRequestHandler):
             wait_s = min(float(query.get("wait", ["0"])[0]), 30.0)
             events, last = backend.events.since(after, wait_s)
             return self._send(200, {"success": True, "last_seq": last, "events": events})
+        artifact = re.fullmatch(PREFIX + r"/tasks/([0-9a-f-]{36})/artifacts/(\d+-\d+)(?:/((?:primary|id_[0-4])/[\w.-]+\.(?:pcd|npz)))?", url.path)
+        if artifact:
+            task_id, generation, filename = artifact.groups()
+            root = Path(os.getenv("CCCP_JOB_STORE", str(Path.home() / "cccp_jobs"))).resolve()
+            folder = root / task_id / generation
+            if not folder.is_dir() or not folder.resolve().is_relative_to(root):
+                return self._send(404, {"message": "artifact store unavailable on this node"})
+            if not filename:
+                files = sorted(str(p.relative_to(folder)) for p in folder.glob("*/*")
+                               if p.suffix in (".pcd", ".npz") and p.is_file())
+                return self._send(200, {"files": [url.path + "/" + f for f in files]})
+            path = folder / filename
+            if not path.is_file() or not path.resolve().is_relative_to(folder):
+                return self._send(404, {"message": "unknown artifact"})
+            with path.open("rb") as stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(os.fstat(stream.fileno()).st_size))
+                self.end_headers()
+                shutil.copyfileobj(stream, self.wfile)
+            return
         match = _TASK.match(url.path)
         if match and match.group(2) is None:
             result = backend.query(match.group(1))

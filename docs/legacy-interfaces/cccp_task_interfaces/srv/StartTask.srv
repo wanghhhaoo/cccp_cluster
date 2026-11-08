@@ -1,0 +1,30 @@
+# <ns>/exec/task/start：集群主节点下发任务给执行节点，只有集群主节点可以调用。
+# 相比复用包 v0.1：新增 term、epoch、role、primary_node、helper_nodes、mode、min_participants，
+# 服务名由 <ns>/task/start 改为 <ns>/exec/task/start。
+#
+# 执行节点的处理规则（开发规范 5.4）：
+#   term 小于本节点已知的最大值             -> 拒绝，STALE_TERM
+#   同一 task_id、同一 epoch 已经在运行     -> 返回成功（幂等，便于换主后重发）
+#   同一 task_id、更大的 epoch              -> 先停掉旧会话，再按新 epoch 启动
+#   同一 task_id、更小的 epoch              -> 拒绝，STALE_EPOCH
+
+string ROLE_PRIMARY="primary"
+string ROLE_HELPER="helper"
+
+uint64 term                       # 集群主节点的 Raft 任期
+int64 task_id
+uint32 epoch                      # 任务执行代次，每次重新调度 +1
+string role                       # primary | helper
+string primary_node               # 任务主节点；role=primary 时就是本节点
+string[] helper_nodes             # 辅助节点列表；只发给 primary
+string task_type
+string mode
+uint8 min_participants
+uint8 drone_id
+string level
+string image_topic
+string params_json
+---
+bool success
+string error_code
+string message
