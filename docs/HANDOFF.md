@@ -359,3 +359,12 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 - `ClusterView.changes(now)` 返回自上次调用以来上线、离线的节点（`NodeChange`），控制进程每次发心跳前打日志：离线是 WARNING `node=<名> offline: last heartbeat 5.0 s ago, missed=<n> before`，回来是 INFO `node=<名> online, unheard <秒> s, missed=<n> heartbeats`（重启的标 `(restarted)`）。`missed` 按同一 incarnation 的 seq 缺口计算：回来时缺口大，说明对方一直在发、是传输途中丢了（单向丢失）；缺口约等于 0，说明对方自己停了（例如控制进程被饿死）。阶段 3 就靠这个区分。
 - 选主触发间接证据时打一次 INFO（同一个 X 只打一次）：`node=<X> is followed by <k> of the <n> nodes in view (term=<t>) but not heard here: stepping down, following nobody`（或 `not claiming`）。
 - 测试 2 项，故意改坏 4 处全部被发现。
+
+**阶段 3：远端复现与验证**（`review-d63c356/`，6 个容器、真实 Cyclone DDS，`ROS_DOMAIN_ID=92`；日志 `logs-stage3-*`、`logs-inject-*`）
+- **按第一次的条件复现（HETEROMAP 和真实 RSSMAP/FASTLIVO 测试同时跑）：没有复现**。没有任何节点离线，HETEROMAP 一次完成，3 项 HTTP 测试通过。负载很轻：平均负载 16～25（144 核），每个节点容器约 2 核。所以“控制进程被 CPU 饿死”大概率不是原因。
+- **单向丢失注入**：在 edge-02 的网络命名空间里用 iptables 丢掉来自 edge-01 的包，持续 120 秒（`inject.sh`；用一个 `--net container:` + `NET_ADMIN` 的 alpine 容器，只影响测试容器）。
+  - 新规则：edge-02 打出 `node=edge-01 is followed by 5 of the 5 nodes in view (term=1) but not heard here: not claiming`，始终只有一个集群主节点、term 保持 1，HETEROMAP 在 epoch 1 跑完（120 个文件、哈希一致）。最终代码 `02ca9a6` 又跑了一遍，结果相同。
+  - **旧规则（`d63c356`）在同样的注入下也没有出事**：edge-02 看到的在线节点（4 个）比别人（5 个）少，候选排名靠后，就一直等别人宣布。也就是说，只有“听不到主节点”这一个条件，旧规则不会分裂；第一次出事还需要第二个条件：**edge-02 自己的心跳也时断时续**，别人看到的在线节点数降到和它一样，它按编号最小排第一而宣布。
+- **意外发现：某一次运行中 edge-02 的心跳持续丢失**（注入前就开始，注入解除后还在）。5 个接收方共记了 1254 条丢失，而 edge-02 的 seq 一直在涨，说明它在发、是途中丢的。6 次运行里有 2 次 edge-02 出现异常（第一次是收不到 edge-01，这一次是别人收不到它），其余 4 次完全正常。原因未查明，需要在出现时抓包（DESIGN 10.1 第 25 条）。新规则下这种情况也没有出事：只有一个集群主节点，任务正常完成。
+- **据此修了仿真和一处新问题**：原来的仿真给所有节点固定 `visible_peers = n-1`，会高估旧规则出事的频率；改为按各自视图上报后，发现“主节点只有 03 听得到”时，其他节点一直等排第一的 03 宣布，而 03 在跟随主节点、永远不会宣布。加了兜底：等候选超过 `candidate_wait_s`（10 秒）仍无声明，就不再等正在跟随别人的候选（DESIGN 5.3“等候选的兜底”）。先试过“一开始就不等跟随者”，结果主节点死时 5 个节点同时宣布（各节点超时有先后），所以改成超时兜底。新增“听不到主节点且自己心跳时断时续”的仿真测试：旧规则 100 例全部多主，新规则没有；300 例随机扫描仍是旧规则 24 例、新规则 0 例；主节点死后换主新旧都是 6 秒。故意改坏 4 处（去掉兜底、一开始就去掉跟随者、去掉间接证据、跟随时不重置等待计时）全部被发现。
+- 远端留下的东西：`review-d63c356/` 下的日志、产物和 `old-d63c356` 工作树（旧代码对照用），容器和网络都已删除。
