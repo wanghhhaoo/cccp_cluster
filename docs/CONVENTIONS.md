@@ -231,6 +231,7 @@ QoS 的配置集中定义在 `cccp_node/ros/qos.py`，端点名称集中定义�
 | START：同一 `task_id`、同一代次，任务已经在运行 | 回 `RUNNING`（幂等） |
 | START：同一 `task_id`、更大的代次 | 先停掉旧会话，再按新代次启动 |
 | START：同一 `task_id`、更小的代次 | 回 `REJECTED`（`STALE_EPOCH`） |
+| START：批处理任务的同一代次在本节点已经跑过（产物目录已存在，会话因执行器重启丢失） | 回 `REJECTED`（`NOT_READY`），集群主节点换新代次重新调度 |
 | START：本节点**实际**运行的其他任务数（不含同一 `task_id` 的旧会话）已达 `max_tasks_per_node` | 回 `REJECTED`（`BUSY`） |
 | STOP：本节点运行的代次不大于命令里的代次 | 停止，回 `STOPPED` |
 | STOP：本节点运行的代次比命令里的新 | 回 `REJECTED`（`STALE_EPOCH`），不停新会话 |
@@ -267,6 +268,8 @@ Pending ──assign(代次+1)───► Scheduled ──report Running──�
 - **运行中没有输入**：任务主节点超过 `input_timeout`（10 秒）收不到一帧，执行器报告 `Failed`（`NOT_READY`）并停掉任务。集群主节点不把它记为终态，而是执行 `Requeue`，并在 60 秒内避开这个节点（换个节点也许能取到数据）；同一个任务累计 `max_input_stalls`（3）个任务主节点都没有输入，或者任务用 `request_node` 指定了节点，才判定 Failed（`NOT_READY`）。辅助节点不做这项检查。计数只在集群主节点内存里，换主后重新计。
 - Pending 只存在于集群主节点的内存里，`pending_timeout_s`（8 秒）比网关的等待时间（10 秒）短，这样调用方总能得到明确的结果。
 - **`request_node` 是硬性指定**：被指定的节点挂掉后，任务不会迁移到其他节点。不指定节点的任务则会迁移。
+- **批处理任务**（`constants.BATCH_TYPES`：FASTLIVO、HETEROMAP、RSSMAP）每个任务一个子进程，自己结束：退出码 0 → 任务主节点报告 `Finished`，非 0 → `Failed`（`INFERENCE_ERROR`）。**辅助节点的进程先结束时，执行器保留会话、不报告**，直到集群主节点发 STOP；否则对账会把它当成“还没启动”而重发 START。HETEROMAP 任一辅助节点 `Failed`，整个任务 `Failed`。
+- **停止批处理任务不能阻塞执行器**：发 SIGTERM 后立即回 `STOPPED`，由执行器的定时器在 `STOP_GRACE_S`（5 秒）后对仍未退出的进程组发 SIGKILL；在 Docker 里运行的算法必须给容器起确定的名字，SIGKILL 之后按名字删除。
 
 ### 5.6 对账（集群主节点每秒执行一次）
 
@@ -274,7 +277,7 @@ Pending ──assign(代次+1)───► Scheduled ──report Running──�
 
 | 观察到的情况 | 动作 |
 |---|---|
-| 某节点运行着任务表**不知道**的任务，或者执行代次**比任务表新**。“某节点”包括在线节点，以及 `offline_retain_s` 内离线节点最后一份 `TaskList` | **接收**（`Adopt`），完整规格取自该节点的 `TaskList`；`TaskList` 还没追上心跳的节点这一轮跳过（任务表不知道的副本也先不停）。同一任务有多份副本时，取代次最大的；代次相同时，优先取任务主节点上的那份；再相同就取节点名最小的。任何节点的 `TaskList` 里有这个任务的墓碑，就接收为 Cancelled；任何节点的 `TaskList` 里有这个任务的墓碑，而任务表里它还没结束（另一个集群主节点在双主期间销毁了它），就把它改为 Cancelled。其余副本在下一轮被停掉 |
+| 某节点运行着任务表**不知道**的任务，或者执行代次**比任务表新**。“某节点”包括在线节点，以及 `offline_retain_s` 内离线节点最后一份 `TaskList` | **接收**（`Adopt`），完整规格取自该节点的 `TaskList`；`TaskList` 还没追上心跳的节点这一轮跳过（任务表不知道的副本也先不停）。同一任务有多份副本时，取代次最大的；代次相同时，优先取任务主节点上的那份；再相同就取节点名最小的。辅助节点保持胜出副本上报的顺序（HETEROMAP 按位置分配 id_0～id_4），不重新排序。任何节点的 `TaskList` 里有这个任务的墓碑，就接收为 Cancelled；任何节点的 `TaskList` 里有这个任务的墓碑，而任务表里它还没结束（另一个集群主节点在双主期间销毁了它），就把它改为 Cancelled。其余副本在下一轮被停掉 |
 | 同上，但这个任务的幂等键已经属于任务表里的另一个任务 | 判定为重复，向该节点发送 STOP（原因 `duplicate`） |
 | Pending | 按优先级从高到低调度；超过 `pending_timeout_s` 仍无可用节点，判定 Failed |
 | 任务主节点离线（超过 `node_offline_timeout_s` 没有收到它的 `NodeStatus`） | 重新调度：代次变为 `(epoch + 1, 当前任期)`。**大面积离线保护生效时暂停**（见下文） |
@@ -415,9 +418,9 @@ UE HTTP 接口的状态码必须与上表一致（`ue_api.py`）：可以重试�
 
 - 接口文件是平台组、算法组和 UE 之间的契约，任何改动都必须经过评审。
 - ROS 2 Humble 不支持类型演进。**`cccp_*` 接口包的任何改动，都会让新旧版本的节点无法互通**。因此：
-  1. 每次改动都要把 `NodeStatus.PROTOCOL_VERSION` 加 1（当前是 2），同时更新对应 `package.xml` 中的版本号；
+  1. 每次改动都要把 `NodeStatus.PROTOCOL_VERSION` 加 1（当前是 4），同时更新对应 `package.xml` 中的版本号；
   2. 12 个节点必须一起升级；协议版本不同的节点不参与选主，也不会被派发任务；
-  3. 镜像标签必须带上协议版本号，例如 `cccp-node:p2-<git短哈希>`。
+  3. 镜像标签必须带上协议版本号，例如 `cccp-node:p4-<git短哈希>`。
 - 每个接口文件开头的注释里，必须写明与上一版相比改了什么。
 - 不得改变已有字段的含义。如果需要新含义，就新增一个字段。
 

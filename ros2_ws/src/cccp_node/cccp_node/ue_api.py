@@ -185,14 +185,15 @@ class _Handler(BaseHTTPRequestHandler):
             root = Path(os.getenv("CCCP_JOB_STORE", str(Path.home() / "cccp_jobs"))).resolve()
             folder = root / task_id / generation
             if not folder.is_dir() or not folder.resolve().is_relative_to(root):
-                return self._send(404, {"message": "artifact store unavailable on this node"})
+                return self._send(404, {"success": False, "error_code": c.NOT_FOUND,
+                                        "message": "artifact store unavailable on this node"})
             if not filename:
                 files = sorted(str(p.relative_to(folder)) for p in folder.glob("*/*")
                                if p.suffix in (".pcd", ".npz") and p.is_file())
                 return self._send(200, {"files": [url.path + "/" + f for f in files]})
             path = folder / filename
             if not path.is_file() or not path.resolve().is_relative_to(folder):
-                return self._send(404, {"message": "unknown artifact"})
+                return self._send(404, {"success": False, "error_code": c.NOT_FOUND, "message": "unknown artifact"})
             with path.open("rb") as stream:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")

@@ -151,6 +151,18 @@ def test_unknown_running_tasks_are_adopted_not_stopped():
     assert w.step(1.0) == []                                      # now known and healthy
 
 
+def test_adoption_keeps_the_reported_helper_order():
+    """HETEROMAP maps helper positions to roles id_0..id_4: a new leader must not reorder them."""
+    w = World()
+    w.online = {"n1", "n2", "n3", "n4"}
+    order = ("n4", "n2", "n3")
+    w.runs("n1", "t-x", 1, primary="n1", helpers=order, key="kx")
+    for helper in order:
+        w.runs(helper, "t-x", 1, role=c.ROLE_HELPER, primary="n1", helpers=order, key="kx")
+    [adopt] = w.step(0.0)
+    assert adopt.helpers == order
+
+
 def test_task_whose_primary_died_is_adopted_from_a_helper_then_moved():
     w = World()
     w.online = {"n2"}

@@ -322,3 +322,21 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 - 选主结果新增 `Leadership.claimed_term`：本次在任以哪个任期声明。term 变了但 `claimed_term` 没变，说明一直在任：控制器保留任务表、等待中的请求和就绪状态，只把之后的命令改用新任期。卸任后再当选，`claimed_term` 会变，仍然从空表开始。
 - 安全性：原来的“清空重建”顺带处理了一种情况——双主期间另一个集群主节点销毁了某个任务，本节点的任务表里它还是 Running。保留任务表后，本节点会把它当成“任务丢失”而迁移，任务就复活了。所以对账增加了一条：任何节点有这个任务的墓碑、而任务表里它还没结束，就改为 Cancelled。墓碑只在销毁时产生，`task_id` 不会重复使用，所以这条规则不会误伤。
 - 测试：提升 term 后任务表、排队中的任务、等待中的创建请求都保留，新命令用新任期并被执行器接受；卸任后再当选、以及两次控制周期之间发生的重新当选，仍然从空表开始；双主期间被另一方销毁的任务不会复活。
+
+## 十七、11-08：接入三类批处理任务，评审修复（协议 4）
+
+**来源**：远端 `comp@10.160.4.17:~/cccp_integration_1108/cccp_cluster` 在 `e469a52` 上未提交的改动，接入了 FASTLIVO、RSSMAP、HETEROMAP 三类批处理任务（每个任务一个子进程，自己结束）。原样导入为一个提交，评审意见单独修复。远端的验收记录在 `docs/推理任务集成.md` 末尾（HETEROMAP 在单机 6 容器、真实 DDS 上跑通过）。远端 `~/cccp_cluster` 里另有 4 个旧协议的未跟踪定义（`RunningTask.msg` 等，10-26 留下的），集成副本把它们存到了 `docs/legacy-interfaces/`。
+
+**评审修复**（都已回填 DESIGN“实现时的调整”第 12～19 条、CONVENTIONS 5.4/5.5/5.6）：
+1. **HETEROMAP 辅助节点跑完后被重发 START，整个任务失败**。原来批处理进程退出就从执行器删掉会话，而 guard 对正常结束的任务不留记录。辅助节点比任务主节点早结束的那一小段时间里，对账看到“辅助节点在线但没在跑”，立刻重发 START（首次下发早已超过 5 秒）；执行器重新建产物目录时 `mkdir(exist_ok=False)` 报错，回 `INVALID_INPUT`，控制器当成永久错误判定 Failed。修复：辅助节点进程以 0 退出时保留会话、不报告，等任务主节点 Finished 后对账按“已是其他终态”发 STOP。
+2. **同一代次重复 START**（执行器重启后会话丢了、产物目录还在）：改为回 `REJECTED`（`NOT_READY`），集群主节点换新代次重新调度，不再判定失败。
+3. **停止时阻塞执行器、FASTLIVO 容器泄漏**：`batch.stop()` 原来在回调线程里同步等 5 秒再 SIGKILL，容器又不在进程组里。改为 SIGTERM 后立即返回，执行器的 0.5 秒定时器（`batch.reap`）在 `STOP_GRACE_S` 后 SIGKILL 进程组，并按确定的容器名（`cccp-fastlivo-<task>-<epoch>-<assign_term>`，经 `CCCP_FASTLIVO_CONTAINER` 传给 `fastlivo.sh`）`docker rm -f`。执行器退出时 `batch.shutdown` 同步收尾。
+4. **换主后辅助节点顺序被打乱**：对账接收任务时原来把辅助节点按名字排序，HETEROMAP 按位置分配 id_0～id_4。改为保持胜出副本上报的顺序。
+5. 任务类型改用常量（`c.FASTLIVO` 等），`"fusion"` 改用 `c.MODE_FUSION`；产物接口的 404 带 `success: false`、`error_code: NOT_FOUND`；`start_node.sh` 权限恢复为 755。
+6. **协议升为 4**：`algorithms_ready` 的位从 2 个扩到 5 个，字段类型没变，但含义变了，新旧节点混跑时能力位对不上。`NodeStatus.msg` 注释、`cccp_cluster_interfaces` 的 `package.xml`（0.2.0）、镜像标签（`p4-`）一起改。
+
+**测试**：新增 `test/test_batch_jobs.py`（6 项，用 shell 脚本冒充算法、假 `docker` 放在 PATH 里）：完成与产物下载、销毁不阻塞且 5 秒（测试里 1 秒）后 SIGKILL、辅助节点跑完后保留会话、同一代次重复 START 可重试、FASTLIVO 被 TERM 时自己删容器、被 KILL 后按名字删容器。`test_reconciler.py` 加了接收时保持辅助节点顺序，`test_constants.py` 检查能力位顺序和 `.msg` 注释一致。每一项都做了“故意改坏”检查（8 处改坏全部被发现）。
+
+**新的已知限制**（DESIGN 10.1 第 22、23 条）：`STOPPED` 之后进程最多还活 5 秒；HETEROMAP 任务主节点 Finished 后、STOP 到达辅助节点前集群主节点刚好挂掉，新集群主节点会从辅助节点接收任务并整个重跑。
+
+**没验证的**：真实算法只在远端跑过（本机没有模型和数据），修复后的版本没有在远端重跑；跨物理板卡、无线链路下的 HETEROMAP（每帧每架机上下行约 32 MiB 走共享盘）待部署阶段验证。

@@ -228,7 +228,9 @@ class LeaderController:
         if event.kind == p.REJECTED:
             self._rejected(record, event)
             return
-        if (not record.terminal and record.spec.task_type == "HETEROMAP" and
+        # Every HETEROMAP frame needs all five helpers: the fusion node would only wait for a
+        # failed one until its timeout, so fail the task now.
+        if (not record.terminal and record.spec.task_type == c.HETEROMAP and
                 event.node in record.helpers and event.kind == p.FAILED):
             self._submit(MarkFailed(record.task_id, event.generation, event.error_code or c.INFERENCE_ERROR,
                                     event.message, self._wall_ms()))

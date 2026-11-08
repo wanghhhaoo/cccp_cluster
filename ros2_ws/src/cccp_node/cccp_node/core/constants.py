@@ -6,7 +6,7 @@ fails if the two ever drift apart.
 """
 
 # NodeStatus.msg: nodes with another version neither vote nor get tasks (DESIGN 5.7)
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 # TaskStatus.msg
 PENDING = "Pending"
@@ -65,5 +65,13 @@ INVALID_STATE = "INVALID_STATE"
 DISPATCH_FAILED = "DISPATCH_FAILED"
 CHAIN_TOO_DEEP = "CHAIN_TOO_DEEP"
 
-BATCH_TYPES = ("FASTLIVO", "HETEROMAP", "RSSMAP")
-ALGORITHMS = ("PKCI", "PKCT") + BATCH_TYPES
+# Task types (algorithms). The order is the wire order of the algorithms_ready bit mask
+# (ros/convert.py), which is a uint8: at most 8 algorithms.
+PKCI = "PKCI"
+PKCT = "PKCT"
+FASTLIVO = "FASTLIVO"      # batch: lidar mapping from a recorded bag, one node
+HETEROMAP = "HETEROMAP"    # batch: collaborative BEV map, a fusion node and five helpers id_0..id_4
+RSSMAP = "RSSMAP"          # batch: radio propagation map, one node
+BATCH_TYPES = (FASTLIVO, HETEROMAP, RSSMAP)     # run as a process per task, end on their own
+ALGORITHMS = (PKCI, PKCT) + BATCH_TYPES
+HETEROMAP_NODES = 6

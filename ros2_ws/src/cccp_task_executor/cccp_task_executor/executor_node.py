@@ -148,6 +148,7 @@ class TaskExecutor(Node):
                                      tombstone_ttl_s=float(self.get_parameter("tombstone_ttl").value))
         self._bridge = CvBridge()
         self._tasks = {}
+        self._stopping = []          # batch.Job: stopped, not yet gone (batch.reap)
         self.create_timer(0.5, self._poll_jobs)
         self._subscriptions_by_topic = {}
 
@@ -283,7 +284,14 @@ class TaskExecutor(Node):
                 last_input=time.monotonic(),
             )
             if task_type in batch.TYPES:
-                task.job = batch.start(task, self._node_id)
+                try:
+                    task.job = batch.start(task, self._node_id)
+                except FileExistsError:
+                    # This generation already ran here and its session was lost (executor restart).
+                    # Not permanent: the leader moves the task to a new generation.
+                    self._report(task_id, generation, p.REJECTED, c.NOT_READY,
+                                 "%s already ran %s %s" % (self._node_name, task_type, generation), msg)
+                    return
                 task.fetch = None
             if task.fetch:
                 self._feeds.acquire(*task.fetch)
@@ -366,27 +374,33 @@ class TaskExecutor(Node):
         future.add_done_callback(lambda f: self._on_tracked(task, msg, f))
 
     def destroy_node(self):
-        for task in list(self._tasks.values()):
-            if task.job is not None:
-                batch.stop(task.job)
+        batch.shutdown([t.job for t in self._tasks.values() if t.job is not None] + self._stopping)
         return super().destroy_node()
 
     def _poll_jobs(self):
+        self._stopping = batch.reap(self._stopping)
         for task in list(self._tasks.values()):
-            if task.job is None:
+            job = task.job
+            if job is None or job.exited:
                 continue
-            process, directory = task.job
-            code = process.poll()
+            code = job.process.poll()
             if code is None:
                 continue
+            job.exited = True
             if code:
-                with (directory / "run.log").open("rb") as stream:
+                with (job.output / "run.log").open("rb") as stream:
                     stream.seek(max(0, stream.seek(0, 2) - 1024))
                     lines = stream.read().decode(errors="replace").strip().splitlines()
                 reason = lines[-1] if lines else "see run.log"
                 self._remove(task, p.FAILED, f"{task.task_type} exit {code}: {reason}", c.INFERENCE_ERROR)
+            elif task.role == c.ROLE_HELPER:
+                # Keep the finished session until the leader stops it, which it does once the primary
+                # finishes. Dropping it now would look like "not started yet" to reconciliation, which
+                # would send START again (DESIGN, implementation adjustment 16).
+                self.get_logger().info("task=%s gen=%s helper part finished, waiting for the primary"
+                                       % (task.task_id, task.generation))
             else:
-                self._remove(task, p.FINISHED, str(directory))
+                self._remove(task, p.FINISHED, str(job.output))
 
     def _check_inputs(self):
         now = time.monotonic()
@@ -501,8 +515,8 @@ class TaskExecutor(Node):
         self.get_logger().error("task=%s gen=%s failed: %s" % (task.task_id, task.generation, reason))
 
     def _remove(self, task, kind, message, error_code="", command=None):
-        if task.job is not None:
-            batch.stop(task.job)
+        if task.job is not None and batch.stop(task.job):
+            self._stopping.append(task.job)
         self._tasks.pop(task.task_id, None)
         self._guard.stopped(task.task_id)
         self._release_subscription(task.image_topic)

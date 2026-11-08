@@ -1,6 +1,6 @@
 # CCCP 分布式集群 设计文档
 
-版本 0.3｜2026-11-02｜对应代码：协议版本 3（`NodeStatus.PROTOCOL_VERSION = 3`），分支 `p3-control-plane`。已在仿 ROS 环境（`test/fake_ros.py`）中测试，**尚未在真实 ROS 2 / DDS 上运行**（第 10.2 节）
+版本 0.3｜2026-11-02｜对应代码：协议版本 4（`NodeStatus.PROTOCOL_VERSION = 4`；4 只扩展了能力位，见“实现时的调整”第 12 条），分支 `p3-control-plane`。已在仿 ROS 环境（`test/fake_ros.py`）中测试，**尚未在真实 ROS 2 / DDS 上运行**（第 10.2 节）
 
 读者：平台组成员，以及新加入、需要了解系统整体如何运转的同事。
 
@@ -75,6 +75,21 @@
 | 9 | 心跳不再带 CPU/GPU 型号，调度器按 `gpu_mem_total_mb > 0` 或 `gpu_usage >= 0` 判断有没有 GPU；UE 的 `GET /nodes` 不再返回型号，新增 `node_id`、`executor_alive` | 型号字符串已从心跳中去掉（本版变更第 2 条） | 8.2 |
 | 10 | 新错误码 `NOT_LEADER`（`ErrorCodes.msg`），可以重试，HTTP 503 | 第 4.1 节的“立即返回 NOT_LEADER” | 4.7 |
 | 11 | 内部代码仍按节点名工作，只有消息里用编号。还不知道名字（`TaskList` 未到）的节点，心跳先忽略；`TaskList` 里出现未知编号时用 `#<编号>` 占位，它不匹配任何在线节点 | 名字贯穿命名空间、`ros://` 地址和日志，只在消息边界转换改动最小 | 3.8 |
+
+### 批处理任务（11-08，协议 4）
+
+接入了三类**批处理任务**：`FASTLIVO`（激光雷达建图，单节点）、`RSSMAP`（信号强度预测，单节点）、`HETEROMAP`（协同 BEV 建图，1 个融合节点 + 5 个辅助节点）。它们不处理图像流，每个任务在执行器里起一个子进程，跑完自己结束。部署和调用见 `docs/推理任务集成.md`。
+
+| # | 调整 | 原因 | 章节 |
+|---|---|---|---|
+| 12 | `algorithms_ready` 位掩码从 2 位扩到 5 位：bit2 = FASTLIVO，bit3 = HETEROMAP，bit4 = RSSMAP（顺序即 `constants.ALGORITHMS`，uint8 最多 8 个）；协议版本升为 4 | 新增任务类型复用已有的能力位；字段含义变了，新旧节点不能混跑 | 附录 C.1 |
+| 13 | 批处理任务不能带 `input`/`image_topic`；HETEROMAP 必须是 `fusion`、正好 6 个有序的 `target_nodes`（融合节点、id_0～id_4），其他两类必须是 `local`；只有 RSSMAP 能带参数（`tx` 字符串、`score` 布尔） | 输入由节点配置（bag、数据目录），请求里不能指定可执行文件或路径 | 4.1 |
+| 14 | 产物按 `<task_id>/<epoch>-<assign_term>/<角色>/` 存到 `CCCP_JOB_STORE`；Finished 后 `result_url` 指向 `GET /api/ue/tasks/<id>/artifacts/<epoch>-<assign_term>`，返回逐文件下载地址 | 按执行代次分目录，重新调度不会覆盖旧代次的产物 | 4.1 |
+| 15 | HETEROMAP 任一辅助节点报告 Failed，整个任务 Failed | 每帧都需要五个辅助节点，融合节点只会等到超时 | 3.5 |
+| 16 | 辅助节点的批处理部分先跑完时，**保留会话**，直到集群主节点发 STOP（任务主节点报告 Finished 后，对账按“已是其他终态”停掉它） | 立即删掉的话，对账会把它当成“还没启动”而重发 START，第二次 START 又因第 18 条被拒绝，任务被判定失败 | 4.9 |
+| 17 | 接收任务时，辅助节点保持上报的顺序（取胜出副本的列表，再补其他副本的），不再按名字排序 | HETEROMAP 按辅助节点的位置决定它是 id_0～id_4 | 4.9 |
+| 18 | 同一代次在本节点已经跑过（产物目录已存在，会话因执行器重启丢失）时，START 回 `REJECTED`（`NOT_READY`），集群主节点 `Requeue` 到新代次 | 同一代次重跑会和旧产物混在一起；这不是永久错误，换一个代次就能跑 | 3.8 |
+| 19 | 停止批处理任务不阻塞执行器：发 SIGTERM 后立即回 `STOPPED`，5 秒后进程组还在就 SIGKILL；FASTLIVO 的容器按名字 `docker rm -f` | 原实现在执行器回调线程里同步等最多 5 秒，这期间发不了状态；容器归 Docker 守护进程，不在进程组里，SIGKILL 后会留在后台继续回放 bag。代价：`STOPPED` 之后进程最多还会活 5 秒（见第 10.1 节第 22 条） | 3.8 |
 
 ---
 
@@ -1066,7 +1081,7 @@ t≈10~11 s edge-02 预热结束：根据各节点的 TaskList 接收所有正�
 这让升级时的行为可预测：升级到一半时，新旧两个版本各自组成一个集群，互不干扰。但这不等于支持滚动升级：ROS 2 Humble 的接口不支持类型演进，新旧版本的节点本来就无法正常交换消息。所以：
 
 - 接口包（`cccp_*`）的任何改动，都要把 `PROTOCOL_VERSION` 加 1；
-- 12 个节点必须一起升级，镜像标签带上协议版本号（例如 `cccp-node:p3-<git短哈希>`）；
+- 12 个节点必须一起升级，镜像标签带上协议版本号（例如 `cccp-node:p4-<git短哈希>`）；
 - 不改变已有字段的含义，需要新含义就新增字段。
 
 正因为每次改接口都要全体升级，0.3 把能预见的字段一次性加了进去：`priority`、`preemption_policy`（在任务规格里）、`Command.leader_id`（以后做“只接受本机跟随的集群主节点的命令”时用）、`ExecEvent` 的 `FINISHED`（以后有终态任务时用）。以后启用它们只需要改逻辑。
@@ -1553,6 +1568,8 @@ NET 的参照节点：任务规格有 `input_node`（数据所在节点）时用
 | 19 | `priority` 只透传，不抢占 | 资源满时，高优先级任务也只能排队 | 10.3 第 10 条 |
 | 20 | ~~在任的集群主节点提升 term 时会清空任务表、重新预热~~（已解决：没有卸任就保留任务表，见第 3.3 节；为此对账增加了“有墓碑的未结束任务改为 Cancelled”，见第 4.9 节第 1 行） | — | — |
 | 21 | 某节点的 `TaskList` 一直没有到达时，它上面任务表不知道的副本既不接收也不停（“实现时的调整”第 2 条） | 这个副本无人管理 | 真机上观察；需要时加一个“等待超过 N 秒仍无 `TaskList` 就停掉”的规则 |
+| 22 | 批处理任务回 `STOPPED` 时进程可能还没退出（最多再活 `STOP_GRACE_S` = 5 秒，“实现时的调整”第 19 条） | 销毁成功后的几秒内，被停的算法仍占着 CPU/GPU；同一节点马上起新任务时资源紧 | 需要时让准入检查把“正在退出”的进程也算进去 |
+| 23 | HETEROMAP 的任务主节点报告 Finished 后、STOP 到达辅助节点之前，集群主节点刚好挂掉：新集群主节点从辅助节点的 `TaskList` 接收任务，发现任务主节点没在跑，就重新调度，整个任务重跑一遍 | 结果正确，但白跑一次（约 1～2 秒的窗口） | 辅助节点在 `TaskState` 里标出“本节点部分已完成”，接收时据此判定 Finished |
 
 ### 10.2 尚未验证
 
@@ -1743,7 +1760,7 @@ python3 tools/check_interfaces.py ros2_ws/src     # 在仓库根目录运行，�
 
 `test/fake_ros.py` 和 `tools/check_interfaces.py` 支持有界数组（`[<=N]`）、有界字符串（`string<=N`）和固定长度数组（`uint8[16]`），并会拒绝超长的值。
 
-## 附录 C 接口定义（协议版本 3）
+## 附录 C 接口定义（协议版本 4）
 
 **约定**：
 
@@ -1847,7 +1864,8 @@ uint8[16] task_id
 
 # 接口协议版本。cccp_* 接口包有不兼容修改时 +1；12 个节点必须一起升级。
 # 3：心跳拆成 NodeStatus + TaskList；节点编号代替名字；跨节点的 Service 改为 topic；执行代次 (epoch, assign_term)。
-uint8 PROTOCOL_VERSION=3
+# 4：algorithms_ready 增加 bit2～bit4（批处理任务 FASTLIVO、HETEROMAP、RSSMAP），字段类型不变。
+uint8 PROTOCOL_VERSION=4
 uint8 protocol_version
 
 # ---- 身份与序号 ----
@@ -1864,7 +1882,7 @@ uint8 visible_peers               # 本节点判定在线的对端数，用于�
 # ---- 就绪（每条都带）----
 bool executor_alive               # false：本机执行器超过 executor_timeout 没有出声；tasks 是最后一次已知的值
 bool inference_ready
-uint8 algorithms_ready            # 位掩码：bit0 = PKCI，bit1 = PKCT
+uint8 algorithms_ready            # 位掩码：bit0 = PKCI，bit1 = PKCT，bit2 = FASTLIVO，bit3 = HETEROMAP，bit4 = RSSMAP
 
 # ---- 任务摘要（每条都带）----
 TaskBrief[<=8] tasks

@@ -1,5 +1,5 @@
 """Constants mirrored outside the interface files must match them: core/constants.py for the
-string constants, and ros/convert.py's tables for the uint8 enums of protocol 3."""
+string constants, and ros/convert.py's tables for the uint8 enums of the protocol."""
 import re
 from pathlib import Path
 
@@ -62,6 +62,17 @@ def test_enum_tables_match_interfaces(relative, prefix, mirrored):
 
 def test_protocol_version():
     assert int_constants("NodeStatus.msg", "")["PROTOCOL_VERSION"] == constants.PROTOCOL_VERSION
+
+
+def test_algorithm_bits_match_the_interface_comment_and_fit_the_mask():
+    """algorithms_ready is a uint8 whose bit i is constants.ALGORITHMS[i]; NodeStatus.msg documents it."""
+    text = (SRC / "cccp_cluster_interfaces" / "msg" / "NodeStatus.msg").read_text()
+    [line] = [line for line in text.splitlines() if line.startswith("uint8 algorithms_ready")]
+    documented = [name for _, name in sorted((int(i), name) for i, name in re.findall(r"bit(\d+) = (\w+)", line))]
+    assert tuple(documented) == constants.ALGORITHMS == convert.ALGORITHMS
+    assert len(set(constants.ALGORITHMS)) == len(constants.ALGORITHMS) <= 8
+    assert convert.algorithms_from_mask(convert.algorithms_mask(constants.ALGORITHMS)) == constants.ALGORITHMS
+    assert set(constants.BATCH_TYPES) <= set(constants.ALGORITHMS)
 
 
 def test_event_kinds_cover_the_protocol():

@@ -282,9 +282,12 @@ def _adoptions(records, task_lists, buried) -> tuple[dict, dict]:
             rejected[task_id] = (c.STOP_STALE, "unreadable spec: %s" % exc)
             continue
         primary = winner.primary or node
-        helpers = {h for _, state in newest for h in state.helpers}
-        helpers |= {n for n, state in newest if state.role == c.ROLE_HELPER}
-        adoptions[task_id] = AdoptTask(task_id, generation, primary, tuple(sorted(helpers - {primary})),
+        # Helper order is part of the placement (HETEROMAP maps it to id_0..id_4), so keep the
+        # winner's list as reported, then whatever the other copies add.
+        reported = [h for _, state in [(node, winner), *newest] for h in state.helpers]
+        reported += sorted(n for n, state in newest if state.role == c.ROLE_HELPER)
+        helpers = tuple(dict.fromkeys(h for h in reported if h != primary))
+        adoptions[task_id] = AdoptTask(task_id, generation, primary, helpers,
                                        winner.idempotency_key, winner.name, spec, node, task_id in buried)
     return adoptions, rejected
 

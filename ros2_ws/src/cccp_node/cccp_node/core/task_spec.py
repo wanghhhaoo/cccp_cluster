@@ -129,8 +129,8 @@ def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth
     if task_type in c.BATCH_TYPES:
         if spec.input or spec.image_topic:
             raise SpecError(c.INVALID_INPUT, "batch jobs use node-configured input")
-        if task_type == "HETEROMAP":
-            if mode != "fusion" or len(targets) != 6:
+        if task_type == c.HETEROMAP:
+            if mode != c.MODE_FUSION or len(targets) != c.HETEROMAP_NODES:
                 raise SpecError(c.INVALID_INPUT, "HETEROMAP needs fusion mode and six ordered target_nodes")
         elif mode != c.MODE_LOCAL:
             raise SpecError(c.INVALID_INPUT, "single-board job requires local mode")
@@ -167,7 +167,7 @@ def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth
     else:
         params = {}
     if task_type in c.BATCH_TYPES:
-        allowed = {"tx", "score"} if task_type == "RSSMAP" else set()
+        allowed = {"tx", "score"} if task_type == c.RSSMAP else set()
         if set(params) - allowed or ("tx" in params and not isinstance(params["tx"], str)) or (
                 "score" in params and not isinstance(params["score"], bool)):
             raise SpecError(c.INVALID_INPUT, "invalid parameters for " + task_type)

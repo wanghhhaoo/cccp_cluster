@@ -1,7 +1,7 @@
 # Jetson / ARM64 node image. Build from the repository root on the target JetPack:
 #   docker build -f deploy/Dockerfile.arm64 \
 #     --build-arg TORCH_WHEEL_URL=... --build-arg TORCHVISION_WHEEL_URL=... \
-#     -t cccp-node:p3-$(git rev-parse --short HEAD)-arm64 .
+#     -t cccp-node:p4-$(git rev-parse --short HEAD)-arm64 .
 # The wheels must be NVIDIA builds matching the JetPack/L4T release; generic ARM
 # PyPI wheels are intentionally not used. Adapted from CCCP edge/Dockerfile_build_arm64.
 FROM ros:humble

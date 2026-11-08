@@ -6,7 +6,8 @@
 
 # 接口协议版本。cccp_* 接口包有不兼容修改时 +1；12 个节点必须一起升级。
 # 3：心跳拆成 NodeStatus + TaskList；节点编号代替名字；跨节点的 Service 改为 topic；执行代次 (epoch, assign_term)。
-uint8 PROTOCOL_VERSION=3
+# 4：algorithms_ready 增加 bit2～bit4（批处理任务 FASTLIVO、HETEROMAP、RSSMAP），字段类型不变。
+uint8 PROTOCOL_VERSION=4
 uint8 protocol_version
 
 # ---- 身份与序号 ----
@@ -23,7 +24,7 @@ uint8 visible_peers               # 本节点判定在线的对端数，用于�
 # ---- 就绪（每条都带）----
 bool executor_alive               # false：本机执行器超过 executor_timeout 没有出声；tasks 是最后一次已知的值
 bool inference_ready
-uint8 algorithms_ready            # 位掩码：bit0 = PKCI，bit1 = PKCT
+uint8 algorithms_ready            # 位掩码：bit0 = PKCI，bit1 = PKCT，bit2 = FASTLIVO，bit3 = HETEROMAP，bit4 = RSSMAP
 
 # ---- 任务摘要（每条都带）----
 TaskBrief[<=8] tasks

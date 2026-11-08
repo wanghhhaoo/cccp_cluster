@@ -2,7 +2,8 @@
 set -eo pipefail
 if [[ ${1:-} != --inside ]]; then
     output=$1
-    name="cccp-fastlivo-$(cat /proc/sys/kernel/random/uuid)"
+    # batch.py names the container so that it can remove it if this script is killed.
+    name="${CCCP_FASTLIVO_CONTAINER:-cccp-fastlivo-$(cat /proc/sys/kernel/random/uuid)}"
     trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
     trap 'exit 143' TERM INT
     calibration=()

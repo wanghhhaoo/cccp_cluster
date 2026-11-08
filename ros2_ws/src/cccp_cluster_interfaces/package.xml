@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>cccp_cluster_interfaces</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>ROS 2 interfaces for CCCP cluster membership, resource status and link quality.</description>
   <maintainer email="comp@example.com">CCCP Team</maintainer>
   <license>Proprietary</license>
