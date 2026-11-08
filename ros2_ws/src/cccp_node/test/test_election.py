@@ -1,3 +1,7 @@
+import random
+
+import pytest
+
 from cccp_node.core import constants as c
 from cccp_node.core.cluster_view import NodeView
 from cccp_node.core.election import Election, ElectionConfig
@@ -157,3 +161,106 @@ def test_claimed_term_tells_a_raised_term_from_a_new_election():
     assert not state.is_self and state.claimed_term == 0                     # stepped down
     state = n1.update({}, 20.0)                                              # alone: claims again
     assert state.is_self and state.claimed_term == state.term == 10
+
+
+# --------------------------------------------- indirect evidence: one-way heartbeat loss (DESIGN 5.3)
+
+def test_incumbent_steps_down_for_a_leader_the_others_follow_but_it_cannot_hear():
+    b = Election("n2", CONFIG, 0.0, node_id=2)
+    b.update({}, 6.0)                                              # claimed while it heard nobody
+    followers = [peer("n%d" % i, 5, follows="n1") for i in (3, 4, 5, 6)]
+    state = b.update(peers(*followers), 7.0)
+    assert (state.leader, state.is_self, state.term) == ("", False, 5)   # follows nobody, keeps the term
+    assert not b.update(peers(*followers), 9.0).is_self            # and does not claim again meanwhile
+
+
+def test_node_does_not_claim_while_a_majority_follows_a_leader_it_cannot_hear():
+    e = Election("n2", CONFIG, 0.0, node_id=2)
+    followers = [peer("n%d" % i, 3, follows="n1") for i in (3, 4, 5, 6)]
+    for now in (6.0, 10.0, 30.0):
+        state = e.update(peers(*followers), now)
+        assert (state.leader, state.is_self, state.term) == ("", False, 3)
+
+
+def test_a_leader_only_a_minority_follows_does_not_stop_the_others_electing():
+    e = Election("n2", CONFIG, 0.0, node_id=2)
+    view = peers(peer("n3", 1, follows="n1"), peer("n4", 1), peer("n5", 1), peer("n6", 1))
+    assert e.update(view, 6.0).is_self                             # 2 of 5 for n1: not a majority
+
+
+def simulate(n, hears, steps, init=None):
+    """n nodes, one Election.update per node per second. hears(t, a, b): does a receive b's heartbeat
+    at second t; a peer stays online for a for 5 s after its last heartbeat (node_offline_timeout_s).
+    hears(t, a, a) is False once a is dead. Returns [(t, sorted live claimants, highest term)]."""
+    names = ["edge-%02d" % i for i in range(1, n + 1)]
+    nodes = {x: Election(x, CONFIG, 0.0, node_id=i + 1) for i, x in enumerate(names)}
+    for x, (leader, term) in (init or {}).items():               # a starting state, as if elected earlier
+        e = nodes[x]
+        e._leader, e._term, e._claim_seen = leader, term, 0.0
+        e._claimed_term = term if leader == x else 0
+    last, history = {}, []
+    for t in range(1, steps + 1):
+        views = {x: NodeView(x, node_id=i + 1, leader_name=nodes[x].state.leader, term=nodes[x].state.term,
+                             is_leader=nodes[x].state.is_self, inference_ready=True, visible_peers=n - 1)
+                 for i, x in enumerate(names)}
+        for a in names:
+            for b in names:
+                if a != b and hears(t, a, b):
+                    last[(a, b)] = (t, views[b])
+        alive = [x for x in names if hears(t, x, x) is not False]
+        for a in alive:
+            seen = {b: v for (r, b), (heard, v) in last.items() if r == a and t - heard < 5}
+            nodes[a].update(seen, float(t), views[a])
+        history.append((t, sorted(x for x in alive if nodes[x].state.is_self),
+                        max(nodes[x].state.term for x in alive)))
+    return history
+
+
+def deaf(pairs, since=20):
+    """Everyone hears everyone, except receiver a stops hearing b for each (a, b) in pairs."""
+    return lambda t, a, b: None if a == b else not (t >= since and (a, b) in pairs)
+
+
+TWO_LEADERS = {"edge-01": ("edge-01", 1), "edge-02": ("edge-02", 2),
+               **{"edge-%02d" % i: ("edge-01", 1) for i in range(3, 7)}}
+
+
+@pytest.mark.parametrize("label, n, hears, init, leader", [
+    ("02 starts deaf to 01 while both lead (seen on the server)", 6, deaf({("edge-02", "edge-01")}, 0),
+     TWO_LEADERS, "edge-01"),
+    ("02 goes deaf to 01 while 01 leads", 6, deaf({("edge-02", "edge-01")}), None, "edge-01"),
+    ("01 and 02 deaf to each other", 6, deaf({("edge-02", "edge-01"), ("edge-01", "edge-02")}), None, "edge-01"),
+    ("only 03 still hears the leader 01", 6, deaf({(x, "edge-01") for x in ("edge-02", "edge-04", "edge-05",
+                                                                          "edge-06")}), None, "edge-02"),
+])
+def test_one_way_loss_settles_on_one_leader_with_a_stable_term(label, n, hears, init, leader):
+    history = simulate(n, hears, 60, init)
+    assert all(claimants == [leader] for _, claimants, _ in history[-20:]), (label, history[-20:])
+    assert history[-1][2] == history[-20][2], label                # no more term raising
+
+
+def test_a_dead_leader_is_replaced_and_nobody_keeps_naming_it():
+    """Followers lose the dead leader at different times; none may prop it up for the others."""
+    def hears(t, a, b):
+        if a == b:
+            return False if a == "edge-01" and t >= 20 else None
+        return not (b == "edge-01" and t >= 20 + int(a[-2:]) % 3)
+    history = simulate(12, hears, 50)
+    new = next(t for t, claimants, _ in history if t > 20 and claimants)
+    assert new - 20 <= 7                                           # node_offline_timeout_s + 2 heartbeats
+    assert all(claimants == ["edge-02"] for t, claimants, _ in history if t >= new)
+
+
+def test_random_one_way_losses_never_leave_two_leaders():
+    """Seeded sweep: 1-3 persistent one-way losses (sometimes towards the leader) from t=20.
+    The rules before indirect evidence ended with several leaders in 24 of these 300 cases."""
+    for seed in range(300):
+        rng = random.Random(seed)
+        n = rng.randint(4, 12)
+        names = ["edge-%02d" % i for i in range(1, n + 1)]
+        pairs = {(rng.choice(names), rng.choice(names)) for _ in range(rng.randint(1, 3))}
+        if rng.random() < 0.3:
+            pairs.add((rng.choice(names[1:]), "edge-01"))
+        history = simulate(n, deaf({(a, b) for a, b in pairs if a != b}), 90)
+        assert len(history[-1][1]) == 1, (seed, pairs, history[-1])
+        assert history[-1][2] == history[59][2], (seed, pairs)

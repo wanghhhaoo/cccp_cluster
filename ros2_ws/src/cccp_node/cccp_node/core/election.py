@@ -20,9 +20,19 @@ renewed by every NodeStatus. Rules, applied by every node on its own view
     heartbeat so everyone ranks alike: the best-connected node leads), then by
     the smaller node id. With good links everyone sees everyone and this is
     simply the smallest id;
-  * an incumbent keeps the role when a better candidate (re)joins.
+  * an incumbent keeps the role when a better candidate (re)joins;
+  * indirect evidence (DESIGN 5.3): a leader this node does not hear itself but that a
+    majority of the nodes it does hear follow (their leader_name, counted as supporters
+    like a claim). An incumbent outranked by such a leader steps down, and a node with no
+    claim to follow does not claim while one exists. Either way it then follows nobody:
+    following a leader nobody can vouch for directly would let nodes keep a dead leader
+    alive by naming it to each other. Without this, a node that stops hearing the leader
+    while everyone else still does claims, never hears the leader's claim to step down
+    for, and keeps raising its term past the one the followers report, so two leaders
+    outbid each other's term for as long as the one-way loss lasts.
 
-Node ids fall back to names where a view carries none (id 0).
+Node ids fall back to names where a view carries none (id 0); a leader known only from
+its followers ranks after any node with an id on otherwise equal claims.
 
 With lossy links two nodes can briefly both claim. Each steps down as soon as
 it hears a better claim, executors reject commands from the lower term
@@ -89,12 +99,15 @@ class Election:
 
         claims = [(supporters(n), v.term, _node_key(v)) for n, v in compatible.items() if v.is_leader]
         best = max(claims, key=_rank, default=None)
+        unheard = max(self._unheard_leaders(compatible, supporters), key=_rank, default=None)
         me = NodeView(self.node_name, node_id=self.node_id) if me is None else me
 
         if self._leader == self.node_name:
             mine = (supporters(self.node_name), self._term, _node_key(me))
             if best is not None and _rank(best) > _rank(mine):
                 self._follow(best, now)                       # a better-supported claim: step down
+            elif unheard is not None and _rank(unheard) > _rank(mine):
+                self._abstain(unheard, now)                   # the others follow a leader I cannot hear
             elif highest > self._term:
                 self._term = highest + 1                      # stay ahead of lone claims
             return self.state
@@ -104,6 +117,9 @@ class Election:
             return self.state
 
         self._term = highest
+        if unheard is not None:
+            self._abstain(unheard, now)                       # do not claim against it
+            return self.state
         waited_since = self._claim_seen if self._claim_seen is not None else self._started
         timeout = self._config.leader_timeout_s if self._claim_seen is not None else self._config.startup_grace_s
         if now - waited_since >= timeout:
@@ -113,6 +129,23 @@ class Election:
             else:
                 self._leader = ""                             # the first candidate will claim
         return self.state
+
+    def _unheard_leaders(self, compatible: Mapping[str, NodeView], supporters) -> list:
+        """Claims inferred for leaders this node does not hear but a majority of its view follows:
+        (supporters, highest term their followers report, node key)."""
+        terms: dict[str, int] = {}
+        for view in compatible.values():
+            leader = view.leader_name
+            if leader and leader != self.node_name and leader not in compatible:
+                terms[leader] = max(terms.get(leader, 0), view.term)
+        majority = (len(compatible) + 1) // 2 + 1             # of the nodes in view, this one included
+        return [(supporters(x), term, (256, x)) for x, term in terms.items() if supporters(x) >= majority]
+
+    def _abstain(self, claim, now: float) -> None:
+        """Follow nobody (see the module docstring), and wait leader_timeout_s before any claim."""
+        self._leader = ""
+        self._term = max(self._term, claim[1])
+        self._claim_seen = now
 
     def _first_candidate(self, views: list[NodeView]) -> NodeView:
         eligible = [v for v in views if self._eligible(v)] or views
