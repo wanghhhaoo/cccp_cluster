@@ -107,6 +107,12 @@
 | 24 | 新增事件日志：每个节点把控制面事件（选主、上线和离线、调度、迁移、停止、大面积离线保护、任务状态变化）和每 10 秒一份集群快照写到本机磁盘，`tools/merge_journal.py` 合并多块板卡的文件并检查时钟偏差 | 原设计只有日志和查询接口。外场出了问题无法登录排查，只能事后复盘；日志格式不统一、没有时间戳、随容器重建丢失，不能把 12 块板卡合并成一条时间线 | 2.9 |
 | 25 | 控制进程的 Python 日志行加上墙钟时间，格式与 rclpy 一致（`[级别] [秒] [名字]: 内容`） | 原格式没有时间，只能靠 `docker logs -t` 补 | CONVENTIONS 7.3 |
 
+### 执行器状态（11-09）
+
+| # | 调整 | 原因 | 章节 |
+|---|---|---|---|
+| 26 | 执行器在任务启动、停止、结束时，先补发一条 `ExecutorStatus`，再发报告这次变化的 `ExecEvent`（`REJECTED` 不补发）；状态的构造和发布加锁，定时器和命令回调并发时 seq 和内容保持一致 | 原来状态只在 1 Hz 定时器上发，而集群主节点收到 `RUNNING` 就回复“创建成功”。集群主节点自己执行的任务，如果它在下一次状态之前掉电，它的 `TaskList` 里没有这个任务，新集群主节点无从接收，任务丢失（第 10.1 节第 28 条）。仿 ROS 测试 `test_task_running_on_the_leader_is_restarted_elsewhere_after_it_dies` 因此约一半失败 | 2.4、6.2 |
+
 ---
 
 ## 0 一页纸概览
@@ -296,9 +302,10 @@
 
 控制面**没有跨节点的阻塞调用**：下发是发布一条 `Command`，回执通过 `ExecEvent` 异步回来；网关转发是发布一条 `Request`，在本地等对应的 `Reply`。集群主节点也不需要为每个等待中的请求占一个线程：它记下请求的标识，结果出来时再发布 `Reply`。
 
-**数据面进程和控制进程之间**只有一个 topic：`<ns>/exec/status`（`ExecutorStatus`，1 Hz）。控制进程用它生成心跳里的任务摘要和本节点的 `TaskList`。
+**数据面进程和控制进程之间**只有一个 topic：`<ns>/exec/status`（`ExecutorStatus`，1 Hz；任务集合一有变化就立即补发一条，见下）。控制进程用它生成心跳里的任务摘要和本节点的 `TaskList`。
 
 - 执行器里，发布 `ExecutorStatus` 的定时器放在**独立的回调组**，不和推理回调共用线程，降低它被饿死的概率。
+- 任务启动、停止、结束时，执行器**先补发一条 `ExecutorStatus`，再发报告这次变化的 `ExecEvent`**。集群主节点收到 `RUNNING` 就回复“创建成功”；如果任务正跑在集群主节点自己身上，而它回复后立即掉电，其他节点要靠它的 `TaskList` 才知道这个任务（第 6.2 节）。只靠 1 Hz 定时器的话，这段时间最长 1 秒，任务会彻底丢失（“实现时的调整”第 26 条）。
 - 超过 3 秒（`executor_timeout_s`）没收到 `ExecutorStatus`，控制进程把心跳的 `executor_alive` 和 `inference_ready` 置为 false，**任务列表和墓碑保持最后一次已知的值**。调度器不再往这个节点派新任务；集群主节点对它已有的任务等 `executor_stall_grace_s`（10 秒）后再迁移（第 4.9 节）。
 - 只有执行器明确说“任务没了”（新的 `ExecutorStatus` 里没有这个任务，包括执行器重启后 `incarnation` 变了），才说明任务真的没了，按第 6.4 节处理。执行器没有出声，只说明暂时不知道。
 
@@ -324,7 +331,7 @@
 |---|---|---|---|---|---|
 | `/cluster/node_status` | `NodeStatus` | 所有节点 | 所有节点 | BEST_EFFORT, VOLATILE；发布端 KEEP_LAST(1)，订阅端 KEEP_LAST(32) | 1 Hz；平均约 250 B（第 3.2 节） |
 | `/cluster/task_list` | `TaskList` | 所有节点 | 所有节点 | RELIABLE, TRANSIENT_LOCAL；发布端 KEEP_LAST(1)，订阅端 KEEP_LAST(32) | 本节点任务或墓碑变化时 |
-| `<ns>/exec/status` | `ExecutorStatus` | 本机执行器 | 本机控制进程 | BEST_EFFORT, KEEP_LAST(1), VOLATILE | 1 Hz，只在本机 |
+| `<ns>/exec/status` | `ExecutorStatus` | 本机执行器 | 本机控制进程 | BEST_EFFORT, KEEP_LAST(1), VOLATILE | 1 Hz，任务集合变化时立即补发；只在本机 |
 | `/cluster/command` | `Command` | **集群主节点**（当选时创建） | 所有执行器 | RELIABLE, KEEP_LAST(32), VOLATILE | 调度、对账时 |
 | `/cluster/exec_event` | `ExecEvent` | 所有执行器 | **集群主节点**（当选时创建） | RELIABLE, KEEP_LAST(32), VOLATILE | 执行状态变化、命令回执 |
 | `/cluster/request` | `Request` | 所有网关 | **集群主节点**（当选时创建） | RELIABLE, KEEP_LAST(32), VOLATILE | 有请求时 |
@@ -1203,7 +1210,7 @@ t≈10~11 s edge-02 预热结束：根据各节点的 TaskList 接收所有正�
 4. 提交 C 的调用方在等待中收到失败：如果 UE 连的是其他节点，那个节点的网关最长等 15 秒后返回 `TIMEOUT`（HTTP 503）；如果 UE 直接连的就是 edge-01，则是 HTTP 连接断开。两种情况下 UE 都用同一个键重试（必要时换一个节点），edge-02 预热结束后新建 C 并调度。
 5. 提交 A 的调用方不需要做任何事：A 在约 11 秒后恢复运行。但它是从头开始的（PKCT 重新初始化），而且这段时间没有结果。
 
-0.2 中第 5 步是这个设计最大的弱点：A 丢失，而调用方并不知道。0.3 通过缓存离线节点的 `TaskList` 解决了“丢失”，剩下的是“从头开始”，与任务主节点故障时一样（第 6.3 节）。`leader_self_penalty`（10 分）仍然让调度器尽量不把任务放在集群主节点自己身上；节点充足时，集群主节点上通常没有任务。
+0.2 中第 5 步是这个设计最大的弱点：A 丢失，而调用方并不知道。0.3 通过缓存离线节点的 `TaskList` 解决了“丢失”，剩下的是“从头开始”，与任务主节点故障时一样（第 6.3 节）。前提是 A 已经在 edge-01 的 `TaskList` 里送到了其他节点：A 刚启动、edge-01 回复了“创建成功”就掉电的话，没有任何节点知道 A。为此执行器在报告 `RUNNING` 之前先发出状态（第 2.4 节），剩下的窗口是本机投递加一次 `TaskList` 传输的时间（第 10.1 节第 28 条）。`leader_self_penalty`（10 分）仍然让调度器尽量不把任务放在集群主节点自己身上；节点充足时，集群主节点上通常没有任务。
 
 ### 6.3 任务主节点挂掉：任务迁移
 
@@ -1648,6 +1655,7 @@ NET 的参照节点：任务规格有 `input_node`（数据所在节点）时用
 | 25 | ~~测试容器之间偶发持续的单向心跳丢失：6 次运行里有 2 次，edge-02 收不到 edge-01，或别人长时间收不到 edge-02（发送方 seq 一直在涨）~~（已查明并解决：“实现时的调整”第 21 条）。原因不在网络：抓包显示这些心跳都到了接收方的网卡，是被订阅端深度为 1 的历史覆盖掉的——两个节点的心跳相隔不到几毫秒时，先到的那条每秒都被后到的覆盖（HANDOFF 第十九节） | — | — |
 | 26 | ~~资源采样 `SystemProbe.sample()` 在 NVIDIA GPU 的机器上同步调用 `nvidia-smi`（实测 70～320 ms，超时 2 秒），而它在心跳定时器里、和心跳订阅同一个互斥回调组 | 这段时间心跳不被取走：深度 32 后不会丢，但会晚处理，链路 RTT 测量偏大；Jetson 读 sysfs，不受影响~~（已解决：“实现时的调整”第 22 条） | — |
 | 27 | ~~`incarnation` 取墙钟毫秒，板卡重启后时钟回退（没有 RTC 电池、外场没有 NTP）时，新的 `incarnation` 比旧的小，其他节点把它的心跳和 `TaskList` 都当成重启前迟到的消息丢掉 | 节点重启后约 5 分钟（`offline_retain_s`）对整个集群不可见；它的 `TaskList` 只在变化时发，被丢后集群主节点长期不知道它在跑什么~~（已解决：“实现时的调整”第 23 条） | — | — |
+| 28 | 集群主节点给自己派的任务，回复“创建成功”后、它的 `TaskList` 送到其他节点之前就掉电，任务丢失：没有节点知道它，不会被接收或重新调度，而调用方已经收到成功。窗口原来最长 1 秒（执行器状态的定时器周期），现在只剩本机投递加一次可靠传输（“实现时的调整”第 26 条） | 极小概率；`leader_self_penalty` 让集群主节点上通常没有任务 | 需要完全消除时：集群主节点对派给自己的任务，等跟随者心跳里的 `tasks_version` 追上之后再回复 |
 
 ### 10.2 尚未验证
 
@@ -1830,7 +1838,7 @@ NET 的参照节点：任务规格有 `input_node`（数据所在节点）时用
 | 数据源地址：解析、各角色的取数计划 | `test_input_source.py` |
 | 事件日志：公共字段、保留字段名、内存窗口、文件轮转和重启后续写、写盘线程、目录不可写时节点照常运行、快照内容；控制器在上任、预热结束、提升 term、卸任、调度、迁移、停止、销毁时的记录；`GET /api/ue/journal` | `test_journal.py`、`test_controller.py`、`test_ue_api.py` |
 | 合并工具：多板卡排序、时钟偏差的判断（3 个节点以上才指认，两个节点只报差值）、筛选、断电截断的行和重复文件 | `test_merge_journal.py` |
-| 端到端（仿 ROS，3 个控制进程 + 3 个执行器，两种推理后端各一遍）：创建 → 运行 → 结果 → 杀集群主节点后原地继续 → 杀任务主节点后迁移 → 杀运行任务的集群主节点后任务在别处重启 → 销毁；执行器卡住时宽限后才迁移；只有集群主节点持有它的端点；数据源地址各场景；没有输入帧时换节点、最终失败；`TaskList` 两端都是 TRANSIENT_LOCAL 才补发；换主时每个节点都把它写进自己的事件日志文件 | `test_ros_integration.py` |
+| 端到端（仿 ROS，3 个控制进程 + 3 个执行器，两种推理后端各一遍）：创建 → 运行 → 结果 → 杀集群主节点后原地继续 → 杀任务主节点后迁移 → 杀运行任务的集群主节点后任务在别处重启 → 销毁；执行器卡住时宽限后才迁移；只有集群主节点持有它的端点；数据源地址各场景；没有输入帧时换节点、最终失败；`TaskList` 两端都是 TRANSIENT_LOCAL 才补发；换主时每个节点都把它写进自己的事件日志文件；创建回复之前，任务已经在它所在节点的 `TaskList` 里到达所有节点 | `test_ros_integration.py` |
 | 真实模型权重 | `collab_inference/test/test_engines_real.py` |
 
 以上测试都不需要 ROS（Python 3.10）：
@@ -2229,7 +2237,7 @@ string<=128 last_event
 | `ros/dispatcher.py`、`ros/forwarder.py` | 改为发布 `Command`、`Request`，订阅 `ExecEvent`、`Reply` |
 | `ros/qos.py`、`names.py`、`convert.py` | 新 topic 的 QoS（尤其是 `TaskList` 两端的 TRANSIENT_LOCAL 和订阅端深度）；端点名；二进制 `task_id` 与字符串的转换 |
 | `ros/control_node.py` | 心跳的慢变部分；`executor_alive` 判定；生成并发布 `TaskList`；节点创建时关闭参数服务和 rosout（带宽措施 A） |
-| `cccp_task_executor/executor_node.py` | 订阅 `Command`、发布 `ExecEvent`；`ExecutorStatus` 定时器放进独立回调组；墓碑；PKCT 会话 ID；`TaskResult` 带 `assign_term` |
+| `cccp_task_executor/executor_node.py` | 订阅 `Command`、发布 `ExecEvent`；`ExecutorStatus` 定时器放进独立回调组，任务集合变化时先补发状态再发事件；墓碑；PKCT 会话 ID；`TaskResult` 带 `assign_term` |
 | `ue_api.py`、`control/ue_backend.py` | `NOT_LEADER` 映射为 503；销毁可能返回 503；创建接口接受 `priority`、`preemption_policy` |
 | `start_node.sh` | `NODE_ID`；`request_timeout` 取代 `dispatch_timeout` |
 | `test/fake_ros.py`、`tools/check_interfaces.py` | 支持有界数组、有界字符串、固定长度数组 |

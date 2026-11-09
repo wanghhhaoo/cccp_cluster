@@ -455,3 +455,27 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 - 故意改坏 18 处都被发现：不记 `leader_active`/`term_raised`/`task_stop`、丢掉迁移原因、不记销毁发起者、不用 context、轮转时删掉旧文件、重启时截断文件、close 时丢掉最后一批、快照不带链路、`snapshots=0` 无效、按两节点的换主指认偏差、`--node` 不认 `primary`、不去重、默认显示快照；控制进程不记 `leader_changed`、离线记成上线、退出时不记 `stop`。
 - 全量 313 项通过、3 项跳过。
 - **原来就有的不稳定测试**：`test_ros_integration.py::test_task_running_on_the_leader_is_restarted_elsewhere_after_it_dies[ros_services]` 偶尔 30 秒内等不到任务以新代次在别处运行。在未改动的提交 `2228652` 上（临时 worktree）跑 8 次失败 5 次，当时机器上同时在跑别的测试；空闲时大多能通过。与事件日志无关，原因还没查。
+
+## 二十四、11-09：查明不稳定的迁移测试——集群主节点自己的新任务可能丢失（DESIGN 10.1 第 28 条，“实现时的调整”第 26 条）
+
+**现象**：`test_task_running_on_the_leader_is_restarted_elsewhere_after_it_dies[ros_services]` 偶尔 30 秒内等不到任务以新代次在别处运行。在未改动的提交 `2228652` 上 8 次失败 5 次。
+
+**查法**：
+1. 用 INFO 日志复现。失败时新集群主节点只从 edge-02、edge-03 接收了 4 个任务，死掉的 edge-01 上那个任务既没有被接收，也没有被重新调度。
+2. 加一个临时探针，在创建回复返回、杀掉之前，看其他节点缓存的 edge-01 的 `TaskList`：8 次里有 2 次两个跟随者都还没有这个任务。
+
+**原因**：
+- 执行器启动任务后立即发 `RUNNING`，集群主节点收到就回复“创建成功”；但执行器的 `ExecutorStatus` 只在定时器上发（真机 1 Hz，测试里和心跳共用参数，是 0.2 秒），而控制进程要收到它才发 `TaskList`。
+- 测试一拿到回复就杀掉集群主节点：如果下一次状态还没发出去，没有任何节点知道这个任务。
+- 真机上也一样：集群主节点给自己派了任务、回复成功后 1 秒内掉电，任务就丢了，违背 DESIGN 1.4 和 6.2 的说法。只有集群主节点自己执行的任务会这样：别的节点上的任务，集群主节点的任务表里有记录，那个节点离线后会被重新调度。
+
+**改法**（`executor_node.py`）：`_report` 发出除 `REJECTED` 以外的事件之前，先补发一条 `ExecutorStatus`。所有任务集合的变化都经过这里：启动报 `RUNNING`，`_remove` 报 `STOPPED`/`FAILED`/`FINISHED`。另外，状态的构造和发布加锁，因为定时器和命令回调现在都会发布，要保持 seq 和内容的顺序。顺带的好处是墓碑也更快到达集群主节点，销毁确认更快。
+
+**剩下的窗口**：本机投递加一次 `TaskList` 可靠传输，毫秒级。回复和 `TaskList` 走不同的 topic，DDS 不保证二者的先后。完全消除的办法记在 10.1 第 28 条：等跟随者心跳里的 `tasks_version` 追上之后再回复。目前没有做。
+
+**测试**：
+- 新增 `test_a_task_is_in_its_nodes_task_list_everywhere_before_its_create_is_answered`：执行器状态周期设为 3 秒（新的 `executor_status_period` marker），从每个网关创建一个任务，回复返回时检查其他节点都已经有它。去掉修复后 3 次全部失败。
+- 原来不稳定的测试修复后连跑 15 次（每次两种推理后端）全部通过。
+- 夹具里执行器的 `status_period` 原来和控制进程共用 `BUS.params`，现在分开设置。
+
+**另一项只出现过一次的失败**：`test_silent_executor_keeps_its_tasks_for_the_grace_period_then_they_move[local_calls]` 在一次误跑整个集成模块时失败过：任务在 6 秒宽限内就迁移了，代次变成 2。单独连跑 10 次都通过。猜测是负载下共享的定时器线程变慢，心跳间隔超过了测试用的 `offline_timeout`（1 秒），节点被判离线后立即迁移。没有查实，再出现时看日志里有没有 `node=... offline`。

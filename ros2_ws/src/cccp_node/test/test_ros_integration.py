@@ -135,12 +135,16 @@ def cluster(monkeypatch, request, tmp_path):
     """Executors reach the algorithms through ROS services or in-process calls (data_plane default).
 
     @pytest.mark.airsim_mode("relay") selects how airsim:// inputs are fetched (default "each");
-    @pytest.mark.input_timeout(s) how long a primary waits for frames (default: longer than any test).
+    @pytest.mark.input_timeout(s) how long a primary waits for frames (default: longer than any test);
+    @pytest.mark.executor_status_period(s) how often executors publish ExecutorStatus on their timer
+    (default: the heartbeat period; the control processes' executor_timeout follows it).
     """
     marker = request.node.get_closest_marker("airsim_mode")
     airsim_mode = marker.args[0] if marker else "each"
     marker = request.node.get_closest_marker("input_timeout")
     input_timeout = marker.args[0] if marker else 300.0
+    marker = request.node.get_closest_marker("executor_status_period")
+    status_period = marker.args[0] if marker else 0.2
     airsim = FakeAirSim()
     monkeypatch.setattr("cccp_node.ros.control_node.SystemProbe", FixedProbe)
     fake_ros.BUS.reset()
@@ -159,7 +163,9 @@ def cluster(monkeypatch, request, tmp_path):
             algorithms = fake_ros.Node("no_algorithm_services")
         else:
             backend, algorithms = None, FakeAlgorithms(engine)
+        fake_ros.BUS.params.update(status_period=status_period)           # read by the executor
         executor = TaskExecutor(backend=backend, airsim_client_factory=airsim.client(name))
+        fake_ros.BUS.params.update(status_period=0.2, executor_timeout=max(1.0, 3 * status_period))
         nodes[name] = NS(name=name, control=ControlNode(), executor=executor, algorithms=algorithms, dead=False)
     stop = threading.Event()
     timers = threading.Thread(target=fake_ros.BUS.run_timers, args=(stop,), daemon=True)
@@ -283,6 +289,21 @@ def test_task_running_on_the_leader_is_restarted_elsewhere_after_it_dies(cluster
     record = wait_for(record_where(cluster, reply.task_id, lambda r: r.status == c.RUNNING and r.epoch >= 2),
                       timeout=30.0)
     assert record.primary != leader.name and runners(cluster, reply.task_id) == [record.primary]
+
+
+@pytest.mark.executor_status_period(3.0)
+def test_a_task_is_in_its_nodes_task_list_everywhere_before_its_create_is_answered(cluster):
+    """The executor publishes its status, and so its node the TaskList, before the RUNNING that answers
+    the create. Otherwise a leader that dies right after starting a task on itself leaves no node
+    knowing the task, which then never runs again (the test above failed that way about half the
+    time while the status went out only on its timer)."""
+    wait_for(lambda: active_leader(cluster))
+    for gateway in live(cluster):
+        reply = create(gateway)
+        listed = {node.name for node in live(cluster) if node.name != reply.assigned_node and
+                  any(t.task_id == reply.task_id
+                      for t in (node.control.cluster.task_list(reply.assigned_node) or NS(tasks=())).tasks)}
+        assert listed == {n.name for n in live(cluster)} - {reply.assigned_node}
 
 
 def test_only_the_leader_holds_the_leader_endpoints(cluster):

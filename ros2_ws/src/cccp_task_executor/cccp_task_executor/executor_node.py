@@ -5,7 +5,11 @@ image topic to PKCI/PKCT through an inference backend (in-process calls or ROS
 services, see inference.py), publishes per-frame results and composited images,
 answers and reports on /cluster/exec_event, and publishes its running tasks and
 tombstones on <ns>/exec/status (from its own callback group, so busy inference
-callbacks do not starve it and make the node look stalled).
+callbacks do not starve it and make the node look stalled). That status also goes
+out at once whenever the task set changes, before the event that reports the
+change: the leader answers a create as soon as RUNNING arrives, and a leader
+running the task itself may die right after; its TaskList, built from this status,
+must already be on its way, or no node is left knowing the task (DESIGN 6.2).
 
 Every command passes the ExecutionGuard first (DESIGN 3.8, CONVENTIONS 5.4):
 commands for other nodes are ignored, commands from an older term are refused,
@@ -22,6 +26,7 @@ unreachable from this node, and the leader may move it (CONVENTIONS 5.5).
 Helpers do not check, since only the primary's reports drive the task state.
 """
 import json
+import threading
 import time
 from dataclasses import dataclass
 
@@ -143,6 +148,7 @@ class TaskExecutor(Node):
         self._wait_timeout = float(self.get_parameter("service_wait_timeout").value)
         self._incarnation = int(time.time() * 1000)
         self._status_seq = 0
+        self._status_lock = threading.Lock()    # the timer and command callbacks both publish: keep seq order
         self._event_seq = 0
         self._guard = ExecutionGuard(me=self._node_id, max_tasks=int(self.get_parameter("max_tasks_per_node").value),
                                      tombstone_ttl_s=float(self.get_parameter("tombstone_ttl").value))
@@ -184,6 +190,10 @@ class TaskExecutor(Node):
         return list(self._backend.algorithms_ready()) + batch.ready()
 
     def _publish_status(self):
+        with self._status_lock:
+            self._publish_status_locked()
+
+    def _publish_status_locked(self):
         self._status_seq += 1
         msg = ExecutorStatus()
         msg.incarnation = self._incarnation
@@ -200,7 +210,10 @@ class TaskExecutor(Node):
         self._status.publish(msg)
 
     def _report(self, task_id, generation, kind, error_code="", message="", command=None):
-        """One ExecEvent: the receipt for command, or a report of its own (request_id 0)."""
+        """One ExecEvent: the receipt for command, or a report of its own (request_id 0). Anything but a
+        refusal may follow a change of the task set: the status goes first (see the module docstring)."""
+        if kind != p.REJECTED:
+            self._publish_status()
         self._event_seq += 1
         term, request_id = (command.term, command.request_id) if command is not None else (0, 0)
         self._events.publish(convert.fill_exec_event(
