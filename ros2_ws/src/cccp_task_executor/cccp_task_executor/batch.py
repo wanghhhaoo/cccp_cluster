@@ -15,7 +15,7 @@ import subprocess
 import time
 
 from cccp_node.core import constants as c
-from cccp_node.core.constants import BATCH_TYPES as TYPES  # noqa: F401  (executor_node uses batch.TYPES)
+from cccp_node.core.task_types import BATCH_TYPES as TYPES  # noqa: F401  (executor_node uses batch.TYPES)
 
 HERE = Path(__file__).resolve().parent
 STOP_GRACE_S = 5.0

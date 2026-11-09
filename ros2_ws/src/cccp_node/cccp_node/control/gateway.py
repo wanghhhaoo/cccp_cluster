@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from ..core import constants as c
-from ..core import idempotency
+from ..core import idempotency, task_types
 from ..core.task_spec import SpecError, TaskSpec, normalize_spec
 from ..core.task_table import TaskRecord
 from . import protocol as p
@@ -32,7 +32,7 @@ from .protocol import Reply, Request
 
 @dataclass(frozen=True)
 class GatewayConfig:
-    task_types: tuple[str, ...] = c.ALGORITHMS
+    task_types: tuple[str, ...] = task_types.ALGORITHMS
     max_chain_depth: int = 5
     request_timeout_s: float = 15.0      # the leader's create/destroy wait (10 s) plus a margin
 

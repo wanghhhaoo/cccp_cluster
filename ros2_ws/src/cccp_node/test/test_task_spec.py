@@ -84,3 +84,70 @@ def test_spec_round_trips_through_dict():
     assert TaskSpec.from_dict(spec.to_dict()) == spec
     with pytest.raises(ValueError):
         TaskSpec.from_dict({"task_type": "PKCI", "colour": "red"})
+
+
+# ------------------------------------------------- per-type rules (batch jobs, DESIGN adjustment 13)
+
+ALL_TYPES = ("PKCI", "PKCT", "FASTLIVO", "HETEROMAP", "RSSMAP")
+SIX = tuple("edge-%02d" % i for i in range(1, 7))
+
+
+def norm_any(**kw):
+    return normalize_spec(TaskSpec(**kw), task_types=ALL_TYPES, max_chain_depth=5)
+
+
+def rejected_any(**kw):
+    with pytest.raises(SpecError) as info:
+        norm_any(**kw)
+    return info.value.error_code, str(info.value)
+
+
+@pytest.mark.parametrize("task_type", ["FASTLIVO", "RSSMAP"])
+def test_single_board_batch_jobs_run_local_only(task_type):
+    assert norm_any(task_type=task_type).mode == c.MODE_LOCAL
+    assert rejected_any(task_type=task_type, mode="redundant", helper_count=1) == (
+        c.INVALID_INPUT, task_type + " requires local mode")
+
+
+@pytest.mark.parametrize("task_type", ["FASTLIVO", "HETEROMAP", "RSSMAP"])
+@pytest.mark.parametrize("field", ["input", "image_topic"])
+def test_batch_jobs_take_no_input(task_type, field):
+    kw = dict(mode="fusion", target_nodes=SIX) if task_type == "HETEROMAP" else {}
+    value = "airsim://drone1/front" if field == "input" else "camera/image"
+    assert rejected_any(task_type=task_type, **{field: value}, **kw) == (
+        c.INVALID_INPUT, "batch jobs use node-configured input")
+
+
+def test_heteromap_needs_fusion_and_six_ordered_targets():
+    spec = norm_any(task_type="HETEROMAP", mode="fusion", target_nodes=SIX)
+    assert (spec.target_nodes, spec.helper_count) == (SIX, 5)
+    wrong_mode = (c.INVALID_INPUT, "HETEROMAP requires fusion mode")
+    six = (c.INVALID_INPUT, "HETEROMAP needs 6 ordered target_nodes, the task primary first")
+    assert rejected_any(task_type="HETEROMAP", mode="fusion", target_nodes=SIX[:5]) == six
+    assert rejected_any(task_type="HETEROMAP", mode="fusion", helper_count=5) == six
+    assert rejected_any(task_type="HETEROMAP", mode="redundant", target_nodes=SIX) == wrong_mode
+    assert rejected_any(task_type="HETEROMAP") == wrong_mode
+
+
+def test_rssmap_params():
+    assert norm_any(task_type="RSSMAP", params_json='{"tx": "node_7", "score": true}').task_type == "RSSMAP"
+    for params in ('{"tx": 7}', '{"score": "yes"}', '{"other": 1}'):
+        assert rejected_any(task_type="RSSMAP", params_json=params) == (
+            c.INVALID_INPUT, "invalid parameters for RSSMAP")
+
+
+@pytest.mark.parametrize("task_type", ["FASTLIVO", "HETEROMAP"])
+def test_other_batch_jobs_take_no_params(task_type):
+    kw = dict(mode="fusion", target_nodes=SIX) if task_type == "HETEROMAP" else {}
+    assert norm_any(task_type=task_type, params_json="{}", **kw).task_type == task_type
+    assert rejected_any(task_type=task_type, params_json='{"tx": "a"}', **kw) == (
+        c.INVALID_INPUT, "invalid parameters for " + task_type)
+
+
+def test_pkci_passes_any_params_through():
+    assert norm_any(task_type="PKCI", params_json='{"anything": [1, 2]}').params_json == '{"anything": [1, 2]}'
+
+
+def test_configured_task_types_limit_what_the_gateway_accepts():
+    with pytest.raises(SpecError):
+        normalize_spec(TaskSpec(task_type="RSSMAP"), task_types=("PKCI",), max_chain_depth=5)

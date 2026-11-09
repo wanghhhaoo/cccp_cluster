@@ -378,7 +378,7 @@ cccp_cluster/
 │   ├── cccp_task_executor/             数据面：执行器、data_plane 组合入口、AirSim 按需取图、压缩转发
 │   └── cccp_node/                      控制进程
 │       └── cccp_node/
-│           ├── core/                   纯逻辑：选主、任务表、调度、对账、链路估计、数据源地址（禁止 import ROS）
+│           ├── core/                   纯逻辑：选主、任务表、调度、对账、链路估计、数据源地址、任务类型注册表（禁止 import ROS）
 │           ├── control/                集群主节点控制器、任务表的存储、网关、UE 后端（不依赖 ROS）
 │           ├── monitor/                CPU/内存/GPU 采集
 │           ├── ros/                    ROS 适配层：control_node、dispatcher、forwarder、convert、qos
@@ -387,6 +387,15 @@ cccp_cluster/
 ├── deploy/                             Dockerfile（x86/ARM64）、start_node.sh
 └── tools/                              接口语法检查、推理测速
 ```
+
+### 6.5 任务类型注册表
+
+- 每种任务类型（算法）在 `core/task_types.py` 的 `REGISTRY` 里登记一项 `TaskType`。控制面需要知道的、因类型而异的规则（运行方式、允许的 mode、固定的有序参与节点数、辅助节点失败是否整个任务失败、参数校验、产物后缀）都写成它的字段。
+- `core/` 和 `control/` 里**不得按类型名字分支**（`c.PKCT`、`"HETEROMAP"` 这类写法），只读 `TaskType` 的字段；`test_task_types.py` 会扫描检查。需要新规则时给 `TaskType` 加字段。
+- **注册顺序就是 `algorithms_ready` 的位号**：新类型只能追加在末尾，不得调换或复用位置；同时更新 `NodeStatus.msg` 里的位说明（`test_constants.py` 对照）和 `test_task_types.py` 里固定的顺序。位掩码是 uint8，最多 8 种。
+- 参数校验函数对不合格的 `params_json` 抛 `ValueError`，网关转成 `INVALID_INPUT`。请求里不得出现可执行文件或路径（DESIGN“实现时的调整”第 13 条）。
+- 批处理类型（`BATCH`）不能带 `input`/`image_topic`，并且必须声明产物后缀；流式类型（`STREAM`）没有产物。
+- 数据面暂时仍按名字分支：执行器、推理后端、`batch.py`、`annotate.py`，以及 `ros/convert.py` 的结果转换。它们分别在推理任务接入改造的阶段 2（适配器）和阶段 3（`TaskResult` 通用化）中改掉（HANDOFF 第二十五节）。
 
 ---
 

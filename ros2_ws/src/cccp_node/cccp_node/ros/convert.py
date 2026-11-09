@@ -18,6 +18,7 @@ from ..control import protocol as p
 from ..control.gateway import CreateReply, DestroyReply, QueryReply
 from ..control.protocol import ExecCommand, ExecEvent, Reply, Request
 from ..core import constants as c
+from ..core import task_types
 from ..core.cluster_view import LinkView, NodeView, TaskListView, TaskStateView
 from ..core.generation import Generation
 from ..core.link_estimator import (
@@ -40,7 +41,7 @@ MAX_PEERS = 15
 NAME_LENGTH, NODE_NAME_LENGTH, REASON_LENGTH, MESSAGE_LENGTH = 64, 32, 64, 128
 
 # uint8 enums. Index = value on the wire.
-ALGORITHMS = c.ALGORITHMS                                   # bit i of algorithms_ready
+ALGORITHMS = task_types.ALGORITHMS                                   # bit i of algorithms_ready
 ROLES = (c.ROLE_PRIMARY, c.ROLE_HELPER)                          # TaskState.ROLE_*, TaskBrief.ROLE_*
 OPS = {p.START: 1, p.STOP: 2}                                    # Command.OP_*
 STOP_KINDS = {c.STOP_CANCEL: 1, c.STOP_STALE: 2, c.STOP_DUPLICATE: 3, c.STOP_UNASSIGNED: 4}

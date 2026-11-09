@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from typing import Iterable
 
 from . import constants as c
+from . import task_types as types
 from .input_source import ROS, parse_input
 
 
@@ -80,29 +81,17 @@ class TaskSpec:
         return cls(**values)
 
 
-def _check_pkct(params: dict) -> None:
-    bbox = params.get("bbox")
-    if not (isinstance(bbox, list) and len(bbox) == 4
-            and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in bbox)
-            and bbox[2] > 0 and bbox[3] > 0):
-        raise SpecError(c.INVALID_INPUT, 'PKCT requires params_json {"bbox": [x, y, width, height]} '
-                                         "with positive size")
-
-
-# Algorithm-specific params_json checks, as the CCCP bridge did before dispatch.
-PARAM_CHECKS = {"PKCT": _check_pkct}
-
-
 def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth: int) -> TaskSpec:
     """Validate a CreateTask spec and fill in defaults; raises SpecError.
 
     Runs in the gateway before submission, so the replicated task table only
     ever stores well-formed specs.
     """
-    task_types = frozenset(task_types)
+    task_types = frozenset(task_types) & types.BY_NAME.keys()
     task_type = spec.task_type.strip().upper()
     if task_type not in task_types:
         raise SpecError(c.INVALID_INPUT, "task_type must be one of %s" % ", ".join(sorted(task_types)))
+    entry = types.BY_NAME[task_type]
     mode = spec.mode.strip().lower() or c.MODE_LOCAL
     if mode not in c.MODES:
         raise SpecError(c.INVALID_INPUT, "mode must be one of %s" % ", ".join(sorted(c.MODES)))
@@ -126,14 +115,13 @@ def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth
             raise SpecError(c.INVALID_INPUT, "%s mode needs helper_count >= 1" % mode)
         if targets and len(targets) != 1 + helper_count:
             raise SpecError(c.INVALID_INPUT, "target_nodes must list the primary and every helper")
-    if task_type in c.BATCH_TYPES:
-        if spec.input or spec.image_topic:
-            raise SpecError(c.INVALID_INPUT, "batch jobs use node-configured input")
-        if task_type == c.HETEROMAP:
-            if mode != c.MODE_FUSION or len(targets) != c.HETEROMAP_NODES:
-                raise SpecError(c.INVALID_INPUT, "HETEROMAP needs fusion mode and six ordered target_nodes")
-        elif mode != c.MODE_LOCAL:
-            raise SpecError(c.INVALID_INPUT, "single-board job requires local mode")
+    if entry.kind == types.BATCH and (spec.input or spec.image_topic):
+        raise SpecError(c.INVALID_INPUT, "batch jobs use node-configured input")
+    if mode not in entry.modes:
+        raise SpecError(c.INVALID_INPUT, "%s requires %s mode" % (task_type, " or ".join(sorted(entry.modes))))
+    if entry.participants and len(targets) != entry.participants:
+        raise SpecError(c.INVALID_INPUT, "%s needs %d ordered target_nodes, the task primary first"
+                        % (task_type, entry.participants))
     if spec.min_participants > 1 + helper_count:
         raise SpecError(c.INVALID_INPUT, "min_participants exceeds 1 + helper_count")
 
@@ -166,14 +154,10 @@ def normalize_spec(spec: TaskSpec, *, task_types: Iterable[str], max_chain_depth
             raise SpecError(c.INVALID_INPUT, "params_json must be a JSON object")
     else:
         params = {}
-    if task_type in c.BATCH_TYPES:
-        allowed = {"tx", "score"} if task_type == c.RSSMAP else set()
-        if set(params) - allowed or ("tx" in params and not isinstance(params["tx"], str)) or (
-                "score" in params and not isinstance(params["score"], bool)):
-            raise SpecError(c.INVALID_INPUT, "invalid parameters for " + task_type)
-    check = PARAM_CHECKS.get(task_type)
-    if check is not None:
-        check(params)
+    try:
+        entry.check_params(params)
+    except ValueError as exc:
+        raise SpecError(c.INVALID_INPUT, str(exc)) from exc
 
     try:
         source = parse_input(spec.input)

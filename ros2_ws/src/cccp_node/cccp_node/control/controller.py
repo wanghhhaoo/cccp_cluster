@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Protocol
 
 from ..core import constants as c
+from ..core import task_types
 from ..core.cluster_view import ClusterView
 from ..core.election import Leadership
 from ..core.generation import Generation
@@ -239,9 +240,10 @@ class LeaderController:
         if event.kind == p.REJECTED:
             self._rejected(record, event)
             return
-        # Every HETEROMAP frame needs all five helpers: the fusion node would only wait for a
-        # failed one until its timeout, so fail the task now.
-        if (not record.terminal and record.spec.task_type == c.HETEROMAP and
+        # A type that needs every helper (HETEROMAP: each frame needs all five) would only wait
+        # for a failed one until its timeout, so fail the task now.
+        entry = task_types.find(record.spec.task_type)
+        if (not record.terminal and entry is not None and entry.helpers_required and
                 event.node in record.helpers and event.kind == p.FAILED):
             self._submit(MarkFailed(record.task_id, event.generation, event.error_code or c.INFERENCE_ERROR,
                                     event.message, self._wall_ms()))

@@ -43,6 +43,7 @@ from collab_inference_interfaces.srv import Classify, InitTracker, ResetTracker,
 from cccp_node import names
 from cccp_node.control import protocol as p
 from cccp_node.core import constants as c
+from cccp_node.core import task_types
 from cccp_node.core.execution_guard import IGNORE, NOOP, REJECT, RESTART, STOP, ExecutionGuard
 from cccp_node.core.generation import Generation
 from cccp_node.core.input_source import FETCH_EACH, parse_input, plan_input
@@ -58,7 +59,7 @@ from .inference import RosServiceBackend
 from .relay import ImageRelay
 from . import batch
 
-TASK_TYPES = c.ALGORITHMS
+TASK_TYPES = task_types.ALGORITHMS
 
 
 def parse_params(task_type, params_json):

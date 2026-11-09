@@ -20,10 +20,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from .core import constants as c
+from .core import task_types
 from .core.task_spec import TaskSpec
 
 PREFIX = "/api/ue"
 _TASK = re.compile(r"^%s/tasks/([A-Za-z0-9_-]+)(/destroy|/result_image)?$" % PREFIX)
+# <task_id>/artifacts/<epoch>-<assign_term>[/<role>/<file>]: what batch jobs leave in CCCP_JOB_STORE
+_ARTIFACT = re.compile(r"%s/tasks/([0-9a-f-]{36})/artifacts/(\d+-\d+)(?:/((?:%s)/[\w.-]+(?:%s)))?" % (
+    PREFIX, "|".join(task_types.ARTIFACT_ROLES), "|".join(re.escape(s) for s in task_types.ARTIFACT_SUFFIXES)))
 
 # UE JSON field -> TaskSpec field type.
 CREATE_FIELDS = {
@@ -188,7 +192,7 @@ class _Handler(BaseHTTPRequestHandler):
                                           query.get("snapshots", ["1"])[0] != "0")
             return self._send(200, {"success": True, "node": journal.node, "incarnation": journal.incarnation,
                                     "last_seq": last, "entries": entries})
-        artifact = re.fullmatch(PREFIX + r"/tasks/([0-9a-f-]{36})/artifacts/(\d+-\d+)(?:/((?:primary|id_[0-4])/[\w.-]+\.(?:pcd|npz)))?", url.path)
+        artifact = _ARTIFACT.fullmatch(url.path)
         if artifact:
             task_id, generation, filename = artifact.groups()
             root = Path(os.getenv("CCCP_JOB_STORE", str(Path.home() / "cccp_jobs"))).resolve()
@@ -198,7 +202,7 @@ class _Handler(BaseHTTPRequestHandler):
                                         "message": "artifact store unavailable on this node"})
             if not filename:
                 files = sorted(str(p.relative_to(folder)) for p in folder.glob("*/*")
-                               if p.suffix in (".pcd", ".npz") and p.is_file())
+                               if p.suffix in task_types.ARTIFACT_SUFFIXES and p.is_file())
                 return self._send(200, {"files": [url.path + "/" + f for f in files]})
             path = folder / filename
             if not path.is_file() or not path.resolve().is_relative_to(folder):

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from cccp_node.control import protocol as p
-from cccp_node.core import constants
+from cccp_node.core import constants, task_types
 from cccp_node.ros import convert
 
 SRC = Path(__file__).resolve().parents[2]
@@ -65,14 +65,13 @@ def test_protocol_version():
 
 
 def test_algorithm_bits_match_the_interface_comment_and_fit_the_mask():
-    """algorithms_ready is a uint8 whose bit i is constants.ALGORITHMS[i]; NodeStatus.msg documents it."""
+    """algorithms_ready is a uint8 whose bit i is task_types.ALGORITHMS[i]; NodeStatus.msg documents it."""
     text = (SRC / "cccp_cluster_interfaces" / "msg" / "NodeStatus.msg").read_text()
     [line] = [line for line in text.splitlines() if line.startswith("uint8 algorithms_ready")]
     documented = [name for _, name in sorted((int(i), name) for i, name in re.findall(r"bit(\d+) = (\w+)", line))]
-    assert tuple(documented) == constants.ALGORITHMS == convert.ALGORITHMS
-    assert len(set(constants.ALGORITHMS)) == len(constants.ALGORITHMS) <= 8
-    assert convert.algorithms_from_mask(convert.algorithms_mask(constants.ALGORITHMS)) == constants.ALGORITHMS
-    assert set(constants.BATCH_TYPES) <= set(constants.ALGORITHMS)
+    assert tuple(documented) == task_types.ALGORITHMS == convert.ALGORITHMS
+    assert len(set(task_types.ALGORITHMS)) == len(task_types.ALGORITHMS) <= 8
+    assert convert.algorithms_from_mask(convert.algorithms_mask(task_types.ALGORITHMS)) == task_types.ALGORITHMS
 
 
 def test_event_kinds_cover_the_protocol():

@@ -637,3 +637,30 @@ def test_journal_records_a_destroy_with_who_asked():
     world.run(controller, 1.0, dt=0.1)
     cancelled = [e for e in journal.since(0)[0] if e["event"] == "task_cancelled"]
     assert [(e["task"], e["by"], e["reason"]) for e in cancelled] == [(task_id, "gw", "done")]
+
+
+def _fail_a_helper(task_type):
+    names = tuple("n%d" % i for i in range(1, 7))
+    clock, world, store, election, controller = setup(names=names)
+    for node in world.nodes.values():
+        node.view["algorithms_ready"] = ("PKCI", "PKCT", "HETEROMAP")
+    warm(world, controller)
+    task_id = submit(store, task_type=task_type, mode="fusion", helper_count=5)
+    world.run(controller, 1.5)
+    record = store.get(task_id)
+    assert record.status == c.RUNNING and len(record.helpers) == 5
+    helper = world.nodes[record.helpers[2]]
+    helper.report(task_id, record.generation, p.FAILED, c.INFERENCE_ERROR)
+    helper.guard.stopped(task_id)
+    world.run(controller, 0.5)
+    return store.get(task_id)
+
+
+def test_a_failed_heteromap_helper_fails_the_whole_task():
+    """DESIGN adjustment 15: every HETEROMAP frame needs all five helpers."""
+    record = _fail_a_helper("HETEROMAP")
+    assert (record.status, record.error_code) == (c.FAILED, c.INFERENCE_ERROR)
+
+
+def test_a_failed_helper_of_other_task_types_does_not_fail_the_task():
+    assert _fail_a_helper("PKCI").status == c.RUNNING

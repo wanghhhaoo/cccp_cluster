@@ -479,3 +479,35 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 - 夹具里执行器的 `status_period` 原来和控制进程共用 `BUS.params`，现在分开设置。
 
 **另一项只出现过一次的失败**：`test_silent_executor_keeps_its_tasks_for_the_grace_period_then_they_move[local_calls]` 在一次误跑整个集成模块时失败过：任务在 6 秒宽限内就迁移了，代次变成 2。单独连跑 10 次都通过。猜测是负载下共享的定时器线程变慢，心跳间隔超过了测试用的 `offline_timeout`（1 秒），节点被判离线后立即迁移。没有查实，再出现时看日志里有没有 `node=... offline`。
+
+## 二十五、11-09：任务类型注册表（推理任务接入改造 阶段 1，DESIGN“实现时的调整”第 27 条）
+
+**目标**：以后新增一种推理任务，控制面只登记一项，不再到处加分支。改造一共分 4 个阶段：
+1. 控制面注册表（本节）；
+2. 数据面适配器：执行器、推理后端、`batch.py`、`annotate.py`；
+3. `TaskResult` 通用化，`algorithms_ready` 扩到 uint32（改接口，协议 5，要先评审）；
+4. 示例算法和接入文档。
+
+**改动**：
+- 新增 `core/task_types.py`。`TaskType` 的字段有 `kind`（stream/batch）、`modes`、`participants`、`helpers_required`、`check_params`、`artifacts`；`REGISTRY` 的顺序就是能力位。`ALGORITHMS`、`BATCH_TYPES` 从 `constants.py` 移到这里，`HETEROMAP_NODES` 去掉（改为 HETEROMAP 的 `participants=6`）。`constants.py` 只留类型名字。
+- `task_spec.normalize_spec`：批处理不能带输入、mode 限制、固定参与节点数、参数校验都查表；`PARAM_CHECKS` 去掉。gateway 配置里有、但没有注册的类型名，按不接受处理。
+- `controller`：辅助节点 `FAILED` 时整个任务失败，条件由 `== HETEROMAP` 改为 `helpers_required`。
+- `task_table.result_url`：条件由"是批处理"改为"有产物后缀"。
+- `ue_api`：产物下载地址的正则由角色列表和产物后缀生成，对现有 5 种类型和原来的正则等价（`primary|id_0..id_4`，`.npz|.pcd`）。
+- `gateway`、`control_node`、`convert.ALGORITHMS`、执行器的 `TASK_TYPES`、`batch.TYPES` 改为从注册表导入；执行器的逻辑没有改。
+- 两条规格错误信息改为通用写法（见 DESIGN 第 27 条），没有找到依赖原文的地方。
+
+**测试**：
+- 先补了现状测试，在改代码之前都能通过，覆盖原来没有测试的批处理规则：
+  - `test_task_spec.py`：批处理不能带输入、FASTLIVO/RSSMAP 只能是 local、HETEROMAP 必须 fusion 且 6 个有序节点、RSSMAP 的参数、其他批处理不能带参数、PKCI 的参数原样通过、gateway 配置限制可接受的类型；
+  - `test_task_table.py`：只有 Finished 的批处理任务有 `result_url`；
+  - `test_controller.py`：HETEROMAP 辅助节点失败，整个任务失败；PKCI 的不会。
+- 新增 `test_task_types.py`：固定位顺序、各项自洽（有产物 ⇔ 批处理、固定节点数 ⇒ 非 local 等），扫描 `core/`、`control/` 里有没有按类型名字分支（另有一项测试确认扫描本身能匹配）。
+- 全量 349 项通过、3 项跳过（原 315 项）。
+- 故意改坏 11 处都被发现：
+  - 注册表：关掉 `helpers_required`、`participants` 改为 5、RSSMAP 的 `score` 接受字符串、FASTLIVO 去掉产物、PKCI/PKCT 换位、FASTLIVO 允许 redundant；
+  - 其他代码：去掉批处理输入检查、去掉参数校验、在调度器里按名字分支、所有 Finished 任务都给 `result_url`、gateway 忽略配置。
+- 没有覆盖到的：
+  - 执行器包本机跑不了自己的测试，这次只改了导入，由 `test_ros_integration.py`、`test_batch_jobs.py`（执行器跑在仿 ROS 上）覆盖；
+  - 产物正则的生成没有专门的改坏测试，`test_batch_jobs.py` 的列出和下载用例覆盖了它。
+

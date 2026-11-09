@@ -52,6 +52,7 @@ from ..core.link_estimator import LinkEstimator
 from ..core.naming import default_node_id
 from ..core.reconciler import ReconcileConfig
 from ..core.scheduler import SchedulerConfig
+from ..core import task_types
 from ..core.task_table import StatusEvent
 from ..monitor.probes import SystemProbe, Usage
 from ..ue_api import UeApi
@@ -178,7 +179,7 @@ class ControlNode(Node):
             "destroy_wait": 10.0,
             "request_timeout": 15.0,
             "battery": -1.0,
-            "task_types": list(c.ALGORITHMS),
+            "task_types": list(task_types.ALGORITHMS),
             "ue_http_host": "0.0.0.0",
             "ue_http_port": 18090,
             # Event journal (control/journal.py): empty keeps it in memory only (GET /api/ue/journal).

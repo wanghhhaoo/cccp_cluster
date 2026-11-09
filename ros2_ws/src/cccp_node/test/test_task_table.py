@@ -6,7 +6,7 @@ import pytest
 from cccp_node.core import constants as c
 from cccp_node.core.task_spec import TaskSpec
 from cccp_node.core.task_table import (
-    Adopt, Assign, Cancel, MarkFailed, Prune, ReportStatus, Requeue, Submit, TaskTable,
+    Adopt, Assign, Cancel, MarkFailed, Prune, ReportStatus, Requeue, Submit, TaskRecord, TaskTable,
 )
 
 
@@ -293,3 +293,14 @@ def test_random_histories_never_move_tasks_backwards():
         keys = [r.idempotency_key for r in table.tasks()]
         assert len(keys) == len(set(keys))                # one task per idempotency key
         previous = {r.task_id: r for r in table.tasks()}
+
+
+# --------------------------------------------------------------------- result_url
+
+@pytest.mark.parametrize("task_type, status, has_url", [
+    ("RSSMAP", c.FINISHED, True), ("FASTLIVO", c.FINISHED, True), ("HETEROMAP", c.FINISHED, True),
+    ("RSSMAP", c.RUNNING, False), ("RSSMAP", c.FAILED, False), ("PKCI", c.FINISHED, False),
+])
+def test_only_finished_batch_jobs_have_a_result_url(task_type, status, has_url):
+    record = TaskRecord("t-1", "k", TaskSpec(task_type=task_type), "t", status=status, epoch=2, assign_term=3)
+    assert record.result_url == ("/api/ue/tasks/t-1/artifacts/2-3" if has_url else "")

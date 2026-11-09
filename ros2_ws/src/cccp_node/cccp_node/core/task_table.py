@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from typing import Union
 
 from . import constants as c
+from . import task_types
 from .generation import Generation
 from .task_spec import TaskSpec
 
@@ -47,7 +48,8 @@ class TaskRecord:
 
     @property
     def result_url(self):
-        if self.status == c.FINISHED and self.spec.task_type in c.BATCH_TYPES:
+        entry = task_types.find(self.spec.task_type)
+        if self.status == c.FINISHED and entry is not None and entry.artifacts:
             return f"/api/ue/tasks/{self.task_id}/artifacts/{self.epoch}-{self.assign_term}"
         return ""
 

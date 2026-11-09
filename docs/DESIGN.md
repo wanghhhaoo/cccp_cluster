@@ -113,6 +113,12 @@
 |---|---|---|---|
 | 26 | 执行器在任务启动、停止、结束时，先补发一条 `ExecutorStatus`，再发报告这次变化的 `ExecEvent`（`REJECTED` 不补发）；状态的构造和发布加锁，定时器和命令回调并发时 seq 和内容保持一致 | 原来状态只在 1 Hz 定时器上发，而集群主节点收到 `RUNNING` 就回复“创建成功”。集群主节点自己执行的任务，如果它在下一次状态之前掉电，它的 `TaskList` 里没有这个任务，新集群主节点无从接收，任务丢失（第 10.1 节第 28 条）。仿 ROS 测试 `test_task_running_on_the_leader_is_restarted_elsewhere_after_it_dies` 因此约一半失败 | 2.4、6.2 |
 
+### 任务类型注册表（11-09）
+
+| # | 调整 | 原因 | 章节 |
+|---|---|---|---|
+| 27 | 新增 `core/task_types.py`：每种任务类型一项 `TaskType`（运行方式 stream/batch、允许的 mode、固定的有序参与节点数、辅助节点失败是否整个任务失败、参数校验、产物后缀）。网关校验、集群主节点"辅助节点失败即失败"、`result_url`、产物下载地址都改为查这张表，`core/`、`control/` 里不再按类型名字分支。注册顺序就是 `algorithms_ready` 的位号。规格校验的两条错误信息随之变成通用写法：`<类型> requires <mode> mode`（原 `single-board job requires local mode`）、`<类型> needs <n> ordered target_nodes, the task primary first`（原 `HETEROMAP needs fusion mode and six ordered target_nodes`；mode 不对时现在报前一条）。接受和拒绝的判断、错误码都不变，接口不变 | 每加一种推理任务都要在 `task_spec`、`controller`、`task_table`、`ue_api` 里各加一个分支，规则散落、容易漏改，批处理的这几条规则原来也没有测试。这是推理任务接入改造的阶段 1；执行器仍按名字分支（阶段 2 改为适配器），`ros/convert.py` 的结果转换要等 `TaskResult` 通用化（阶段 3，要改接口） | 4.1、2.6 |
+
 ---
 
 ## 0 一页纸概览
@@ -370,7 +376,8 @@ QoS 集中定义在 `cccp_node/ros/qos.py`，端点名集中定义在 `cccp_node
 | `cccp_node/core/election.py`                                      | 选主规则                                          | `test_election.py`                             |
 | `cccp_node/core/cluster_view.py`                                  | 集群视图：每个节点最新的 `NodeStatus` 和 `TaskList`、在线判定、离线条目保留 | `test_cluster_view.py`                         |
 | `cccp_node/core/link_estimator.py`                                | RTT、抖动、丢包                                   | `test_link_estimator.py`                       |
-| `cccp_node/core/task_spec.py`                                     | 任务规格、校验和规范化                            | `test_task_spec.py`                            |
+| `cccp_node/core/task_types.py`                                    | 任务类型注册表：每种算法的运行方式、mode、参与节点、参数校验、产物；顺序即能力位 | `test_task_types.py`                           |
+| `cccp_node/core/task_spec.py`                                     | 任务规格、校验和规范化（按类型的规则取自 `task_types`） | `test_task_spec.py`                            |
 | `cccp_node/core/generation.py`                                    | 执行代次 `(epoch, assign_term)`                   | `test_task_table.py`                           |
 | `cccp_node/core/task_table.py`                                    | 任务表状态机，唯一写入口 `apply(command)`       | `test_task_table.py`（含随机历史测试）         |
 | `cccp_node/core/scheduler.py`                                     | 过滤 + 评分选节点                                 | `test_scheduler.py`                            |
