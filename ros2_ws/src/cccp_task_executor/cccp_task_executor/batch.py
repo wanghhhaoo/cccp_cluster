@@ -1,4 +1,5 @@
-"""Launch node-configured algorithms. Request data never names an executable.
+"""Run batch tasks. Request data never names an executable: the algorithm's adapter
+(algorithms/*.py, BatchAlgorithm.launch) builds the command from node configuration.
 
 Each batch task runs as its own process group. Stopping one never blocks the
 executor thread: stop() sends SIGTERM and returns, and reap(), called from the
@@ -15,9 +16,7 @@ import subprocess
 import time
 
 from cccp_node.core import constants as c
-from cccp_node.core.task_types import BATCH_TYPES as TYPES  # noqa: F401  (executor_node uses batch.TYPES)
 
-HERE = Path(__file__).resolve().parent
 STOP_GRACE_S = 5.0
 
 
@@ -25,57 +24,26 @@ STOP_GRACE_S = 5.0
 class Job:
     process: subprocess.Popen
     output: Path
-    container: str = ""              # FASTLIVO: the Docker container the script runs
+    container: str = ""              # Docker container the job runs in (Launch.container)
     kill_at: float = None            # stop requested: SIGKILL after this time.monotonic()
     cleanup: subprocess.Popen = None  # `docker rm -f` started after a SIGKILL
     exited: bool = False             # the executor has handled the exit
 
 
-def ready():
-    enabled = []
-    if (shutil.which("docker") and os.getenv("FASTLIVO_BAG")
-            and Path(os.environ["FASTLIVO_BAG"]).is_file()):
-        enabled.append(c.FASTLIVO)
-    data = Path(os.getenv("RSSMAP_DATA", "/nonexistent"))
-    if (os.access(os.getenv("RSSMAP_PYTHON", ""), os.X_OK)
-            and all((data / f).is_file() for f in ("config/config.json", "weights/newdata.pt",
-                                                   "field/gaussians.npz", "field/voxel_grid.npz"))):
-        enabled.append(c.RSSMAP)
-    root = Path(os.getenv("HETEROMAP_ROOT", "/nonexistent"))
-    if (os.access(os.getenv("HETEROMAP_PYTHON", ""), os.X_OK)
-            and os.access(os.getenv("CCCP_JOB_STORE", ""), os.W_OK)
-            and (root / "weights/collaboration_best.pth").is_file()
-            and all((root / f"weights/id{i}_bev_best.pth").is_file() for i in range(5))):
-        enabled.append(c.HETEROMAP)
-    return enabled
-
-
-def start(task, node_id):
-    """Raises FileExistsError when this generation already ran here (an earlier session was lost)."""
+def start(task, node_id, algorithm):
+    """algorithm: the task's BatchAlgorithm. Raises FileExistsError when this generation already ran
+    here (an earlier session was lost)."""
     root = Path(os.getenv("CCCP_JOB_STORE", str(Path.home() / "cccp_jobs"))).resolve()
     run = root / task.task_id / f"{task.epoch}-{task.assign_term}"
     role = "primary" if task.role == c.ROLE_PRIMARY else f"id_{task.helper_ids.index(node_id)}"
     output = run / role
     output.mkdir(parents=True, exist_ok=False)
-    env, container = None, ""
-    if task.task_type == c.HETEROMAP:
-        cmd = [os.environ["HETEROMAP_PYTHON"], str(HERE / "bev_job.py"), str(run), role]
-    elif task.task_type == c.FASTLIVO:
-        container = f"cccp-fastlivo-{task.task_id}-{task.epoch}-{task.assign_term}"
-        env = dict(os.environ, CCCP_FASTLIVO_CONTAINER=container)
-        cmd = ["bash", str(HERE / "fastlivo.sh"), str(output)]
-    else:
-        cmd = [os.environ["RSSMAP_PYTHON"], "-m", "propagation_model.demo",
-               "--data", os.environ["RSSMAP_DATA"], "--out", str(output / "rss.npz")]
-        if "tx" in task.params:
-            cmd.extend(["--tx", str(task.params["tx"])])
-        if task.params.get("score") is True:
-            cmd.append("--score")
+    launch = algorithm.launch(task, run, role, output)
     with (output / "run.log").open("wb") as log:
         # A crashed executor must not leave a model or ROS bag consuming resources.
-        process = subprocess.Popen(["setpriv", "--pdeathsig", "TERM", *cmd], stdout=log, env=env,
+        process = subprocess.Popen(["setpriv", "--pdeathsig", "TERM", *launch.cmd], stdout=log, env=launch.env,
                                    stderr=subprocess.STDOUT, start_new_session=True)
-    return Job(process, output, container)
+    return Job(process, output, launch.container)
 
 
 def _signal(job, sig):

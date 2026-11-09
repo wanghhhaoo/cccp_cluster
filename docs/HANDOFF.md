@@ -511,3 +511,57 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
   - 执行器包本机跑不了自己的测试，这次只改了导入，由 `test_ros_integration.py`、`test_batch_jobs.py`（执行器跑在仿 ROS 上）覆盖；
   - 产物正则的生成没有专门的改坏测试，`test_batch_jobs.py` 的列出和下载用例覆盖了它。
 
+## 二十六、11-09：算法适配器（推理任务接入改造 阶段 2，DESIGN“实现时的调整”第 28 条）
+
+**改动**：
+- 新增 `cccp_task_executor/algorithms/`：
+  - `base.py`：`StreamAlgorithm`、`BatchAlgorithm`、`Step`、`Output`、`Launch`、`parse_params`；
+  - 每种类型一个模块：`pkci.py`、`pkct.py`（`tracker_id` 移到这里）、`fastlivo.py`、`rssmap.py`、`heteromap.py`；
+  - `__init__.py`：`CLASSES`、`create(backend)`、`local_handlers(**engines)`。
+- `executor_node.py`：
+  - 分发、结果填写、PKCT 初始化失败、释放跟踪器都改为调用适配器；
+  - `ActiveTask` 去掉 `tracker_id`、`initialized`，加 `algorithm` 和 `state`；
+  - `parse_params` 改用网关同一份校验；
+  - 去掉了 `_run_classify`/`_run_init`/`_run_track` 和三个 `_on_*` 回调，合成一个 `_on_step`。
+- `inference.py`：两种后端改为 `declare(service, srv_type)`、`ready(service)`、`wait_ready(service)`、`call(service, request)`。`LocalBackend` 的参数从 `(pkci_engine, pkct_engine)` 改为 `handlers`（服务名 → 引擎方法）。本地后端"没加载"的提示从按类型改为按服务名。
+- `batch.py` 只保留进程的启动、停止、回收；就绪检查和命令移到适配器。`start()` 要传入适配器。
+- `annotate.py` 只留通用的 `label`、`box`，怎么画由适配器决定。
+- `data_plane.py` 遍历流式适配器，按 `ENABLE_<名称>` 加载引擎，环境变量名不变。
+- 测试改用新构造方式：
+  - `test_ros_integration.py`、`test_batch_jobs.py` 改用 `LocalBackend(local_handlers(...))`；
+  - 断言改为 `state["tracker_id"]`；
+  - `batch.start(task, 1, FastLivo())`。
+- 执行器包的测试加了 `test/conftest.py`：没有 ROS 时装上 `cccp_node/test/fake_ros.py`，所以本机现在也能跑 `cccp_task_executor` 的测试（有 ROS 时不起作用）。项目记忆第 5 节"本机跑不了"的说法过时了。
+
+**测试**：
+- 先补了现状测试 `test_stream_algorithms.py`（11 项），在改代码之前都能通过。它用单个执行器手工发命令，覆盖：
+  - PKCI 的结果字段和帧号；
+  - 连续失败到阈值才失败；
+  - PKCT 第一帧初始化（`frame_id` 为 0）、按代次的会话 ID、停止时释放；
+  - 初始化失败立即失败；
+  - bbox 不合格被拒绝；
+  - 只上报已加载的算法；
+  - ROS 服务后端在服务出现后才就绪；
+  - 未知类型被拒绝。
+- 新增 `test_algorithms.py`（10 项）：
+  - 适配器和注册表一一对应；
+  - 流式适配器的服务和本地调用一致；
+  - 扫描执行器模块里有没有按名字分支；
+  - 三个批处理适配器的启动命令和就绪条件。
+- 全量：`cccp_node` 370 项通过、3 项跳过；`cccp_task_executor` 4 项通过、1 项跳过（AirSim 取图需要真实客户端）。
+- 故意改坏 16 处：
+  - PKCT 初始化不再致命、不释放跟踪器、释放服务变成必需、bbox 不转浮点；
+  - PKCI 不计帧、不带载荷；
+  - 执行器忽略 `fatal`、从不 `close`、上报全部算法就绪、跳过参数校验、不调用 `open`；
+  - FASTLIVO 容器不命名；
+  - RSSMAP 丢掉 `--tx`；
+  - HETEROMAP 不检查共享目录、角色参数写错；
+  - `batch.py` 不用适配器的环境变量。
+  
+  第一轮有 3 处没被发现（RSSMAP `--tx`、HETEROMAP 的两处）。这些逻辑改造前也没有测试，补了批处理适配器的测试后全部发现。
+- 没有覆盖到的：
+  - `data_plane.py` 要加载真实引擎（PKCI/PKCT 权重），没有测试；
+  - 真实 ROS 2 上没有跑过。
+
+  到远端服务器上，要跑 `colcon test` 和三类批处理的真实专项测试（`docs/推理任务集成.md`“复验”）。
+

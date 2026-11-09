@@ -375,7 +375,7 @@ cccp_cluster/
 │   ├── cccp_task_interfaces/           任务层接口（从复用包 v0.1 演进而来）
 │   ├── collab_inference_interfaces/    从复用包原样复制
 │   ├── collab_inference/               推理服务；engines.py 让 ROS 服务和进程内调用共用同一份逻辑
-│   ├── cccp_task_executor/             数据面：执行器、data_plane 组合入口、AirSim 按需取图、压缩转发
+│   ├── cccp_task_executor/             数据面：执行器、算法适配器（algorithms/）、data_plane 组合入口、AirSim 按需取图、压缩转发
 │   └── cccp_node/                      控制进程
 │       └── cccp_node/
 │           ├── core/                   纯逻辑：选主、任务表、调度、对账、链路估计、数据源地址、任务类型注册表（禁止 import ROS）
@@ -395,7 +395,18 @@ cccp_cluster/
 - **注册顺序就是 `algorithms_ready` 的位号**：新类型只能追加在末尾，不得调换或复用位置；同时更新 `NodeStatus.msg` 里的位说明（`test_constants.py` 对照）和 `test_task_types.py` 里固定的顺序。位掩码是 uint8，最多 8 种。
 - 参数校验函数对不合格的 `params_json` 抛 `ValueError`，网关转成 `INVALID_INPUT`。请求里不得出现可执行文件或路径（DESIGN“实现时的调整”第 13 条）。
 - 批处理类型（`BATCH`）不能带 `input`/`image_topic`，并且必须声明产物后缀；流式类型（`STREAM`）没有产物。
-- 数据面暂时仍按名字分支：执行器、推理后端、`batch.py`、`annotate.py`，以及 `ros/convert.py` 的结果转换。它们分别在推理任务接入改造的阶段 2（适配器）和阶段 3（`TaskResult` 通用化）中改掉（HANDOFF 第二十五节）。
+- 数据面的对应部分是算法适配器（6.6）。还按名字分支的只剩 `ros/convert.py` 的结果转换，等推理任务接入改造的阶段 3（`TaskResult` 通用化）改掉（HANDOFF 第二十五、二十六节）。
+
+### 6.6 算法适配器
+
+- 每种任务类型在 `cccp_task_executor/algorithms/` 下有一个模块，并列在 `algorithms/__init__.py` 的 `CLASSES` 里；`test_algorithms.py` 检查它和 6.5 的注册表一一对应、运行方式一致。
+- 流式算法继承 `StreamAlgorithm`：
+  - `services`（必需）和 `optional`（有就用，例如释放会话）声明要调用的服务，服务名以 `algorithms/` 开头；`handlers(engine)` 给出本进程直接调用时服务名到引擎方法的对应，`serve()` 给出在数据面进程里承载引擎的 ROS 节点；
+  - `step(task, image)` 处理一帧，返回 `Step`；工作单元编号自己在 `task.frames` 里加；`Step.fatal` 非空表示这一步失败就立即结束任务（例如 PKCT 的初始化）；
+  - 会话状态放在 `task.state`，在 `open` 里建立，在 `close` 里释放（停止、失败、被新代次替换都会调用）；会话必须按 `(task_id, epoch, assign_term)` 隔离（4.1）。
+- 批处理算法继承 `BatchAlgorithm`：`ready()` 检查本节点的配置（环境变量、数据、Docker），`launch()` 返回命令、环境变量和容器名。命令只能来自节点配置，不能来自请求（6.5）。
+- 执行器、推理后端、`batch.py`、`data_plane.py`、`annotate.py` **不得按类型名字分支**；`test_algorithms.py` 扫描检查（`algorithms/` 目录除外）。
+- 新算法的引擎在数据面进程里默认加载，`ENABLE_<名称>=false` 关掉。
 
 ---
 

@@ -1,19 +1,23 @@
-"""Data-plane process (CONVENTIONS 6.1): task executor plus the PKCI and PKCT services.
+"""Data-plane process (CONVENTIONS 6.1): the task executor plus the engines of the stream algorithms.
 
 Running them in one process cuts DDS participants per board; inference stays
 out of the control process so it cannot starve the heartbeats (DESIGN 2.4).
 
-The executor calls the algorithm engines of this process directly
-(INFERENCE_BACKEND=local, the default), so frames are not serialized per call.
-The engines are still exposed as <ns>/algorithms/* ROS services for other
-processes and nodes; INFERENCE_BACKEND=ros makes the executor use those too.
-Parameters given with --ros-args apply to all three nodes (e.g. device:=cuda:0).
+Every stream algorithm (algorithms/) is loaded unless ENABLE_<NAME>=false, e.g.
+ENABLE_PKCT=false. Its engine node (StreamAlgorithm.serve) exposes the engine as
+<ns>/algorithms/* ROS services for other processes and nodes. The executor calls
+the engines of this process directly (INFERENCE_BACKEND=local, the default), so
+frames are not serialized per call; INFERENCE_BACKEND=ros makes it use the
+services too. Batch algorithms need no engine here: each task runs as its own
+process (batch.py). Parameters given with --ros-args apply to all nodes
+(e.g. device:=cuda:0).
 """
 import os
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 
+from . import algorithms
 from .executor_node import TaskExecutor
 from .inference import LocalBackend
 
@@ -27,17 +31,14 @@ def main(args=None):
     nodes = []
     backend = None
     try:
-        pkci = pkct = None
-        if _enabled("ENABLE_PKCI"):
-            from collab_inference_ros.pkci_server import PkciServer
-            pkci = PkciServer()
-            nodes.append(pkci)
-        if _enabled("ENABLE_PKCT"):
-            from collab_inference_ros.pkct_server import PkctServer
-            pkct = PkctServer()
-            nodes.append(pkct)
+        handlers = {}
+        for cls in algorithms.STREAM:
+            if _enabled("ENABLE_" + cls.name):
+                server = cls.serve()
+                nodes.append(server)
+                handlers.update(cls.handlers(server.engine))
         if os.environ.get("INFERENCE_BACKEND", "local") == "local":
-            backend = LocalBackend(pkci.engine if pkci else None, pkct.engine if pkct else None)
+            backend = LocalBackend(handlers)
         nodes.append(TaskExecutor(backend=backend))
         executor = MultiThreadedExecutor()
         for node in nodes:

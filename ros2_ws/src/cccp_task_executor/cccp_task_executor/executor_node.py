@@ -1,8 +1,10 @@
 """Board-side task executor: the interface between the control plane and the data plane (DESIGN 2.7).
 
-Takes commands from the cluster leader on /cluster/command, feeds frames from an
-image topic to PKCI/PKCT through an inference backend (in-process calls or ROS
-services, see inference.py), publishes per-frame results and composited images,
+Takes commands from the cluster leader on /cluster/command, runs each task through
+its algorithm's adapter (algorithms/): feeds frames from an image topic to a stream
+algorithm, which reaches its engine through an inference backend (in-process calls or
+ROS services, see inference.py), or starts a batch algorithm's process (batch.py).
+Publishes per-frame results and composited images,
 answers and reports on /cluster/exec_event, and publishes its running tasks and
 tombstones on <ns>/exec/status (from its own callback group, so busy inference
 callbacks do not starve it and make the node look stalled). That status also goes
@@ -19,16 +21,15 @@ max_tasks_per_node is refused BUSY, and a stop for a destroyed task leaves a
 tombstone. Every command addressed here gets exactly one ExecEvent in return.
 
 Frames that arrive while a task's previous frame is still being processed are
-skipped, so each task always works on the latest frame and PKCT receives its
-frames strictly in order. A primary that receives no frame at all for
+skipped, so each task always works on the latest frame and a stateful algorithm
+(PKCT) receives its frames strictly in order. A primary that receives no frame at all for
 input_timeout seconds reports the task Failed with NOT_READY: its input is
 unreachable from this node, and the leader may move it (CONVENTIONS 5.5).
 Helpers do not check, since only the primary's reports drive the task state.
 """
-import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import rclpy
 from cv_bridge import CvBridge
@@ -38,12 +39,10 @@ from sensor_msgs.msg import CompressedImage, Image
 
 from cccp_cluster_interfaces.msg import Command, ExecEvent, ExecutorStatus, TaskState, Tombstone
 from cccp_task_interfaces.msg import TaskResult
-from collab_inference_interfaces.srv import Classify, InitTracker, ResetTracker, Track
 
 from cccp_node import names
 from cccp_node.control import protocol as p
 from cccp_node.core import constants as c
-from cccp_node.core import task_types
 from cccp_node.core.execution_guard import IGNORE, NOOP, REJECT, RESTART, STOP, ExecutionGuard
 from cccp_node.core.generation import Generation
 from cccp_node.core.input_source import FETCH_EACH, parse_input, plan_input
@@ -51,37 +50,14 @@ from cccp_node.core.naming import default_node_id
 from cccp_node.core.task_spec import TaskSpec
 from cccp_node.ros import convert, qos
 
+from . import algorithms
 from .airsim_common import AirSimClient
 from .airsim_feeds import AirSimFeeds
-from .annotate import annotate
+from .algorithms.base import parse_params
 from .images import decompress
 from .inference import RosServiceBackend
 from .relay import ImageRelay
 from . import batch
-
-TASK_TYPES = task_types.ALGORITHMS
-
-
-def parse_params(task_type, params_json):
-    """Validate StartTask.params_json; returns the decoded dict."""
-    params = json.loads(params_json) if params_json.strip() else {}
-    if not isinstance(params, dict):
-        raise ValueError("params_json must be a JSON object")
-    if task_type == "PKCT":
-        bbox = params.get("bbox")
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            raise ValueError("PKCT requires params_json {\"bbox\": [x, y, width, height]}")
-        bbox = [float(v) for v in bbox]
-        if bbox[2] <= 0 or bbox[3] <= 0:
-            raise ValueError("PKCT bbox width and height must be positive")
-        params["bbox"] = bbox
-    return params
-
-
-def tracker_id(task_id, generation):
-    """PKCT sessions are isolated per task and generation (CONVENTIONS 4.1)."""
-    return "task-%s-%d-%d" % (task_id, *generation)
-
 
 @dataclass
 class ActiveTask:
@@ -93,7 +69,8 @@ class ActiveTask:
     level: str
     image_topic: str             # topic actually subscribed (see input_source.plan_input)
     params: dict
-    tracker_id: str = ""
+    algorithm: object = None     # its adapter (algorithms/)
+    state: dict = field(default_factory=dict)   # the adapter's per-session state (StreamAlgorithm.open)
     primary: str = ""            # name of the task primary (its namespace serves relayed input)
     primary_id: int = 0
     helper_ids: tuple = ()
@@ -103,7 +80,6 @@ class ActiveTask:
     input: str = ""
     compressed: bool = False
     fetch: tuple = None          # (vehicle, camera) of the AirSim feed this task holds
-    initialized: bool = False
     busy: bool = False
     frames: int = 0
     failures: int = 0
@@ -119,7 +95,7 @@ class ActiveTask:
 
 class TaskExecutor(Node):
     def __init__(self, backend=None, airsim_client_factory=None):
-        """backend: how to reach the algorithms (inference.py); default calls their ROS services.
+        """backend: how stream algorithms reach their engines (inference.py); default calls their ROS services.
         airsim_client_factory: makes AirSim clients for airsim:// inputs; default uses airsim_host."""
         super().__init__("task_executor", start_parameter_services=False, enable_rosout=False)
         self.declare_parameter("node_name", "node-1")
@@ -160,6 +136,7 @@ class TaskExecutor(Node):
         self._subscriptions_by_topic = {}
 
         self._backend = backend if backend is not None else RosServiceBackend(self)
+        self._algorithms = algorithms.create(self._backend)
         get = lambda name: self.get_parameter(name).value  # noqa: E731
         self._airsim_mode = get("airsim_fetch_mode")
         self._relay = ImageRelay(self, int(get("jpeg_quality")))
@@ -188,7 +165,7 @@ class TaskExecutor(Node):
 
     # ------------------------------------------------------------------ status
     def _algorithms_ready(self):
-        return list(self._backend.algorithms_ready()) + batch.ready()
+        return [name for name, algorithm in self._algorithms.items() if algorithm.ready()]
 
     def _publish_status(self):
         with self._status_lock:
@@ -255,13 +232,13 @@ class TaskExecutor(Node):
         try:
             spec = TaskSpec.from_json(msg.spec_json)
             task_type = spec.task_type.strip().upper()
-            if task_type not in TASK_TYPES:
+            algorithm = self._algorithms.get(task_type)
+            if algorithm is None:
                 raise ValueError("unsupported algorithm: " + task_type)
             if generation.epoch <= 0:
                 raise ValueError("epoch must be positive")
-            params = parse_params(task_type, spec.params_json)
-            unavailable = (("" if task_type in batch.ready() else "batch runtime unavailable")
-                           if task_type in batch.TYPES else self._backend.wait_ready(task_type, self._wait_timeout))
+            params = parse_params(algorithm, spec.params_json)
+            unavailable = algorithm.wait_ready(self._wait_timeout)
             if unavailable:
                 self._report(task_id, generation, p.REJECTED, c.NOT_READY, unavailable, msg)
                 return
@@ -285,7 +262,7 @@ class TaskExecutor(Node):
                 level=spec.level or "full",
                 image_topic=plan.topic,
                 params=params,
-                tracker_id=tracker_id(task_id, generation),
+                algorithm=algorithm,
                 primary=msg.primary_name,
                 primary_id=msg.primary_node,
                 helper_ids=tuple(msg.helper_nodes),
@@ -297,9 +274,9 @@ class TaskExecutor(Node):
                 fetch=plan.fetch,
                 last_input=time.monotonic(),
             )
-            if task_type in batch.TYPES:
+            if isinstance(algorithm, algorithms.BatchAlgorithm):
                 try:
-                    task.job = batch.start(task, self._node_id)
+                    task.job = batch.start(task, self._node_id, algorithm)
                 except FileExistsError:
                     # This generation already ran here and its session was lost (executor restart).
                     # Not permanent: the leader moves the task to a new generation.
@@ -307,6 +284,8 @@ class TaskExecutor(Node):
                                  "%s already ran %s %s" % (self._node_name, task_type, generation), msg)
                     return
                 task.fetch = None
+            else:
+                algorithm.open(task)
             if task.fetch:
                 self._feeds.acquire(*task.fetch)
             self._tasks[task.task_id] = task
@@ -355,37 +334,8 @@ class TaskExecutor(Node):
             if task.busy:
                 continue
             task.busy = True
-            if task.task_type == "PKCI":
-                self._run_classify(task, msg)
-            elif not task.initialized:
-                self._run_init(task, msg)
-            else:
-                self._run_track(task, msg)
-
-    def _run_classify(self, task, msg):
-        task.frames += 1
-        request = Classify.Request(
-            image=msg, drone_id=task.drone_id, frame_id=task.frames, level=task.level
-        )
-        future = self._backend.classify(request)
-        future.add_done_callback(lambda f: self._on_classified(task, msg, f))
-
-    def _run_init(self, task, msg):
-        x, y, width, height = task.params["bbox"]
-        request = InitTracker.Request(
-            tracker_id=task.tracker_id, first_frame=msg, x=x, y=y, width=width, height=height
-        )
-        future = self._backend.init_tracker(request)
-        future.add_done_callback(lambda f: self._on_initialized(task, msg, f))
-
-    def _run_track(self, task, msg):
-        task.frames += 1
-        request = Track.Request(
-            tracker_id=task.tracker_id, frame=msg, drone_id=task.drone_id,
-            frame_id=task.frames, level=task.level,
-        )
-        future = self._backend.track(request)
-        future.add_done_callback(lambda f: self._on_tracked(task, msg, f))
+            step = task.algorithm.step(task, msg)
+            step.future.add_done_callback(lambda f, task=task, step=step: self._on_step(task, msg, step, f))
 
     def destroy_node(self):
         batch.shutdown([t.job for t in self._tasks.values() if t.job is not None] + self._stopping)
@@ -440,7 +390,7 @@ class TaskExecutor(Node):
         result.source_stamp = msg.header.stamp
         return result
 
-    def _reply(self, task, future):
+    def _reply(self, task, future, fatal):
         """Common completion handling; returns the service reply or None."""
         task.busy = False
         if self._tasks.get(task.task_id) is not task:
@@ -448,63 +398,34 @@ class TaskExecutor(Node):
         try:
             reply = future.result()
         except Exception as exc:
-            self._failure(task, "service call failed: %s" % exc)
+            self._failure(task, "service call failed: %s" % exc, fatal)
             return None
         if not reply.success:
-            self._failure(task, reply.message)
+            self._failure(task, reply.message, fatal)
             return None
         task.failures = 0
         return reply
 
-    def _on_classified(self, task, msg, future):
-        reply = self._reply(task, future)
+    def _on_step(self, task, msg, step, future):
+        reply = self._reply(task, future, step.fatal)
         if reply is None:
             return
+        output = step.finish(reply)
         result = self._new_result(task, msg)
         result.success = result.valid = True
-        result.message = "ok"
-        result.latency_ms = reply.latency_ms
-        result.label = reply.label
-        result.class_name = reply.class_name
-        result.score = reply.score
-        result.confidence = reply.confidence
-        result.log_probs = list(reply.log_probs)
-        result.payload = reply.increment
-        self._publish(task, msg, result, "%s (%.2f)" % (reply.class_name, reply.score))
-
-    def _on_initialized(self, task, msg, future):
-        reply = self._reply(task, future)
-        if reply is None:
-            return
-        task.initialized = True
-        result = self._new_result(task, msg)
-        result.success = result.valid = True
-        result.message = "tracker initialized"
-        result.x, result.y, result.width, result.height = task.params["bbox"]
-        result.confidence = 1.0
-        self._publish(task, msg, result, None)
-
-    def _on_tracked(self, task, msg, future):
-        reply = self._reply(task, future)
-        if reply is None:
-            return
-        result = self._new_result(task, msg)
-        result.success = result.valid = True
-        result.message = "ok"
-        result.latency_ms = reply.latency_ms
-        result.x, result.y = reply.x, reply.y
-        result.width, result.height = reply.width, reply.height
-        result.confidence = reply.confidence
-        result.payload = reply.identity
-        self._publish(task, msg, result, "box (%.0f, %.0f, %.0f, %.0f) conf %.2f" % (
-            reply.x, reply.y, reply.width, reply.height, reply.confidence))
+        result.message = output.message
+        result.latency_ms = output.latency_ms
+        for name, value in output.fields.items():
+            setattr(result, name, value)
+        result.payload = output.payload
+        self._publish(task, msg, result, output.summary)
 
     def _publish(self, task, msg, result, summary):
         self._results.publish(result)
         if self._publish_annotated and self._result_images.get_subscription_count() > 0:
             try:
                 rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
-                image = self._bridge.cv2_to_imgmsg(annotate(rgb, result), encoding="rgb8")
+                image = self._bridge.cv2_to_imgmsg(task.algorithm.annotate(rgb, result), encoding="rgb8")
                 image.header.stamp = msg.header.stamp
                 # frame_id identifies the task: several tasks may share one board.
                 image.header.frame_id = "task_%s" % task.task_id
@@ -515,14 +436,15 @@ class TaskExecutor(Node):
             task.reported_first_result = True
             self.get_logger().info("task=%s gen=%s first result: %s" % (task.task_id, task.generation, summary))
 
-    def _failure(self, task, reason):
+    def _failure(self, task, reason, fatal=""):
+        """fatal: a failure of this step ends the task at once (Step.fatal), with this prefix."""
         task.failures += 1
         self.get_logger().warning(
             "task=%s gen=%s frame failed (%d/%d): %s"
             % (task.task_id, task.generation, task.failures, self._max_failures, reason)
         )
-        if not task.initialized and task.task_type == "PKCT":
-            reason = "tracker init failed: " + reason
+        if fatal:
+            reason = fatal + reason
         elif task.failures < self._max_failures:
             return
         self._remove(task, p.FAILED, reason, c.INFERENCE_ERROR)
@@ -536,8 +458,8 @@ class TaskExecutor(Node):
         self._release_subscription(task.image_topic)
         if task.fetch and self._feeds is not None:
             self._feeds.release(*task.fetch)
-        if task.task_type == "PKCT":
-            self._backend.reset(ResetTracker.Request(tracker_id=task.tracker_id))
+        if task.job is None:
+            task.algorithm.close(task)
         self._report(task.task_id, task.generation, kind, error_code, message, command)
 
 

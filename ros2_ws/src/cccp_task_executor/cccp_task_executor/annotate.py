@@ -1,4 +1,4 @@
-"""Draw algorithm results onto the input frame (the composited result image)."""
+"""Drawing helpers for the composited result image (StreamAlgorithm.annotate)."""
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -23,16 +23,21 @@ def _label(draw, font, xy, text):
     draw.text((left, top), text, fill=_TEXT, font=font)
 
 
-def annotate(rgb, result):
-    """rgb: HxWx3 uint8; result: TaskResult message. Returns a new HxWx3 uint8 array."""
+def _canvas(rgb):
     image = Image.fromarray(np.ascontiguousarray(rgb))
-    draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
-    if result.task_type == "PKCT":
-        x0, y0 = result.x, result.y
-        x1, y1 = x0 + result.width, y0 + result.height
-        draw.rectangle((x0, y0, x1, y1), outline=_COLOR, width=3)
-        _label(draw, font, (x0 + 2, max(0.0, y0 - 14)), "conf %.2f" % result.confidence)
-    else:
-        _label(draw, font, (6, 6), "%s %.2f" % (result.class_name, result.score))
+    return image, ImageDraw.Draw(image), ImageFont.load_default()
+
+
+def label(rgb, text):
+    """A label in the top left corner. rgb: HxWx3 uint8; returns a new array."""
+    image, draw, font = _canvas(rgb)
+    _label(draw, font, (6, 6), text)
+    return np.asarray(image)
+
+
+def box(rgb, x, y, width, height, text):
+    """A box with a label above it. rgb: HxWx3 uint8; returns a new array."""
+    image, draw, font = _canvas(rgb)
+    draw.rectangle((x, y, x + width, y + height), outline=_COLOR, width=3)
+    _label(draw, font, (x + 2, max(0.0, y - 14)), text)
     return np.asarray(image)

@@ -118,6 +118,7 @@
 | # | 调整 | 原因 | 章节 |
 |---|---|---|---|
 | 27 | 新增 `core/task_types.py`：每种任务类型一项 `TaskType`（运行方式 stream/batch、允许的 mode、固定的有序参与节点数、辅助节点失败是否整个任务失败、参数校验、产物后缀）。网关校验、集群主节点"辅助节点失败即失败"、`result_url`、产物下载地址都改为查这张表，`core/`、`control/` 里不再按类型名字分支。注册顺序就是 `algorithms_ready` 的位号。规格校验的两条错误信息随之变成通用写法：`<类型> requires <mode> mode`（原 `single-board job requires local mode`）、`<类型> needs <n> ordered target_nodes, the task primary first`（原 `HETEROMAP needs fusion mode and six ordered target_nodes`；mode 不对时现在报前一条）。接受和拒绝的判断、错误码都不变，接口不变 | 每加一种推理任务都要在 `task_spec`、`controller`、`task_table`、`ue_api` 里各加一个分支，规则散落、容易漏改，批处理的这几条规则原来也没有测试。这是推理任务接入改造的阶段 1；执行器仍按名字分支（阶段 2 改为适配器），`ros/convert.py` 的结果转换要等 `TaskResult` 通用化（阶段 3，要改接口） | 4.1、2.6 |
+| 28 | 数据面改为**算法适配器**（`cccp_task_executor/algorithms/`，每种类型一个模块）。流式算法（`StreamAlgorithm`）声明要用的服务，提供 `open`/`step`/`close`/`annotate`，每帧返回结果字段；批处理算法（`BatchAlgorithm`）给出就绪检查和启动命令（`Launch`）。执行器、推理后端（改为按服务名调用）、`batch.py`、`data_plane.py`（按 `ENABLE_<名称>` 加载引擎）不再按类型名字分支。执行器收到 START 时用和网关同一份参数校验（`core/task_types.py`），PKCT bbox 不合格时的错误信息随之变成网关的那条。PKCT 的“初始化失败立即失败”改由 `Step.fatal` 表示 | 推理任务接入改造的阶段 2：每加一种算法原来要改执行器的分发、失败处理、释放、后端两种实现、`batch.py` 的就绪检查和启动命令、`annotate.py`。行为不变，接口不变。剩下 `ros/convert.py` 的结果转换要等 `TaskResult` 通用化（阶段 3） | 6.2、2.6 |
 
 ---
 
@@ -394,7 +395,8 @@ QoS 集中定义在 `cccp_node/ros/qos.py`，端点名集中定义在 `cccp_node
 | `cccp_node/ros/*`                                                 | ROS 适配：控制节点、命令和请求的发布、消息转换（含编号 ↔ 名字、枚举、量化）、QoS | `test_convert.py`、`test_constants.py`、`test_message_size.py`、`test_ros_integration.py` |
 | `cccp_node/monitor/probes.py`                                     | CPU/内存/GPU 采集                                 | `test_probes.py`                               |
 | `cccp_task_executor/executor_node.py`                             | 执行器                                            | `test_ros_integration.py`                      |
-| `cccp_task_executor/inference.py`                                 | 推理后端：本地调用 / ROS 服务                     | 同上（两种后端各跑一遍）                         |
+| `cccp_task_executor/inference.py`                                 | 推理后端：按服务名本地调用 / ROS 服务             | 同上（两种后端各跑一遍）                         |
+| `cccp_task_executor/algorithms/`                                  | 算法适配器：每种任务类型一个模块（流式：服务、逐帧步骤、会话、画图；批处理：就绪检查、启动命令） | `test_stream_algorithms.py`、`test_algorithms.py`、`test_batch_jobs.py` |
 | `cccp_task_executor/airsim_feeds.py`、`relay.py`、`images.py` | AirSim 按需取图、压缩转发、解压                   | 同上                                             |
 | `collab_inference/collab_inference_ros/engines.py`                | PKCI/PKCT 引擎（ROS 服务和本地调用共用）          | `test_engines.py`、`test_engines_real.py`    |
 
@@ -891,7 +893,8 @@ UE 侧需要做的事：每次用户操作生成一个键；收到 503 时退避
 - **结果带执行代次**：`TaskResult` 带 `frame_id` 和 `(epoch, assign_term)`，汇总方和子任务据此丢弃旧代次的结果。
 - **失败计数**：连续失败 10 次（`max_consecutive_failures`），执行器上报 `FAILED`（`INFERENCE_ERROR`）。PKCT 初始化失败立即上报失败。
 - **无输入检测**：任务主节点从启动或上一帧起超过 `input_timeout`（10 秒）收不到帧，上报 `FAILED`（`NOT_READY`）。只看帧是否到达，被丢弃的帧也算，所以推理慢不会触发。集群主节点收到后换节点重试，见第 3.3 节。
-- **推理后端**（`inference.py`）：默认 `LocalBackend`，在同一进程内用线程池直接调用引擎，返回 future；设置 `INFERENCE_BACKEND=ros` 可以改走 `<ns>/algorithms/*` 服务。两种后端接口相同，集成测试各跑一遍。
+- **推理后端**（`inference.py`）：默认 `LocalBackend`，在同一进程内用线程池直接调用引擎，返回 future；设置 `INFERENCE_BACKEND=ros` 可以改走 `<ns>/algorithms/*` 服务。两种后端都按服务名调用（服务由各算法适配器声明），接口相同，集成测试各跑一遍。
+- **算法适配器**（`algorithms/`）：执行器只做通用的事（只处理最新帧、失败计数、发布结果和结果图、无输入检测、批处理进程的启停），每种算法怎么调用引擎、结果填哪些字段、会话怎么建立和释放、结果图怎么画，都在它自己的模块里（CONVENTIONS 6.6）。
 - **结果的接收者**：网关只有在 UE 问到某个任务时，才订阅执行它的节点的结果 topic（`ue_backend` 的 `watch`）。如果每个节点都订阅所有结果，无线链路上会多出约 8 Mbps 的流量。
 
 **实测推理耗时**（640×480 合成图，`tools/inference_bench.py`）：

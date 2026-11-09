@@ -27,6 +27,8 @@ if INSTALLED:
     from cccp_node.ue_api import UeApi
     from cccp_task_executor import batch
     from cccp_task_executor.executor_node import TaskExecutor
+    from cccp_task_executor.algorithms import local_handlers
+    from cccp_task_executor.algorithms.fastlivo import FastLivo
     from cccp_task_executor.inference import LocalBackend
 
 pytestmark = pytest.mark.skipif(not INSTALLED, reason="requires fake ROS control bus")
@@ -129,7 +131,7 @@ def executor(batch_env):
     fake_ros.BUS.reset()
     fake_ros.BUS.namespace = ros_namespace("edge-02")
     fake_ros.BUS.params = dict(node_name="edge-02", status_period=60.0, input_timeout=0.0)
-    node = TaskExecutor(backend=LocalBackend(FakeEngine(), FakeEngine()))
+    node = TaskExecutor(backend=LocalBackend(local_handlers(PKCI=FakeEngine(), PKCT=FakeEngine())))
     node.events = []
     probe = fake_ros.Node("probe")
     probe.create_subscription(ExecEvent, names.EXEC_EVENT_TOPIC, node.events.append, qos.EXEC_EVENT)
@@ -215,7 +217,7 @@ def docker_calls(log):
 
 def test_stopped_fastlivo_script_removes_its_named_container(batch_env, docker_log):
     task = fastlivo_task()
-    job = batch.start(task, 1)
+    job = batch.start(task, 1, FastLivo())
     name = "cccp-fastlivo-%s-2-3" % task.task_id
     assert job.container == name
     wait_for(lambda: any(call.startswith("run ") for call in docker_calls(docker_log)))

@@ -32,6 +32,7 @@ if INSTALLED:
 
     from cccp_node.ros.control_node import ControlNode  # noqa: E402
     from cccp_task_executor.executor_node import TaskExecutor  # noqa: E402
+    from cccp_task_executor.algorithms import local_handlers  # noqa: E402
     from cccp_task_executor.inference import LocalBackend  # noqa: E402
 
 NAMES = ("edge-01", "edge-02", "edge-03")
@@ -159,7 +160,7 @@ def cluster(monkeypatch, request, tmp_path):
         )
         engine = FakeEngine()
         if request.param == "local_calls":
-            backend = LocalBackend(engine, engine)
+            backend = LocalBackend(local_handlers(PKCI=engine, PKCT=engine))
             algorithms = fake_ros.Node("no_algorithm_services")
         else:
             backend, algorithms = None, FakeAlgorithms(engine)
@@ -263,12 +264,12 @@ def test_unpinned_task_moves_when_its_primary_dies(cluster):
                                        CreateTask.Response())
     assert reply.success, reply.message
     primary = cluster[reply.assigned_node]
-    assert primary.executor._tasks[reply.task_id].tracker_id.startswith("task-%s-1-" % reply.task_id)
+    assert primary.executor._tasks[reply.task_id].state["tracker_id"].startswith("task-%s-1-" % reply.task_id)
     kill(primary)
     record = wait_for(record_where(cluster, reply.task_id, lambda r: r.epoch == 2 and r.status == c.RUNNING),
                       timeout=20.0)
     assert record.primary != primary.name and runners(cluster, reply.task_id) == [record.primary]
-    assert cluster[record.primary].executor._tasks[reply.task_id].tracker_id == "task-%s-%d-%d" % (
+    assert cluster[record.primary].executor._tasks[reply.task_id].state["tracker_id"] == "task-%s-%d-%d" % (
         reply.task_id, *record.generation)
 
 
