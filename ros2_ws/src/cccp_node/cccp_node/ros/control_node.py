@@ -42,6 +42,7 @@ from cccp_task_interfaces.srv import CreateTask, DestroyTask, QueryTask
 from .. import names
 from ..control.controller import ControllerConfig, LeaderController
 from ..control.gateway import Gateway, GatewayConfig
+from ..control.journal import SNAPSHOT, Journal, JournalWriter, snapshot_fields
 from ..control.task_store import TaskStore
 from ..control.ue_backend import UeBackend
 from ..core import constants as c
@@ -96,6 +97,16 @@ class ControlNode(Node):
         self.probe = SystemProbe()
         self._usage = Usage()                          # unknown until the first sample
         self.store = TaskStore()
+        self._journal_writer = None
+        if p["journal_dir"]:
+            self._journal_writer = JournalWriter(p["journal_dir"], self.node_name,
+                                                 max_bytes=int(p["journal_max_mb"] * (1 << 20)),
+                                                 keep=p["journal_keep"])
+        state = lambda: self.election.state
+        self.journal = Journal(self.node_name, self._incarnation, context=lambda: (state().term, state().leader),
+                               sink=self._journal_writer.put if self._journal_writer else None)
+        self._followed = ("", 0)                      # (leader, term) last journaled
+        self.journal.record("start", node_id=self.node_id, protocol=c.PROTOCOL_VERSION)   # before any timer runs
         self._commands = RosCommandSink(self.cluster)
         self._leader_endpoints = None                 # (Reply publisher, ExecEvent and Request subscriptions)
         self.controller = LeaderController(
@@ -103,7 +114,7 @@ class ControlNode(Node):
             ControllerConfig(scheduler=SchedulerConfig(), reconcile=ReconcileConfig(
                 executor_stall_grace_s=p["executor_stall_grace"]), warmup_s=p["offline_timeout"],
                 create_wait_timeout_s=p["create_wait"], destroy_wait_timeout_s=p["destroy_wait"]),
-            reply=self._send_reply,
+            reply=self._send_reply, journal=self.journal,
         )
         request_pub = self.create_publisher(Request, names.REQUEST_TOPIC, qos.REQUEST)
         self.gateway = Gateway(
@@ -115,7 +126,7 @@ class ControlNode(Node):
         )
         self.ue = UeBackend(self.node_name, self.gateway, self.cluster,
                             watch=lambda node, images: self._outbox.put(("watch", (node, images))),
-                            leader_name=lambda: self.election.state.leader)
+                            leader_name=lambda: self.election.state.leader, journal=self.journal)
         self.store.add_event_listener(self._on_table_events)
 
         self._node_status_pub = self.create_publisher(NodeStatus, names.NODE_STATUS_TOPIC, qos.NODE_STATUS_PUB)
@@ -140,6 +151,8 @@ class ControlNode(Node):
         self.create_timer(p["status_period"] * self._slow_every, self._sample_resources,
                           callback_group=self._probe_group)
         self.create_timer(0.05, self._drain_outbox)
+        if p["snapshot_period"] > 0:
+            self.create_timer(p["snapshot_period"], self._journal_snapshot, callback_group=self._state_group)
         self._publish_task_list()                     # tells everyone this node's name
 
         self._controller_thread = threading.Thread(target=self.controller.run, args=(self._stop,), daemon=True)
@@ -147,8 +160,9 @@ class ControlNode(Node):
         self._ue_api = None
         if p["ue_http_port"]:
             self._ue_api = UeApi(self.ue, p["ue_http_host"], p["ue_http_port"], self.get_logger())
-        self.get_logger().info("control node %s (id %d) ready (protocol %d, ue_http=%s)" % (
-            self.node_name, self.node_id, c.PROTOCOL_VERSION, p["ue_http_port"] or "off"))
+        self.get_logger().info("control node %s (id %d) ready (protocol %d, ue_http=%s, journal=%s)" % (
+            self.node_name, self.node_id, c.PROTOCOL_VERSION, p["ue_http_port"] or "off",
+            self._journal_writer.path if self._journal_writer else "memory only"))
 
     def _declare_parameters(self) -> dict:
         defaults = {
@@ -167,6 +181,12 @@ class ControlNode(Node):
             "task_types": list(c.ALGORITHMS),
             "ue_http_host": "0.0.0.0",
             "ue_http_port": 18090,
+            # Event journal (control/journal.py): empty keeps it in memory only (GET /api/ue/journal).
+            "journal_dir": os.environ.get("CCCP_JOURNAL_DIR") or (
+                os.path.join(os.environ["CCCP_DATA_DIR"], "journal") if os.environ.get("CCCP_DATA_DIR") else ""),
+            "journal_max_mb": 20.0,      # per file; journal_keep older files are kept besides the current one
+            "journal_keep": 9,
+            "snapshot_period": 10.0,     # cluster snapshot in the journal; 0 turns it off
         }
         return {name: self.declare_parameter(name, value).value for name, value in defaults.items()}
 
@@ -188,7 +208,13 @@ class ControlNode(Node):
             else:
                 self.get_logger().warning("node=%s offline: last heartbeat %.1f s ago, missed=%d before" % (
                     change.name, change.silent_s, change.missed))
+            self.journal.record("node_online" if change.online else "node_offline", peer=change.name,
+                                restarted=change.restarted, silent_s=round(change.silent_s, 2), missed=change.missed)
         leadership = self.election.update(peers, now, me)
+        if (leadership.leader, leadership.term) != self._followed:
+            (prev_leader, prev_term), self._followed = self._followed, (leadership.leader, leadership.term)
+            self.journal.record("leader_changed", prev_leader=prev_leader, prev_term=prev_term,
+                                leading=leadership.is_self)
         self._follow_role(leadership.is_self)
         self._seq += 1
         hw, usage = self.probe.hardware, self._usage
@@ -213,6 +239,13 @@ class ControlNode(Node):
         own_links = tuple(LinkView(r.peer_name, r.rtt_ms, r.jitter_ms, r.loss_rate) for r in reports)
         self.cluster.update(replace(view, links=own_links), now)
         self.cluster.update_task_list(self._own_tasks, now)
+
+    def _journal_snapshot(self):
+        now = time.monotonic()
+        me = self.cluster.get(self.node_name)
+        statuses = [r.status for r in self.store.records().values()] if self.controller.active else None
+        self.journal.record(SNAPSHOT, **snapshot_fields(self.cluster.online(now), self.cluster.all(),
+                                                        me.links if me else (), statuses))
 
     def _sample_resources(self):
         self._usage = self.probe.sample()             # one reference assignment: the heartbeat reads it whole
@@ -353,10 +386,14 @@ class ControlNode(Node):
         if self._ue_api is not None:
             self._ue_api.shutdown()
         self._controller_thread.join(timeout=2.0)
+        self.journal.record("stop")
+        if self._journal_writer is not None:
+            self._journal_writer.close()
 
 
 def main(args=None):
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] [%(name)s] %(message)s")
+    # Same layout as rclpy's own lines ([severity] [epoch seconds] [name]: message), so both kinds sort together.
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] [%(created).6f] [%(name)s]: %(message)s")
     rclpy.init(args=args)
     node = None
     try:

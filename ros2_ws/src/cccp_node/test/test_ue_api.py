@@ -10,6 +10,7 @@ import pytest
 
 from cccp_node.control.controller import ControllerConfig, LeaderController
 from cccp_node.control.gateway import Gateway, GatewayConfig
+from cccp_node.control.journal import Journal
 from cccp_node.control.task_store import TaskStore
 from cccp_node.control.ue_backend import UeBackend
 from cccp_node.core import constants as c
@@ -78,6 +79,19 @@ def test_health_and_nodes(server):
     assert status == 200 and body["leader"] == "n1"
     status, body = call_json("GET", server.base + "/nodes")
     assert status == 200 and body["nodes"][0]["name"] == "n1" and body["nodes"][0]["status"] == "Online"
+
+
+def test_journal_window(server):
+    status, body = call_json("GET", server.base + "/journal")
+    assert status == 404
+    journal = server.backend.journal = Journal("n1", 77)
+    for event in ("start", "snapshot", "node_offline", "snapshot", "leader_changed"):
+        journal.record(event)
+    status, body = call_json("GET", server.base + "/journal?after=1&snapshots=0")
+    assert status == 200 and (body["node"], body["incarnation"], body["last_seq"]) == ("n1", 77, 5)
+    assert [e["event"] for e in body["entries"]] == ["node_offline", "leader_changed"]
+    status, body = call_json("GET", server.base + "/journal?limit=2")
+    assert [e["seq"] for e in body["entries"]] == [1, 2]
 
 
 def start_on(server, node):

@@ -50,6 +50,7 @@ deploy/run_node.sh deploy/node.env
 - 容器用 `--restart unless-stopped`，板卡重启后自动起来。
 - 启动日志（`docker logs cccp-<NODE_NAME>`）第二行会打印 DDS 网卡、组播设置和 `CYCLONEDDS_URI`。网卡名写错时 `start_node.sh` 直接退出并报错。
 - 想看 Cyclone 实际选了什么，在 `node.env` 里设 `CCCP_DDS_TRACE=config`，启动时会打印完整的生效配置。
+- 事件日志（DESIGN 2.9）写在板卡的 `/var/lib/cccp/journal/<NODE_NAME>.jsonl`（`CCCP_DATA_DIR` 可改），重建容器不会丢。控制进程启动时会打印实际路径。
 - 第一轮只验证控制面和 PKCI/PKCT，**先不配三类批处理任务**（FASTLIVO 的镜像只有 amd64，还需要在容器里调用 Docker；HETEROMAP 需要共享盘，见 `docs/推理任务集成.md`）。
 
 ### 组播还是单播（`CCCP_DDS_MULTICAST`）
@@ -74,6 +75,18 @@ python3 deploy/smoke_check.py 192.168.1.101 192.168.1.102 192.168.1.103
    - 抓包：空闲 60 秒，每块板卡上执行 `tcpdump -i <网卡> -w edge-XX.pcap udp`。把各板卡的 pcap 收到一个目录，加一个 `addresses` 文件（每行 `<节点名> <IP>`），然后运行 `python3 tools/rtps_loss.py <目录>`。
    - 故障注入：按 DESIGN 10.2 的验收表逐条执行，丢包和延迟用 `tc qdisc add dev <网卡> root netem loss 30%` 这类命令注入，结果回填附录 A。
 
+每轮测试后把各板卡的事件日志收回来合并（每块板卡一个目录）：
+
+```bash
+for ip in 192.168.1.101 192.168.1.102; do mkdir -p journal/$ip && scp "$ip:/var/lib/cccp/journal/*" journal/$ip/; done
+```
+
+```bash
+python3 tools/merge_journal.py journal/ --event leader_changed,node_offline,node_online,leader_active
+```
+
+`--task <id 前缀>` 看一个任务的调度、迁移和停止，`--node <名字>` 看某个节点自己记的和别人记它的事件，`--snapshots` 加上每 10 秒的快照。输出开头如果有 `clock check: ... off the others`，说明那块板卡的时钟没同步，它的事件在时间线上整体偏移了那么多。
+
 ## 6 常见问题
 
 | 现象 | 先查什么 |
@@ -82,3 +95,4 @@ python3 deploy/smoke_check.py 192.168.1.101 192.168.1.102 192.168.1.103
 | 某个节点时断时续 | `/api/ue/nodes` 里各节点对它的 `loss_rate`；日志里 `node=<名字> offline ... missed=` 的 seq 缺口（缺口大说明它一直在发，是途中丢的）；抓包确认包到没到接收方网卡（HANDOFF 第十九节的查法） |
 | 出现两个集群主节点 | `smoke_check.py` 会报 “gateways disagree”；看日志里的选主间接证据（`not heard here: not claiming`），HANDOFF 第十八节 |
 | `inference not ready` | 数据面进程的日志：torch 能否导入、`COLLAB_DEVICE`、模型权重 |
+| 事后想知道某次换主或迁移的经过 | 收回事件日志用 `tools/merge_journal.py` 合并（第 5 节）；还在运行的节点可以直接 `curl http://<IP>:18090/api/ue/journal?snapshots=0` 看最近 2000 条 |

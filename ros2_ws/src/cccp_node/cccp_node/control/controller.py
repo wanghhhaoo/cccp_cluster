@@ -43,6 +43,7 @@ from ..core.task_table import (
     Adopt, Assign, Cancel, MarkFailed, Prune, ReportStatus, Requeue, Submit, TaskRecord,
 )
 from . import protocol as p
+from .journal import Journal, recorder
 from .protocol import ExecCommand, ExecEvent, Reply, Request
 from .task_store import TaskStore
 
@@ -97,6 +98,7 @@ class LeaderController:
         wall_ms: Callable[[], int] = lambda: int(time.time() * 1000),
         reply: Callable[[Reply], None] = lambda reply: None,
         new_uuid: Callable[[], str] = lambda: str(uuid.uuid4()),
+        journal: Journal | None = None,
     ):
         self.node_name = node_name
         self._store = store
@@ -108,6 +110,7 @@ class LeaderController:
         self._wall_ms = wall_ms
         self._reply = reply
         self._new_uuid = new_uuid
+        self._record = recorder(journal)
         self._events: queue.Queue[ExecEvent] = queue.Queue()
         self._requests: queue.Queue[Request] = queue.Queue()
         self._last_event_seq: dict[tuple[str, int], int] = {}
@@ -121,6 +124,8 @@ class LeaderController:
         self._stalls: Counter = Counter()                   # task_id -> primaries whose input stopped
         self._waiting: list[_Waiting] = []
         self._stopped: dict[str, set[str]] = {}             # cancelled task_id -> nodes that confirmed
+        self._active_term = 0                               # term whose warm-up end was journaled
+        store.add_event_listener(self._journal_table_events)
 
     # ------------------------------------------------------------- inputs
     def on_event(self, event: ExecEvent) -> None:
@@ -156,10 +161,13 @@ class LeaderController:
         leading = self._ensure_leadership()
         self._drain_events(apply=leading)
         ready = self.active
+        now = self._clock()
+        if ready and self._active_term != self._ready_term:
+            self._active_term = self._ready_term
+            self._record("leader_active", warmup_s=round(now - self._ready_at, 2))
         self._drain_requests(ready)
         if not ready:
             return
-        now = self._clock()
         pending = self._store.pending()
         if pending:
             online = self._cluster.online(now)
@@ -176,6 +184,7 @@ class LeaderController:
             if self._ready_term:
                 log.info("no longer leader (term %d), now following %s term %d",
                          self._ready_term, state.leader or "nobody", state.term)
+                self._record("leader_stop", led_term=self._ready_term)
                 self._ready_term = self._claimed_term = 0
                 self._flush_waiting(c.NOT_LEADER, "%s is no longer the cluster leader" % self.node_name)
             return False
@@ -184,6 +193,7 @@ class LeaderController:
         if self._ready_term and state.claimed_term and state.claimed_term == self._claimed_term:
             log.info("still leader, term %d -> %d (raised past a higher claim); keeping the task table",
                      self._ready_term, state.term)
+            self._record("term_raised", from_term=self._ready_term)
             self._ready_term, self._command_id = state.term, 0
             return True
         self._flush_waiting(c.NO_LEADER, "the leader changed; retry with the same idempotency key")
@@ -196,6 +206,7 @@ class LeaderController:
         self._stopped.clear()
         log.info("leader for term %d; adopting running tasks after %.1f s warm-up",
                  state.term, self._config.warmup_s)
+        self._record("leader_start", warmup_s=self._config.warmup_s)
         return True
 
     # ------------------------------------------------------------ events
@@ -257,6 +268,8 @@ class LeaderController:
             return
         log.warning("task=%s gen=%s node=%s refused: %s %s", record.task_id, record.generation, event.node,
                     event.error_code, event.message)
+        self._record("task_refused", task=record.task_id, gen=str(record.generation), by=event.node,
+                     error_code=event.error_code, message=event.message)
         self._failures.setdefault(record.task_id, {})[event.node] = self._clock()
         message = "start on %s refused: %s" % (event.node, event.message or event.error_code)
         if event.error_code in PERMANENT_START_ERRORS:
@@ -274,6 +287,8 @@ class LeaderController:
         if self._stalls[record.task_id] >= self._config.max_input_stalls:
             return False
         self._failures.setdefault(record.task_id, {})[event.node] = self._clock()
+        self._record("task_input_stalled", task=record.task_id, gen=str(record.generation), primary=event.node,
+                     stalls=self._stalls[record.task_id], max_stalls=self._config.max_input_stalls)
         self._submit(Requeue(record.task_id, record.generation, self._ready_term, "%s (%d/%d)" % (
             event.message or "no input on %s" % event.node, self._stalls[record.task_id],
             self._config.max_input_stalls), self._wall_ms()))
@@ -328,6 +343,7 @@ class LeaderController:
                          record=record)
             return
         if record.status != c.CANCELLED:
+            self._record("task_cancelled", task=record.task_id, by=request.origin_node, reason=request.reason)
             self._submit(Cancel(record.task_id, request.reason, self._wall_ms()))
             self._stopped[record.task_id] = set()
             record = self._store.get(record.task_id)
@@ -408,9 +424,11 @@ class LeaderController:
             if self._memory.protecting:
                 log.warning("mass offline: %d nodes dropped out at once; not moving their tasks for now",
                             len(self._memory.protected[0]))
+                self._record("mass_offline", nodes=sorted(self._memory.protected[0]))
             else:
-                log.warning("mass offline protection ended (%s)", "held too long" if
-                            self._memory.protection_spent else "nodes are back")
+                ended = "held too long" if self._memory.protection_spent else "nodes are back"
+                log.warning("mass offline protection ended (%s)", ended)
+                self._record("mass_offline_end", reason=ended)
         dispatches: dict[tuple[str, Generation], list[str]] = {}
         for action in actions:
             record = records.get(getattr(action, "task_id", ""))
@@ -421,13 +439,18 @@ class LeaderController:
                 if result.ok:
                     log.info("task=%s gen=%s adopted from %s (primary %s)%s", action.task_id, action.generation,
                              action.reported_by, action.primary, " as cancelled" if action.cancelled else "")
+                    self._record("task_adopted", task=action.task_id, gen=str(action.generation),
+                                 primary=action.primary, helpers=list(action.helpers), reported_by=action.reported_by,
+                                 cancelled=action.cancelled)
             elif isinstance(action, CancelTask):
                 log.warning("task=%s cancelled: %s", action.task_id, action.reason)
+                self._record("task_cancelled", task=action.task_id, by="reconcile", reason=action.reason)
                 self._submit(Cancel(action.task_id, action.reason, self._wall_ms()))
             elif isinstance(action, ScheduleTask):
                 self._place(record, online, now)     # usually done already by step(); Assign is fenced
             elif isinstance(action, Reschedule):
                 log.info("task=%s gen=%s reschedule: %s", action.task_id, action.expected, action.reason)
+                self._record("task_reschedule", task=action.task_id, gen=str(action.expected), reason=action.reason)
                 self._place(record, online, now, reason=action.reason)
             elif isinstance(action, Dispatch):
                 dispatches.setdefault((action.task_id, action.generation), []).append(action.node)
@@ -471,6 +494,8 @@ class LeaderController:
         updated = self._store.get(record.task_id)
         log.info("task=%s gen=%s scheduled primary=%s helpers=%s", updated.task_id, updated.generation,
                  updated.primary, ",".join(updated.helpers) or "-")
+        self._record("task_scheduled", task=updated.task_id, gen=str(updated.generation), primary=updated.primary,
+                     helpers=list(updated.helpers), reason=reason)
         self._start(updated, updated.nodes, now)      # table first, then the command (CONVENTIONS 5.3)
 
     def _start(self, record: TaskRecord, nodes: Iterable[str], now: float) -> None:
@@ -488,6 +513,7 @@ class LeaderController:
         for node in nodes:
             self._memory.note_stop(node, task_id, generation, now)
         log.info("task=%s gen=%s stop on %s: %s (%s)", task_id, generation, ",".join(nodes), kind, reason)
+        self._record("task_stop", task=task_id, gen=str(generation), nodes=list(nodes), kind=kind, reason=reason)
         self._commands.send(ExecCommand(self._ready_term, self._next_command_id(), nodes, p.STOP, task_id,
                                         generation, stop_kind=kind, reason=reason, leader=self.node_name))
 
@@ -505,6 +531,12 @@ class LeaderController:
             del self._stopped[task_id]
 
     # -------------------------------------------------------------- helpers
+    def _journal_table_events(self, events) -> None:
+        """Every status change of the task table (only the leader changes it)."""
+        for event in events:
+            self._record("task_status", task=event.task_id, status=event.status, epoch=event.epoch,
+                         primary=event.node, message=event.message)
+
     def _next_command_id(self) -> int:
         self._command_id += 1
         return self._command_id

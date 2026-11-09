@@ -179,6 +179,15 @@ class _Handler(BaseHTTPRequestHandler):
             wait_s = min(float(query.get("wait", ["0"])[0]), 30.0)
             events, last = backend.events.since(after, wait_s)
             return self._send(200, {"success": True, "last_seq": last, "events": events})
+        if url.path == PREFIX + "/journal":
+            journal = getattr(backend, "journal", None)
+            if journal is None:
+                return self._send(404, {"success": False, "message": "no journal on this node"})
+            entries, last = journal.since(int(query.get("after", ["0"])[0]),
+                                          min(int(query.get("limit", ["500"])[0]), 2000),
+                                          query.get("snapshots", ["1"])[0] != "0")
+            return self._send(200, {"success": True, "node": journal.node, "incarnation": journal.incarnation,
+                                    "last_seq": last, "entries": entries})
         artifact = re.fullmatch(PREFIX + r"/tasks/([0-9a-f-]{36})/artifacts/(\d+-\d+)(?:/((?:primary|id_[0-4])/[\w.-]+\.(?:pcd|npz)))?", url.path)
         if artifact:
             task_id, generation, filename = artifact.groups()

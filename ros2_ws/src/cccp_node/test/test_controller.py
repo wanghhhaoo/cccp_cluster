@@ -4,6 +4,7 @@ from _sim import Clock, FakeElection, SimWorld
 
 from cccp_node.control import protocol as p
 from cccp_node.control.controller import ControllerConfig, LeaderController
+from cccp_node.control.journal import Journal
 from cccp_node.control.protocol import Request
 from cccp_node.control.task_store import TaskStore
 from cccp_node.core import constants as c
@@ -572,3 +573,67 @@ def test_a_new_election_between_two_steps_is_not_taken_for_a_raised_term():
     clock.advance(0.1)
     controller.step()
     assert not controller.active and store.records() == {}
+
+
+def journaled(controller_setup=setup, **kw):
+    """setup() with a journal: (clock, world, store, election, controller, events)."""
+    clock, world, store, election, _ = controller_setup(**kw)
+    journal = Journal("n1", 1, context=lambda: (election.state.term, election.state.leader), clock=clock)
+    controller = LeaderController("n1", store, election, world.cluster, world.network, CONFIG, clock=clock,
+                                  journal=journal)
+
+    def events(*names):
+        return [e for e in journal.since(0, 10000)[0] if not names or e["event"] in names]
+    return clock, world, store, election, controller, events
+
+
+def test_journal_records_leadership_and_a_migration():
+    """What tools/merge_journal.py rebuilds a failover from (control/journal.py)."""
+    clock, world, store, election, controller, events = journaled()
+    world.run(controller, 5.5)
+    start, active = events("leader_start", "leader_active")
+    assert (start["term"], start["leader"], active["event"]) == (1, "n1", "leader_active")
+    assert active["warmup_s"] >= 5.0
+    task_id = submit(store)
+    world.run(controller, 1.5)
+    first = store.get(task_id).primary
+    scheduled = events("task_scheduled")
+    assert [(e["task"], e["gen"], e["primary"], e["reason"]) for e in scheduled] == [(task_id, "(1,1)", first, "")]
+    assert [e["status"] for e in events("task_status")] == [c.PENDING, c.SCHEDULED, c.RUNNING]
+
+    world.nodes[first].alive = False
+    world.run(controller, 8.0)
+    moved = events("task_reschedule")
+    assert [(e["task"], e["gen"]) for e in moved] == [(task_id, "(1,1)")] and moved[0]["reason"]
+    again = events("task_scheduled")[-1]
+    assert again["gen"] == "(2,1)" and again["primary"] != first and again["reason"] == moved[0]["reason"]
+    world.nodes[first].alive = True
+    world.run(controller, 2.0)
+    stop = events("task_stop")[-1]
+    assert (stop["task"], stop["gen"], stop["nodes"], stop["kind"]) == (task_id, "(1,1)", [first], c.STOP_STALE)
+    assert [e["seq"] for e in events()] == sorted(e["seq"] for e in events())
+
+
+def test_journal_records_a_raised_term_and_stepping_down():
+    clock, world, store, election, controller, events = journaled()
+    warm(world, controller)
+    election.raise_term(4)
+    world.run(controller, 0.5)
+    assert [(e["from_term"], e["term"]) for e in events("term_raised")] == [(1, 4)]
+    election.set("n2", 5)
+    world.run(controller, 0.5)
+    (stop,) = events("leader_stop")
+    assert (stop["led_term"], stop["term"], stop["leader"]) == (4, 5, "n2")
+    assert len(events("leader_start")) == 1          # raising the term is not a new leadership
+
+
+def test_journal_records_a_destroy_with_who_asked():
+    clock, world, store, controller, replies = leader()
+    journal = Journal("n1", 1)
+    controller._record = journal.record
+    warm(world, controller)
+    task_id = created(world, controller, replies)
+    controller.on_request(request(p.DESTROY, 9, task_id=task_id, reason="done"))
+    world.run(controller, 1.0, dt=0.1)
+    cancelled = [e for e in journal.since(0)[0] if e["event"] == "task_cancelled"]
+    assert [(e["task"], e["by"], e["reason"]) for e in cancelled] == [(task_id, "gw", "done")]

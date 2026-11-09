@@ -427,3 +427,31 @@ colcon test --packages-select cccp_node cccp_task_executor && colcon test-result
 - 容器和网络都已删除，镜像 `cccp-node:p4-a7d2f2f-check` 留在远端，以后做单机回归可以直接用。
 
 **没验证的**：arm64 镜像（要在 JetPack 上构建）、无线网卡上 Cyclone `default` 的实际行为（只让 SPDP 走组播是按 Cyclone 的说明，要在板卡上抓包确认）、`--runtime nvidia`、`--task`（远端这次没开推理，只用假网关测过）。
+
+## 二十三、11-09：事件日志（DESIGN 2.9，“实现时的调整”第 24、25 条）
+
+监控与本地录制分三个阶段：事件日志、Prometheus 指标、rosbag2 只录本机 topic。这次只做了第一阶段。
+
+**为什么先做它**：外场出问题时无法登录排查，只能事后复盘。原来的日志格式不统一、没有时间戳、只在容器标准输出里（重建容器就没了），没法把 12 块板卡合并成一条时间线。
+
+**做了什么**：
+- `control/journal.py`：`Journal.record(event, **fields)` 生成一行 JSON。公共字段有墙钟 `t`、单调时钟 `mono`、`node`、`inc`、跟随的 `term`/`leader`、`seq`。最近 2000 条留在内存里，同时放进有界队列，由 `JournalWriter` 线程写入 `RotatingFile`（20 MB × 10 个文件）。每批写完 flush，fsync 最多每秒一次。写不进去时计数，每分钟告警一次，节点照常运行。
+- **记录的事件**（DESIGN 2.9 有完整的表）：
+  - 控制器：上任、预热结束（`leader_active`，附实际用时）、提升 term、卸任、调度（`reason` 非空即迁移）、接收、重新调度、取消（`by` 是网关节点或 `reconcile`）、停止、拒绝、无输入、大面积离线保护，以及任务表的每次状态变化（作为任务表的事件监听器）。
+  - 控制进程：`start`/`stop`、节点上线和离线、跟随的 (集群主节点, term) 变化（每个节点都记，时钟检查就靠它），以及每 10 秒一份快照。
+- `GET /api/ue/journal?after=&limit=&snapshots=0`。
+- `tools/merge_journal.py`：多目录合并、按墙钟排序，按任务、节点、事件筛选，跳过断电截断的行，去掉重复的文件。
+- **时钟检查**：同一次换主，各节点记录 `leader_changed` 的时间相差一两秒，据此估计每个节点的时钟偏差。第一版用了只有两个节点记录到的那次换主，中位数是两者的中点，两个节点都显得偏了一半，把没偏的 n2 也报了出来。现在至少 3 个节点都记录到才指认是哪个节点偏了；只有两个节点时只报两者相差多少。
+- 控制进程的 Python 日志改为 rclpy 的格式 `[级别] [墙钟秒] [名字]: 内容`。
+- `run_node.sh` 把宿主机的 `CCCP_DATA_DIR`（默认 `/var/lib/cccp`）以同一路径挂进容器。控制进程的 `journal_dir` 参数默认读 `$CCCP_JOURNAL_DIR`，没有就用 `$CCCP_DATA_DIR/journal`；两个都没有时只保留在内存里，测试默认就是这样。
+
+**没有做的**：控制面不用 rosbag 录。录制器订阅 `/cluster/*` 后，单播模式下发布者要给它多发一份，控制面的无线流量会翻倍；控制面的历史由事件日志负责。指标和推理结果录制留到后面的阶段（DESIGN 10.3 第 3 条）。没有改接口包，协议版本不变。
+
+**测试**：
+- 新增 `test_journal.py`（9 项）和 `test_merge_journal.py`（6 项）。
+- `test_controller.py` 加了 3 项：换主和迁移、提升 term 和卸任、销毁记录发起者。
+- `test_ue_api.py` 加了 1 项。
+- `test_ros_integration.py` 加了 1 项：杀掉集群主节点后，每个存活节点都记了 `leader_changed` 和 `node_offline`，有快照；新集群主节点的快照带任务计数；死掉的那个节点的文件以 `start` 开头、`stop` 结尾。
+- 故意改坏 18 处都被发现：不记 `leader_active`/`term_raised`/`task_stop`、丢掉迁移原因、不记销毁发起者、不用 context、轮转时删掉旧文件、重启时截断文件、close 时丢掉最后一批、快照不带链路、`snapshots=0` 无效、按两节点的换主指认偏差、`--node` 不认 `primary`、不去重、默认显示快照；控制进程不记 `leader_changed`、离线记成上线、退出时不记 `stop`。
+- 全量 313 项通过、3 项跳过。
+- **原来就有的不稳定测试**：`test_ros_integration.py::test_task_running_on_the_leader_is_restarted_elsewhere_after_it_dies[ros_services]` 偶尔 30 秒内等不到任务以新代次在别处运行。在未改动的提交 `2228652` 上（临时 worktree）跑 8 次失败 5 次，当时机器上同时在跑别的测试；空闲时大多能通过。与事件日志无关，原因还没查。

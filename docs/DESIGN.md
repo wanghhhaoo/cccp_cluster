@@ -100,6 +100,13 @@
 | 22 | 资源采样从心跳定时器移到单独的定时器和互斥回调组，周期为 `status_period × slow_fields_every`（5 秒），心跳只读最近一次的结果；第一次采样之前资源报 -1（未知） | 采样在 NVIDIA GPU 的机器上要调用 `nvidia-smi`（70～320 ms），原来在心跳的回调组里，期间收到的心跳都不被处理，链路 RTT 偏大（第 10.1 节第 26 条）。资源只随每第 5 条心跳发送，按 1 秒采样多出来的 4 次没人用；CPU 占用率变成 5 秒内的平均 | 2.4、3.2 |
 | 23 | 离线后回来的节点，`incarnation` 比原来小也接受；被替换掉的 `incarnation` 不再接受；新一轮的 `TaskList` 在它的心跳被接受前先暂存 | `incarnation` 取墙钟毫秒，板卡没有 RTC、外场没有 NTP 时重启后时钟回退。原规则一律丢弃较小的 `incarnation`，节点重启后会被所有节点忽略，直到旧条目过期（`offline_retain_s`，5 分钟）；它的 `TaskList` 也因此丢失（第 10.1 节第 27 条） | 3.6、3.8 |
 
+### 可观测性（11-09）
+
+| # | 调整 | 原因 | 章节 |
+|---|---|---|---|
+| 24 | 新增事件日志：每个节点把控制面事件（选主、上线和离线、调度、迁移、停止、大面积离线保护、任务状态变化）和每 10 秒一份集群快照写到本机磁盘，`tools/merge_journal.py` 合并多块板卡的文件并检查时钟偏差 | 原设计只有日志和查询接口。外场出了问题无法登录排查，只能事后复盘；日志格式不统一、没有时间戳、随容器重建丢失，不能把 12 块板卡合并成一条时间线 | 2.9 |
+| 25 | 控制进程的 Python 日志行加上墙钟时间，格式与 rclpy 一致（`[级别] [秒] [名字]: 内容`） | 原格式没有时间，只能靠 `docker logs -t` 补 | CONVENTIONS 7.3 |
+
 ---
 
 ## 0 一页纸概览
@@ -285,6 +292,7 @@
 | 控制器线程 | 10 Hz 循环：处理 `ExecEvent` 和 `Request`；为新的 Pending 任务调度；每秒对账一次 | 只在当选且预热结束后真正工作 |
 | UE HTTP 线程 | 每个请求一个线程 | 创建、销毁请求最多阻塞 15 秒（`request_timeout_s`），等集群主节点的 `Reply` |
 | 出站队列（50 ms 定时器） | 把其他线程产生的 ROS 动作（发布消息、订阅结果）交给 ROS 线程执行 | ROS 实体只在执行器线程里创建 |
+| 事件日志写盘线程 | 把事件日志的行写到本机磁盘（第 2.9 节） | 记录事件的线程只把行放进队列，不等磁盘 |
 
 控制面**没有跨节点的阻塞调用**：下发是发布一条 `Command`，回执通过 `ExecEvent` 异步回来；网关转发是发布一条 `Request`，在本地等对应的 `Reply`。集群主节点也不需要为每个等待中的请求占一个线程：它记下请求的标识，结果出来时再发布 `Reply`。
 
@@ -367,6 +375,7 @@ QoS 集中定义在 `cccp_node/ros/qos.py`，端点名集中定义在 `cccp_node
 | `cccp_node/control/controller.py`                                 | 集群主节点控制器：上任、预热、请求、事件、对账、调度、下发 | `test_controller.py`（多节点仿真）             |
 | `cccp_node/control/task_store.py`                                 | 任务表加锁封装、事件监听                          | —                                               |
 | `cccp_node/control/gateway.py`                                    | 路由（本地/转发/报错）、创建等待、回复语义        | `test_gateway.py`                              |
+| `cccp_node/control/journal.py`、`tools/merge_journal.py`          | 事件日志、写盘线程、快照；多板卡合并和时钟检查（第 2.9 节） | `test_journal.py`、`test_merge_journal.py`   |
 | `cccp_node/control/ue_backend.py`、`ue_api.py`                  | UE HTTP 接口                                      | `test_ue_api.py`（真实 HTTP）                  |
 | `cccp_node/ros/*`                                                 | ROS 适配：控制节点、命令和请求的发布、消息转换（含编号 ↔ 名字、枚举、量化）、QoS | `test_convert.py`、`test_constants.py`、`test_message_size.py`、`test_ros_integration.py` |
 | `cccp_node/monitor/probes.py`                                     | CPU/内存/GPU 采集                                 | `test_probes.py`                               |
@@ -455,6 +464,46 @@ QoS 集中定义在 `cccp_node/ros/qos.py`，端点名集中定义在 `cccp_node
 | D. 合并消息 | 讨论过去掉 `TaskReport`；改为 topic 方案后，`TaskReport` 升级为 `ExecEvent`，同时承担命令回执 | 已由 `ExecEvent` 取代 |
 
 **先测再改**：在一块板卡上抓包，让 12 个节点空闲运行 60 秒，用 Wireshark 的 RTPS 解析器按子消息类型统计（DATA、HEARTBEAT、ACKNACK，以及 SPDP、SEDP 发现报文）各占多少字节、多少个包，并确认 rmw 实际用的是组播还是单播。在无线网络上，**包数**往往比字节数更要命，因为每个帧都有固定的信道争用和前导开销，所以评估时除了 kbps，也要看每秒的包数。
+
+### 2.9 事件日志
+
+日志是给现场盯着一块板卡看的；**事件日志**（`control/journal.py`）是给事后还原“整个集群当时发生了什么”用的。每个节点把自己经历的控制面事件写到本机磁盘，每个事件一行 JSON；事后把各板卡的文件收到一起，用 `tools/merge_journal.py` 合并成一条时间线。它不占无线信道：节点之间不交换事件日志，也不为它订阅任何 topic。
+
+**每一行**都带这些公共字段，后面跟事件自己的字段：
+
+| 字段 | 含义 |
+|---|---|
+| `t` | 墙钟时间（秒，3 位小数），合并多块板卡时按它排序，所以只有板卡做了时钟同步才准 |
+| `mono` | 本机单调时钟，同一次运行内计算间隔用 |
+| `node`、`inc` | 写这一行的节点和它的 `incarnation`（重启后变化） |
+| `term`、`leader` | 这个节点当时跟随的 term 和集群主节点 |
+| `seq` | 本次运行内的序号 |
+| `event` | 事件名 |
+
+**事件**：
+
+| 事件 | 谁记 | 字段 |
+|---|---|---|
+| `start`、`stop` | 每个节点，控制进程启动和正常退出时 | `node_id`、`protocol` |
+| `node_online`、`node_offline` | 每个节点，集群视图判定某节点上线或离线时 | `peer`、`restarted`、`silent_s`、`missed`（上线时：听不到的这段时间里对方的 seq 前进了多少，数值大说明它一直在发、是途中丢的；离线时：离线前漏掉的心跳数） |
+| `leader_changed` | 每个节点，跟随的 (集群主节点, term) 变化时 | `prev_leader`、`prev_term`、`leading` |
+| `leader_start`、`term_raised`、`leader_stop` | 当选的节点 | `warmup_s`；`from_term`；`led_term` |
+| `leader_active` | 当选的节点，预热结束、开始接请求时 | `warmup_s`（实际用时）。和其他节点的 `node_offline` 对照，就是这次换主的不可用时长 |
+| `task_status` | 集群主节点，任务表里任务状态的每次变化 | `task`、`status`、`epoch`、`primary`、`message` |
+| `task_scheduled` | 集群主节点 | `task`、`gen`、`primary`、`helpers`、`reason`（非空表示迁移，写明原因） |
+| `task_adopted`、`task_reschedule`、`task_cancelled`、`task_stop`、`task_refused`、`task_input_stalled` | 集群主节点 | `task`、`gen` 和各自的原因字段；`task_cancelled.by` 是发起销毁的网关节点，或 `reconcile` |
+| `mass_offline`、`mass_offline_end` | 集群主节点 | `nodes`；`reason` |
+| `snapshot` | 每个节点，每 10 秒（`snapshot_period`） | 在线和离线的节点、每个在线节点心跳里的 term/是否声明/任务数/执行器/推理就绪、本机测到的各条链路的 RTT 和丢失率；本节点是集群主节点时加上任务表按状态的计数 |
+
+快照的作用是兜底：某次变化漏记了或者没有对应的事件，最多 10 秒后就能从快照里看到结果。12 个节点时一份约 0.6 KB，每天约 5 MB。
+
+**写在哪里**：`journal_dir`（默认 `$CCCP_DATA_DIR/journal`，`run_node.sh` 把宿主机的 `/var/lib/cccp` 挂进容器）下的 `<节点名>.jsonl`，超过 20 MB 就轮转为 `<节点名>.1.jsonl`，最多保留 9 个旧文件。没有配置目录时只保留在内存里。最近 2000 条可以通过 `GET /api/ue/journal?after=<seq>&limit=<n>&snapshots=0` 读取。
+
+**不能拖慢控制面**：`record()` 只格式化一行、放进内存和一个有界队列；写盘在单独的线程里完成，每批写完 flush，fsync 最多每秒一次（板卡可能直接断电，而 SD 卡上一次 fsync 可能要几十毫秒）。磁盘写不进去时只丢事件日志、计数并每分钟告警一次，节点照常运行。事件日志不是任何控制逻辑的输入。
+
+**合并与时钟检查**：`merge_journal.py <目录或文件...>` 按墙钟排序，可以按任务（`--task`）、节点（`--node`，含以它为对象的事件）、事件名（`--event`）筛选。它还检查各板卡的时钟：同一次换主，所有节点在一两秒内都会记一条 `leader_changed`（第 5.5 节），所以某个节点的这些记录如果总是离其他节点很远，它的时钟就偏了，工具会报出估计的偏差（至少要有 3 个节点记录了同一次换主才能判断是哪一个偏了；只有两个节点时只报两者相差多少）。
+
+不包括的：推理结果和图像的录制（第 10.3 节第 3 条）、指标（Prometheus）、把各板卡的事件日志自动收集到地面站。
 
 ---
 
@@ -1646,7 +1695,7 @@ NET 的参照节点：任务规格有 `input_node`（数据所在节点）时用
 
 1. **真实环境验证**（10.2 全部），包括抓包。在此之前，本文中所有时间和带宽数字都只是推算。
 2. **带宽措施 A、B**（第 2.8 节）：按抓包结果决定先做哪一项。A 的代码部分已完成（控制进程和执行器创建节点时关闭参数服务和 rosout），还需要在真机上用 `ros2 node list` 等核对端点。
-3. **节点本地录制结果**：每个节点用 rosbag2（MCAP 格式）把自己的 `task/result` 录到本地盘，按时间或大小循环覆盖。不需要节点间协调，主要用于调试、复盘和收集数据，真机联调时会很有用。
+3. **节点本地录制结果**：每个节点用 rosbag2（MCAP 格式）把自己的 `task/result` 录到本地盘，按时间或大小循环覆盖。不需要节点间协调，主要用于调试、复盘和收集数据，真机联调时会很有用。只录本机的 topic：录制器订阅 `/cluster/*` 的话，单播模式下每条心跳和 `TaskList` 都要给它多发一份，控制面的无线流量翻倍；控制面的历史由事件日志（第 2.9 节）负责。之后再加 Prometheus 指标（每个节点只导出自己的数据，集群视图在地面站拼）。
 4. **缩短换主后的不可用窗口**。预热 5 秒是一个保守值。实际上跟随者平时就一直在接收所有节点的心跳和 `TaskList`，当选时已经有完整的视图，只有刚启动的节点才需要等待完整视图。可以改为：节点运行时间已超过 `node_offline_timeout_s` 时，预热缩短到 1～2 个心跳周期（但要留够按角色创建的端点完成 DDS 匹配的时间）。改之前需要确认“预热不足时漏接收的任务”在后续对账中一定会被接收（目前的对账规则应该已经保证了这一点）。
 5. **集群主节点主动让位**（大面积离线保护的完整版）：集群主节点自己的 `visible_peers` 掉到阈值以下（例如看不到一半的节点）时，主动撤销声明，让连通性更好的节点接任。
 6. **节点恢复的迟滞和迁移限速**：节点从离线恢复后，要连续稳定一段时间（例如 30 秒）才重新往它上面派任务；同一个任务在一段时间内最多迁移一次（例如 60 秒内一次）。等真机上测出链路抖动的实际情况后，再定迟滞时长和限速阈值。
@@ -1750,6 +1799,9 @@ NET 的参照节点：任务规格有 `input_node`（数据所在节点）时用
 | 控制进程 | `node_id`、`slow_fields_every`、`offline_retain`、`executor_stall_grace` | 0（推导）、5、300、10 | 见附录 A.1 |
 | `start_node.sh` | `REQUEST_TIMEOUT` | 15.0 | 传给控制进程的 `request_timeout` |
 | 控制进程 | `battery` | -1 | 电量（-1 表示未知，不参与过滤） |
+| 控制进程 | `journal_dir` | `$CCCP_JOURNAL_DIR`，否则 `$CCCP_DATA_DIR/journal`，都没有时为空 | 事件日志目录；空表示只保留在内存里（第 2.9 节） |
+| 控制进程 | `journal_max_mb`、`journal_keep`、`snapshot_period` | 20、9、10.0 | 单个事件日志文件的大小、保留的旧文件数、快照周期（0 表示不记快照） |
+| `run_node.sh` | `CCCP_DATA_DIR` | `/var/lib/cccp` | 宿主机上存事件日志的目录，以同一路径挂进容器 |
 | 执行器 | `max_consecutive_failures` | 10 | 连续失败多少帧后上报失败 |
 | 执行器 | `max_tasks_per_node`（新） | 4 | 准入检查的上限，必须和控制面参数一致；`start_node.sh` 用 `MAX_TRACKERS` 填写 |
 | 执行器 | `node_id`（新） | 0（从 `node_name` 推导） | 过滤 `Command.targets` |
@@ -1776,7 +1828,9 @@ NET 的参照节点：任务规格有 `input_node`（数据所在节点）时用
 | 消息转换：心跳（含慢变部分）、`TaskList`、`Command`、`ExecEvent`、`Request`、`Reply` 往返；uint8 枚举表与 `.msg` 常量一致 | `test_convert.py`、`test_constants.py` |
 | 心跳大小：带满 8 个任务和 15 条链路时 419 B，普通 168 B，带慢变部分 275 B（按 CDR 规则从 `.msg` 计算） | `test_message_size.py` |
 | 数据源地址：解析、各角色的取数计划 | `test_input_source.py` |
-| 端到端（仿 ROS，3 个控制进程 + 3 个执行器，两种推理后端各一遍）：创建 → 运行 → 结果 → 杀集群主节点后原地继续 → 杀任务主节点后迁移 → 杀运行任务的集群主节点后任务在别处重启 → 销毁；执行器卡住时宽限后才迁移；只有集群主节点持有它的端点；数据源地址各场景；没有输入帧时换节点、最终失败；`TaskList` 两端都是 TRANSIENT_LOCAL 才补发 | `test_ros_integration.py` |
+| 事件日志：公共字段、保留字段名、内存窗口、文件轮转和重启后续写、写盘线程、目录不可写时节点照常运行、快照内容；控制器在上任、预热结束、提升 term、卸任、调度、迁移、停止、销毁时的记录；`GET /api/ue/journal` | `test_journal.py`、`test_controller.py`、`test_ue_api.py` |
+| 合并工具：多板卡排序、时钟偏差的判断（3 个节点以上才指认，两个节点只报差值）、筛选、断电截断的行和重复文件 | `test_merge_journal.py` |
+| 端到端（仿 ROS，3 个控制进程 + 3 个执行器，两种推理后端各一遍）：创建 → 运行 → 结果 → 杀集群主节点后原地继续 → 杀任务主节点后迁移 → 杀运行任务的集群主节点后任务在别处重启 → 销毁；执行器卡住时宽限后才迁移；只有集群主节点持有它的端点；数据源地址各场景；没有输入帧时换节点、最终失败；`TaskList` 两端都是 TRANSIENT_LOCAL 才补发；换主时每个节点都把它写进自己的事件日志文件 | `test_ros_integration.py` |
 | 真实模型权重 | `collab_inference/test/test_engines_real.py` |
 
 以上测试都不需要 ROS（Python 3.10）：

@@ -17,6 +17,7 @@ from ..core.cluster_view import ClusterView
 from ..core.task_table import StatusEvent
 from ..ue_api import EventLog, encode_jpeg, spec_from_body
 from .gateway import Gateway
+from .journal import Journal
 
 MAX_CACHED_TASKS = 100
 
@@ -24,9 +25,11 @@ MAX_CACHED_TASKS = 100
 class UeBackend:
     def __init__(self, node_name: str, gateway: Gateway, cluster: ClusterView,
                  watch: Callable[[str, bool], None] = lambda node, images: None,
-                 leader_name: Callable[[], str] = lambda: "", clock: Callable[[], float] = time.monotonic):
+                 leader_name: Callable[[], str] = lambda: "", clock: Callable[[], float] = time.monotonic,
+                 journal: Journal | None = None):
         self.node_name = node_name
         self.events = EventLog()
+        self.journal = journal                                # GET /api/ue/journal
         self._gateway = gateway
         self._cluster = cluster
         self._watch = watch

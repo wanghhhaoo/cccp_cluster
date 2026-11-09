@@ -7,6 +7,7 @@ per-frame results reaching that node's UE backend, the leader dying while the
 task runs (the new leader rebuilds its table from the TaskLists), and executors
 dying. Skipped when the real rclpy is installed.
 """
+import json
 import sys
 import threading
 import time
@@ -130,7 +131,7 @@ class FakeAirSim:
 
 
 @pytest.fixture(params=["ros_services", "local_calls"])
-def cluster(monkeypatch, request):
+def cluster(monkeypatch, request, tmp_path):
     """Executors reach the algorithms through ROS services or in-process calls (data_plane default).
 
     @pytest.mark.airsim_mode("relay") selects how airsim:// inputs are fetched (default "each");
@@ -150,6 +151,7 @@ def cluster(monkeypatch, request):
             node_name=name, status_period=0.2, offline_timeout=1.0, executor_timeout=1.0, executor_stall_grace=6.0,
             create_wait=3.0, destroy_wait=3.0, service_wait_timeout=0.5, ue_http_port=0,
             airsim_fetch_mode=airsim_mode, airsim_fps=20.0, input_timeout=input_timeout,
+            journal_dir=str(tmp_path / "journal"), snapshot_period=0.5,
         )
         engine = FakeEngine()
         if request.param == "local_calls":
@@ -505,3 +507,30 @@ def test_subscriptions_to_topics_several_nodes_publish_keep_a_sample_from_each_o
     assert {names.NODE_STATUS_TOPIC, names.TASK_LIST_TOPIC, names.EXEC_EVENT_TOPIC} <= shared
     for topic, subs in subscriptions.items():
         assert subs and all(s.qos.depth >= 12 for s in subs), topic
+
+
+def test_every_node_journals_the_failover_to_its_own_file(cluster, tmp_path):
+    """control/journal.py: what each board writes for tools/merge_journal.py."""
+    leader = wait_for(lambda: active_leader(cluster))
+    kill(leader)
+    new_leader = wait_for(lambda: active_leader(cluster), timeout=20.0)
+    survivors = live(cluster)
+
+    def journaled(node, event, **fields):
+        return [e for e in node.control.journal.since(0, 2000)[0]
+                if e["event"] == event and all(e.get(k) == v for k, v in fields.items())]
+    for node in survivors:
+        wait_for(lambda: journaled(node, "leader_changed", leader=new_leader.name))
+        offline = journaled(node, "node_offline", peer=leader.name)
+        assert offline and offline[0]["missed"] >= 0
+        assert journaled(node, "snapshot")
+    assert journaled(new_leader, "leader_active", leader=new_leader.name)
+    wait_for(lambda: journaled(new_leader, "snapshot", leader=new_leader.name) and
+             "tasks" in journaled(new_leader, "snapshot", leader=new_leader.name)[-1])
+
+    # the dead leader's file ends with its stop; every line is one JSON object
+    lines = (tmp_path / "journal" / ("%s.jsonl" % leader.name)).read_text().splitlines()
+    entries = [json.loads(line) for line in lines]
+    assert entries[0]["event"] == "start" and entries[-1]["event"] == "stop"
+    assert {e["node"] for e in entries} == {leader.name}
+    assert any(e["event"] == "leader_active" for e in entries)

@@ -42,6 +42,10 @@ elif [ "${COLLAB_DEVICE:-cpu}" != "cpu" ]; then
 	echo "run_node: COLLAB_DEVICE=$COLLAB_DEVICE but Docker has no nvidia runtime" >&2
 	exit 1
 fi
+# Event journal (and later recordings) on the board's disk, kept across container replacements.
+# Several nodes on one machine share it: each writes <data dir>/journal/<NODE_NAME>.jsonl.
+data_dir=${CCCP_DATA_DIR:-/var/lib/cccp}
+args+=(-v "$data_dir:$data_dir" -e "CCCP_DATA_DIR=$data_dir")
 if [ -n "${CCCP_JOB_STORE:-}" ]; then
 	# The same path inside and outside: FASTLIVO hands it to the Docker daemon (docs/推理任务集成.md).
 	args+=(-v "$CCCP_JOB_STORE:$CCCP_JOB_STORE")
@@ -51,4 +55,4 @@ name="cccp-$NODE_NAME"
 docker rm -f "$name" >/dev/null 2>&1 || true
 docker run -d --name "$name" "${args[@]}" "$IMAGE" >/dev/null
 echo "run_node: started $name ($IMAGE) on $CCCP_DDS_INTERFACE (network $network), domain ${ROS_DOMAIN_ID:-default}"
-echo "run_node: logs: docker logs -f $name"
+echo "run_node: logs: docker logs -f $name; journal: $data_dir/journal/$NODE_NAME.jsonl"
